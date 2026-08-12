@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+sqlmodel
+asyncmy
+cryptography
+pydantic-settings
+greenlet
+python-multipart
+httpx
+openai
+Pillow
