@@ -1,0 +1,15 @@
+# 本地环境配置可能包含密码、令牌等敏感信息。
+.env
+.env.*
+!.env.example
+
+# Python 运行和测试缓存。
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 本地虚拟环境。
+.venv/
+venv/

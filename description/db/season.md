@@ -20,7 +20,7 @@
 | start_date | DATE             |       是 |     无 | 赛季开始日期                                       |
 | end_date   | DATE             |       是 |     无 | 赛季结束日期                                       |
 | required_project_count | TINYINT UNSIGNED |       是 |      3 | 当前赛季要求用户固定选择的项目数量                 |
-| status     | TINYINT UNSIGNED |       是 |      0 | 赛季状态：`0` 未开始，`1` 进行中，`2` 已结束       |
+| status     | TINYINT UNSIGNED |       是 |      0 | 赛季状态：`0` 未开始，`1` 进行中，`2` 结算中，`3` 已结束 |
 
 ---
 
@@ -116,21 +116,36 @@ required_project_count = 3
 赛季状态。
 
 取值说明：
+
 ```text
 0 = 未开始
 1 = 进行中
-2 = 已结束
+2 = 结算中
+3 = 已结束
 ```
+
 保留该字段的原因是：赛季状态不一定完全等同于日期判断。
 
 例如：
 
 - 到了开始日期，但管理员暂未开启赛季
-- 赛季已到结束日期，但仍允许后台补审核
+- 赛季已到结束日期，但仍需在结算中阶段完成后台补审核和积分结算
 - 特殊情况下需要提前结束赛季
 - 需要明确标记当前正在进行的赛季
 
 当前业务规则要求同一时间只允许存在一个进行中的赛季，即同一时间只能有一条记录的 `status = 1`。
+
+正常生命周期为：
+
+```text
+0 未开始 -> 1 进行中 -> 2 结算中 -> 3 已结束
+```
+
+`status = 2` 表示赛季已经离开用户正常参与阶段，但终审、进度校正或积分结算尚未全部完成。该状态不属于“当前赛季”，查询当前赛季时仍只匹配 `status = 1`。
+
+> **迁移注意**
+>
+> 旧结构中的 `status = 2` 表示“已结束”。升级时必须先将这些历史记录迁移为 `status = 3`，禁止直接变更字段注释后继续使用，否则历史已结束赛季会被误识别为结算中。
 
 ---
 
@@ -143,7 +158,7 @@ CREATE TABLE season (
   start_date DATE NOT NULL COMMENT '赛季开始日期',
   end_date DATE NOT NULL COMMENT '赛季结束日期',
   required_project_count TINYINT UNSIGNED NOT NULL DEFAULT 3 COMMENT '当前赛季要求选择的项目数量',
-  status TINYINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '状态：0未开始，1进行中，2已结束',
+  status TINYINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '状态：0未开始，1进行中，2结算中，3已结束',
   PRIMARY KEY (id),
   KEY idx_season_status (status),
   KEY idx_season_date (start_date, end_date)
