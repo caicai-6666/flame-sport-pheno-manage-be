@@ -138,6 +138,7 @@ description/
 | --- | --- |
 | [FastAPI 应用结构与基础连接](infrastructure/application-structure.md) | 应用目录、配置、MySQL 会话、客户端后端连接、启动和测试 |
 | [Python 运行依赖](infrastructure/python-dependencies.md) | Python 环境基线、依赖用途、安装、验证和安全要求 |
+| [管理端 Docker Compose 部署](infrastructure/docker-compose-deployment.md) | 管理端后端镜像、Compose 服务拓扑、根环境变量、启动顺序和生产入口 |
 
 ### 5.3 应用服务文档
 
@@ -180,6 +181,7 @@ description/
 | 商品管理与礼品发放 | [积分商城商品 API](api/product.md)、[积分商城规则](project.md) | [商品表](db/product.md)、[积分流水表](db/point-record.md) |
 | 环境安装或依赖维护 | [Python 运行依赖](infrastructure/python-dependencies.md) | 无 |
 | 应用启动、服务分层、MySQL 或客户端后端连接 | [FastAPI 应用结构与基础连接](infrastructure/application-structure.md)、[应用服务层设计](application/service-layer.md) | 按具体业务继续选择 |
+| Docker Compose 构建与部署 | [管理端 Docker Compose 部署](infrastructure/docker-compose-deployment.md)、[FastAPI 应用结构与基础连接](infrastructure/application-structure.md) | 无 |
 
 “首要业务入口”默认指向项目总览；具体功能文档产生后，应在本表中优先链接到更精确的功能文档。
 

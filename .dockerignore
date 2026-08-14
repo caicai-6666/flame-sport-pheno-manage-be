@@ -1,0 +1,22 @@
+.git
+.gitignore
+.idea
+.vscode
+
+# 本地密钥和运行环境不得进入镜像构建上下文。
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+description/
+script/
+tests/
+*.log

@@ -195,7 +195,8 @@ cp .env.example .env
 | 连接池 | `MYSQL_POOL_SIZE`、`MYSQL_MAX_OVERFLOW`、`MYSQL_POOL_RECYCLE_SECONDS` | 数据库连接池容量与回收周期 |
 | 客户端后端 | `CLIENT_BACKEND_BASE_URL`、`CLIENT_BACKEND_TIMEOUT_SECONDS` | 客户端后端局域网服务地址和请求超时 |
 | 图片缓存 | `IMAGE_CACHE_SECONDS` | 所有图片响应的浏览器私有缓存时效，单位为秒 |
-| 模型 | `OPENAI_API_KEY` | 后续模型能力使用的 API Key，可在未使用时留空 |
+| DeepSeek 模型 | `DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL`、`DEEPSEEK_MODEL`、`DEEPSEEK_HTTP_TIMEOUT_SECONDS` | 与客户端后端共享的 OpenAI 兼容模型密钥、地址、模型名称和调用超时 |
+| OpenAI 模型 | `OPENAI_API_KEY` | 预留的原生 OpenAI API Key，可在未使用时留空 |
 
 配置由 `pydantic-settings` 从根目录 `.env` 和进程环境变量加载并校验。数据库密码使用 `SecretStr` 保存，构造连接地址时通过 SQLAlchemy `URL` 处理特殊字符。
 
@@ -206,6 +207,17 @@ CLIENT_BACKEND_BASE_URL=http://backend:8000/flame/api/admin
 ```
 
 其中 `backend` 由当前局域网或容器网络提供名称解析。应用启动时使用标准 HTTP URL 类型校验配置；后续客户端后端接口路径均应相对于 `/flame/api/admin` 拼接，不再经过公网域名或 Nginx 的开发前缀。
+
+DeepSeek 使用与客户端后端相同的环境变量名称和默认口径：
+
+```dotenv
+DEEPSEEK_API_KEY=
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_MODEL=deepseek-v4-flash
+DEEPSEEK_HTTP_TIMEOUT_SECONDS=60
+```
+
+管理端目前只完成配置接入，不会因存在密钥而自动发起模型请求。后续实现具体模型用例时，应通过现有 `openai` SDK 的兼容客户端读取这些配置，并在独立客户端适配器中统一处理超时、有限重试和安全错误映射。
 
 ### 3.3 激活赛季配置变更窗口
 

@@ -52,6 +52,11 @@ class Settings(BaseSettings):
     client_backend_timeout_seconds: float = Field(default=10.0, gt=0)
     image_cache_seconds: int = Field(default=86400, ge=0, le=31536000)
 
+    deepseek_api_key: SecretStr | None = None
+    deepseek_base_url: AnyHttpUrl = AnyHttpUrl("https://api.deepseek.com")
+    deepseek_model: str = Field(default="deepseek-v4-flash", min_length=1)
+    deepseek_http_timeout_seconds: float = Field(default=60.0, gt=0)
+
     openai_api_key: SecretStr | None = None
 
     # 使用 SQLAlchemy URL 安全拼装异步 MySQL 地址，避免密码中的特殊字符破坏连接串。

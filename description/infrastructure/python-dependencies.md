@@ -29,7 +29,7 @@ python -m pip install -r requirements.txt
 | `greenlet` | 支撑 SQLAlchemy 相关异步桥接能力 |
 | `python-multipart` | 解析表单和文件上传请求 |
 | `httpx` | 发起异步 HTTP 请求及编写接口测试 |
-| `openai` | 调用 OpenAI API，服务后续模型辅助能力 |
+| `openai` | 调用 OpenAI 兼容 API，包括后续 DeepSeek 模型辅助能力 |
 | `Pillow` | 校验和处理上传图片 |
 
 > **注意**
@@ -40,7 +40,7 @@ python -m pip install -r requirements.txt
 
 ## 3. 配置与安全
 
-- 数据库密码、OpenAI API Key 和其他凭证必须通过环境配置注入，禁止写入 `requirements.txt`、代码或文档。
+- 数据库密码、DeepSeek API Key、OpenAI API Key 和其他凭证必须通过环境配置注入，禁止写入 `requirements.txt`、代码或文档。
 - 外部 HTTP 和模型调用必须配置合理超时，重试应有上限并避免重复副作用。
 - 图片上传必须校验大小、格式和内容，不能只相信扩展名或请求中的 MIME 类型。
 - `cryptography` 只能使用经过验证的高层协议和项目既定方案，禁止自行设计加密算法。
