@@ -497,12 +497,13 @@ erDiagram
     SEASON_USER ||--o| LEADERBOARD_SNAPSHOT : ranks
     USER ||--o{ POINT_RECORD : owns
     PRODUCT ||--o{ POINT_RECORD : references
+    USER ||--o{ NOTIFICATION : receives
     USER ||--o{ USER_SUGGESTION : submits
 ```
 
 > **说明**
 >
-> 该关系图只表达当前已有表之间的主要关系，不替代数据库文档，也不表示所有业务约束都已由数据库外键或唯一键实现。
+> 该关系图只表达当前已形成文档的数据表之间的主要关系，不替代数据库文档，也不表示所有业务约束都已由数据库外键或唯一键实现。
 
 ---
 
@@ -510,12 +511,13 @@ erDiagram
 
 `description/db/` 是数据库结构和字段语义的只读事实来源。开发时只阅读与当前任务相关的表文档，不需要无差别加载全部文档。
 
-### 8.1 组织与用户
+### 8.1 组织、用户与通知
 
 | 表 | 作用 | 文档 |
 | --- | --- | --- |
 | `department` | 企业部门基础信息 | [部门表说明](db/department.md) |
 | `user` | 用户基础信息、部门归属、头像和身高 | [用户表说明](db/user.md) |
+| `notification` | Markdown 工作通知及钉钉投递状态 | [用户通知表说明](db/notification.md) |
 | `user_suggestion` | 用户建议与反馈 | [用户建议表说明](db/user-suggestion.md) |
 
 ### 8.2 项目与赛季配置
@@ -572,6 +574,7 @@ erDiagram
 | 凭证查询或终审 | [凭证记录表](db/proof-record.md)、[赛季用户项目表](db/season-user-project.md)、[项目规则表](db/project-rule.md) |
 | 进度回退或回补 | [凭证记录表](db/proof-record.md)、[赛季用户项目表](db/season-user-project.md) |
 | 排行榜 | [排行榜快照表](db/leaderboard-snapshot.md)、[凭证记录表](db/proof-record.md)、[赛季用户表](db/season-user.md)、[用户表](db/user.md)、[部门表](db/department.md) |
+| 用户业务通知 | [用户通知表](db/notification.md)、[用户表](db/user.md)；涉及具体业务时继续读取对应业务表文档 |
 | 赛季结算 | [赛季表](db/season.md)、[赛季用户表](db/season-user.md)、[赛季用户项目表](db/season-user-project.md)、[项目等级表](db/project-level.md)、[积分流水表](db/point-record.md) |
 | 积分或商品 | [积分流水表](db/point-record.md)、[商品表](db/product.md)、[用户表](db/user.md) |
 | 用户反馈 | [用户建议表](db/user-suggestion.md)、[用户表](db/user.md) |

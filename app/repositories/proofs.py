@@ -31,6 +31,13 @@ class ProofForFinalReview:
 
 
 @dataclass(frozen=True, slots=True)
+class ProofNotificationContext:
+    user_id: str
+    project_name: str
+    proof_date: date
+
+
+@dataclass(frozen=True, slots=True)
 class ProofBackfillCandidate:
     id: int
     review_status: str
@@ -127,6 +134,39 @@ async def fetch_proof_for_final_review(
         progress_delta=Decimal(str(row["progress_delta"])),
         increase=Decimal(str(row["increase"])),
         status=int(row["status"]),
+    )
+
+
+# 查询终审拒绝通知所需的用户、项目名称和凭证日期，不扩大终审行锁范围。
+async def fetch_proof_notification_context(
+    session: AsyncSession,
+    proof_record_id: int,
+) -> ProofNotificationContext | None:
+    result = await session.exec(
+        text(
+            """
+            SELECT
+                season_user.user_id,
+                project.name AS project_name,
+                proof_record.proof_date
+            FROM proof_record
+            INNER JOIN season_user
+                ON season_user.id = proof_record.season_user_id
+            INNER JOIN project
+                ON project.id = proof_record.project_id
+            WHERE proof_record.id = :proof_record_id
+            LIMIT 1
+            """
+        ),
+        params={"proof_record_id": proof_record_id},
+    )
+    row = result.mappings().first()
+    if row is None:
+        return None
+    return ProofNotificationContext(
+        user_id=str(row["user_id"]),
+        project_name=str(row["project_name"]),
+        proof_date=row["proof_date"],
     )
 
 

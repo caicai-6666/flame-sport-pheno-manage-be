@@ -52,6 +52,12 @@ class GiftDistributionRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class GiftDistributionNotificationContext:
+    product_name: str
+    exchanged_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class LatestPointRecord:
     id: int
     points_after: int
@@ -430,6 +436,35 @@ async def fetch_gift_distribution_for_update(
         change_points=int(row["change_points"]),
         status=int(row["status"]),
         gift_distribution_status=str(row["gift_distribution_status"]),
+    )
+
+
+# 查询礼品发放通知所需的商品名称和原兑换时间，不扩大兑换流水的行锁范围。
+async def fetch_gift_distribution_notification_context(
+    session: AsyncSession,
+    point_record_id: int,
+) -> GiftDistributionNotificationContext | None:
+    result = await session.exec(
+        text(
+            """
+            SELECT
+                product.name AS product_name,
+                point_record.created_at AS exchanged_at
+            FROM point_record
+            INNER JOIN product
+                ON product.id = point_record.product_id
+            WHERE point_record.id = :point_record_id
+            LIMIT 1
+            """
+        ),
+        params={"point_record_id": point_record_id},
+    )
+    row = result.mappings().first()
+    if row is None:
+        return None
+    return GiftDistributionNotificationContext(
+        product_name=str(row["product_name"]),
+        exchanged_at=row["exchanged_at"],
     )
 
 

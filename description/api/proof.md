@@ -130,6 +130,9 @@ Content-Type: application/json
 5. 遍历同一 `season_user_id + project_id` 下仍有效、审核通过且 `progress_delta > increase` 的其他凭证。
 6. 优先使用 `approved` 凭证回补，再使用 `preliminary_approved` 凭证；同一优先级按 `created_at ASC, id ASC` 分配。
 7. 写回候选凭证的 `increase` 和最终 `completion_progress`。
+8. 创建标题为 `运动凭证终审结果` 的 `pending` 通知，保存审核结果、运动项目、凭证日期和审核意见。
+
+终审通过不创建通知。终审拒绝未填写审核意见时，通知中使用 `未填写`。
 
 > **进度口径**
 >
@@ -181,6 +184,7 @@ Content-Type: application/json
 - [凭证记录表说明](../db/proof-record.md)
 - [赛季用户表说明](../db/season-user.md)
 - [赛季用户项目表说明](../db/season-user-project.md)
+- [用户通知表说明](../db/notification.md)
 
 代码入口：
 
@@ -188,7 +192,7 @@ Content-Type: application/json
 - `app/services/proofs.py`
 - `app/repositories/proofs.py`
 
-待终审查询在显式只读事务中执行。终审写入把状态更新、进度撤销、候选回补和项目进度写回放在同一个事务中；项目行锁用于串行化同一用户项目下的进度分配。管理前端读取图片时应把凭证 `id` 传给 [图片安全中转 API](image.md) 的 `/image/proof_record/{proof_record_id}`。
+待终审查询在显式只读事务中执行。终审拒绝把状态更新、进度撤销、候选回补、项目进度写回和通知创建放在同一个事务中；项目行锁用于串行化同一用户项目下的进度分配。通知写入失败时终审事务整体回滚。管理前端读取图片时应把凭证 `id` 传给 [图片安全中转 API](image.md) 的 `/image/proof_record/{proof_record_id}`。
 
 ---
 
@@ -198,7 +202,7 @@ Content-Type: application/json
 python -m unittest tests.test_proof tests.test_proof_final_review -v
 ```
 
-测试覆盖待终审查询，以及终审通过、拒绝回退、终审通过凭证优先回补、回补不足、重复终审、进度一致性、参数校验、认证和事务回滚边界。
+测试覆盖待终审查询，以及终审通过不通知、拒绝通知、拒绝回退、终审通过凭证优先回补、回补不足、重复终审、进度一致性、通知失败回滚、参数校验和认证。
 
 ---
 

@@ -10,14 +10,20 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.clients.client_backend import ClientBackendClient
 from app.core.config import get_settings
+from app.repositories.notifications import (
+    NotificationField,
+    insert_notification,
+)
 from app.repositories.products import (
     GiftDistributionRecord,
+    GiftDistributionNotificationContext,
     LatestPointRecord,
     PendingGiftDistribution,
     ProductDetails,
     ProductInformation,
     fetch_all_products,
     fetch_gift_distribution_for_update,
+    fetch_gift_distribution_notification_context,
     fetch_gift_distribution_user_id,
     fetch_latest_point_record_for_update,
     fetch_pending_gift_distributions,
@@ -41,6 +47,7 @@ settings = get_settings()
 GiftDistributionDecision = Literal["distributed", "rejected"]
 REJECTED_DISTRIBUTION_DESCRIPTION = "发放失败，请联系管理员"
 EXCHANGE_REFUND_DESCRIPTION = "礼品拒绝发放，退还兑换积分"
+GIFT_DISTRIBUTION_NOTIFICATION_TITLE = "奖品发放结果"
 
 
 class ProductNotFoundError(RuntimeError):
@@ -79,6 +86,33 @@ class ProductImageSizeExceededError(ValueError):
 class GiftDistributionResult:
     id: int
     gift_distribution_status: GiftDistributionDecision
+
+
+# 按发放结论构造固定顺序消息字段，拒绝时附带实际退款积分和处理说明。
+def build_gift_distribution_notification_fields(
+    distribution: GiftDistributionRecord,
+    context: GiftDistributionNotificationContext,
+    decision: GiftDistributionDecision,
+) -> tuple[NotificationField, ...]:
+    fields = [
+        NotificationField(
+            "发放结果",
+            "已发放" if decision == "distributed" else "未发放",
+        ),
+        NotificationField("奖品名称", context.product_name),
+        NotificationField(
+            "兑换时间",
+            context.exchanged_at.strftime("%Y-%m-%d %H:%M:%S"),
+        ),
+    ]
+    if decision == "rejected":
+        fields.extend(
+            (
+                NotificationField("退还积分", str(-distribution.change_points)),
+                NotificationField("处理说明", "兑换积分已退还"),
+            )
+        )
+    return tuple(fields)
 
 
 @dataclass(frozen=True, slots=True)
@@ -357,7 +391,26 @@ async def process_gift_distribution(
             if terminal_result is not None:
                 return terminal_result
             await update_gift_distribution_status(session, point_record_id)
-            return GiftDistributionResult(point_record_id, "distributed")
+            result = GiftDistributionResult(point_record_id, "distributed")
+            notification_context = (
+                await fetch_gift_distribution_notification_context(
+                    session,
+                    point_record_id,
+                )
+            )
+            if notification_context is None:
+                raise InvalidGiftDistributionRecordError
+            await insert_notification(
+                session,
+                distribution.user_id,
+                GIFT_DISTRIBUTION_NOTIFICATION_TITLE,
+                build_gift_distribution_notification_fields(
+                    distribution,
+                    notification_context,
+                    decision,
+                ),
+            )
+            return result
 
         user_id = await fetch_gift_distribution_user_id(
             session,
@@ -387,8 +440,27 @@ async def process_gift_distribution(
         )
         if latest_point_record is None:
             raise PointBalanceConsistencyError
-        return await reject_and_refund_gift_distribution(
+        result = await reject_and_refund_gift_distribution(
             session,
             distribution,
             latest_point_record,
         )
+        notification_context = (
+            await fetch_gift_distribution_notification_context(
+                session,
+                point_record_id,
+            )
+        )
+        if notification_context is None:
+            raise InvalidGiftDistributionRecordError
+        await insert_notification(
+            session,
+            distribution.user_id,
+            GIFT_DISTRIBUTION_NOTIFICATION_TITLE,
+            build_gift_distribution_notification_fields(
+                distribution,
+                notification_context,
+                decision,
+            ),
+        )
+        return result

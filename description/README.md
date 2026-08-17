@@ -74,12 +74,13 @@ description/
 
 `description/db/` 是数据库结构、字段语义、索引和关联关系的事实来源。除非用户明确要求优化或修改数据库文档，否则该目录**只读**。
 
-### 4.1 组织、用户与反馈
+### 4.1 组织、用户、通知与反馈
 
 | 数据表 | 文档 | 主要用途 |
 | --- | --- | --- |
 | `department` | [部门表说明](db/department.md) | 企业部门、用户归属和排行榜部门展示 |
 | `user` | [用户表说明](db/user.md) | 用户基础信息、部门归属、头像和身高 |
+| `notification` | [用户通知表说明](db/notification.md) | Markdown 工作通知及钉钉投递状态 |
 | `user_suggestion` | [用户建议表说明](db/user-suggestion.md) | 用户建议、记录状态和处理阶段 |
 
 ### 4.2 运动项目与挑战配置
@@ -166,6 +167,7 @@ description/
 | 项目图标读取 | [图片安全中转 API](api/image.md) | [项目表](db/project.md) |
 | 商品图片读取 | [图片安全中转 API](api/image.md)、[积分商城商品 API](api/product.md) | [商品表](db/product.md) |
 | 运动凭证图片读取 | [图片安全中转 API](api/image.md)、[凭证终审 API](api/proof.md) | [凭证记录表](db/proof-record.md)、[赛季用户表](db/season-user.md)、[赛季表](db/season.md) |
+| 业务结果通知 | [通知写入规则](application/result-notifications.md)、[凭证终审 API](api/proof.md)、[礼品发放 API](api/product.md) | [用户通知表](db/notification.md)、[凭证记录表](db/proof-record.md)、[积分流水表](db/point-record.md)、[用户表](db/user.md) |
 | 用户反馈管理 | [用户意见 API](api/suggestion.md)、[管理端职责边界](project.md) | [用户建议表](db/user-suggestion.md)、[用户表](db/user.md) |
 | 运动项目查询、创建、状态与规则展示 | [运动项目管理 API](api/project.md) | [项目表](db/project.md)、[挑战等级表](db/project-level.md)、[项目规则表](db/project-rule.md)、[上传配置表](db/project-upload-config.md) |
 | 运动项目配置管理 | [运动项目管理 API](api/project.md)、[项目与挑战规则](project.md) | [项目表](db/project.md)、[挑战等级表](db/project-level.md)、[项目规则表](db/project-rule.md)、[上传配置表](db/project-upload-config.md) |

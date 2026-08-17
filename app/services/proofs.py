@@ -6,19 +6,27 @@ from typing import Literal
 
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from app.repositories.notifications import (
+    NotificationField,
+    insert_notification,
+)
 from app.repositories.proofs import (
     PendingFinalReviewProof,
     ProofForFinalReview,
+    ProofNotificationContext,
     fetch_locked_backfill_candidates,
     fetch_locked_project_progress,
     fetch_pending_final_review_proofs,
     fetch_proof_for_final_review,
+    fetch_proof_notification_context,
     update_project_completion_progress,
     update_proof_final_review,
     update_proof_increase,
 )
 
 ZERO_PROGRESS = Decimal("0.0000")
+PROOF_REJECTION_NOTIFICATION_TITLE = "运动凭证终审结果"
+MISSING_REVIEW_COMMENT = "未填写"
 
 
 class ProofForFinalReviewNotFoundError(RuntimeError):
@@ -41,6 +49,26 @@ class FinalReviewResult:
     rolled_back_progress: Decimal
     backfilled_progress: Decimal
     completion_progress: Decimal | None
+
+
+# 构造终审拒绝的固定顺序消息字段，空审核意见使用明确占位文本。
+def build_proof_rejection_notification_fields(
+    context: ProofNotificationContext,
+    review_comment: str | None,
+) -> tuple[NotificationField, ...]:
+    return (
+        NotificationField("审核结果", "未通过"),
+        NotificationField("运动项目", context.project_name),
+        NotificationField("凭证日期", context.proof_date.isoformat()),
+        NotificationField(
+            "审核意见",
+            (
+                review_comment
+                if review_comment is not None
+                else MISSING_REVIEW_COMMENT
+            ),
+        ),
+    )
 
 
 # 在只读事务中查询待终审凭证，保持审核状态筛选逻辑脱离 HTTP 层。
@@ -195,8 +223,24 @@ async def record_proof_final_review(
                 proof_record_id,
                 review_comment,
             )
-        return await reject_proof_record(
+        result = await reject_proof_record(
             session,
             proof_snapshot,
             review_comment,
         )
+        notification_context = await fetch_proof_notification_context(
+            session,
+            proof_record_id,
+        )
+        if notification_context is None:
+            raise ProofProgressConsistencyError
+        await insert_notification(
+            session,
+            notification_context.user_id,
+            PROOF_REJECTION_NOTIFICATION_TITLE,
+            build_proof_rejection_notification_fields(
+                notification_context,
+                review_comment,
+            ),
+        )
+        return result

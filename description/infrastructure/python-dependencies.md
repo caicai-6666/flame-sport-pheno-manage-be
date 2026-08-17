@@ -40,7 +40,7 @@ python -m pip install -r requirements.txt
 
 ## 3. 配置与安全
 
-- 数据库密码、DeepSeek API Key、OpenAI API Key 和其他凭证必须通过环境配置注入，禁止写入 `requirements.txt`、代码或文档。
+- 数据库密码、DeepSeek API Key 和其他凭证必须通过环境配置注入，禁止写入 `requirements.txt`、代码或文档。
 - 外部 HTTP 和模型调用必须配置合理超时，重试应有上限并避免重复副作用。
 - 图片上传必须校验大小、格式和内容，不能只相信扩展名或请求中的 MIME 类型。
 - `cryptography` 只能使用经过验证的高层协议和项目既定方案，禁止自行设计加密算法。

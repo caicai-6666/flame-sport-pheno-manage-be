@@ -57,8 +57,6 @@ class Settings(BaseSettings):
     deepseek_model: str = Field(default="deepseek-v4-flash", min_length=1)
     deepseek_http_timeout_seconds: float = Field(default=60.0, gt=0)
 
-    openai_api_key: SecretStr | None = None
-
     # 使用 SQLAlchemy URL 安全拼装异步 MySQL 地址，避免密码中的特殊字符破坏连接串。
     @property
     def database_url(self) -> URL:

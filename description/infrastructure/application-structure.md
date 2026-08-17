@@ -186,7 +186,7 @@ cp .env.example .env
 
 | 配置组 | 关键配置 | 说明 |
 | --- | --- | --- |
-| 应用 | `APP_NAME`、`APP_ENV`、`APP_DEBUG` | 服务名称、环境和调试开关 |
+| 应用 | `APP_NAME`、`APP_ENV`、`APP_DEBUG`、`TZ` | 服务名称、环境、调试开关和固定的 `Asia/Shanghai` 运行时区 |
 | 监听 | `APP_HOST`、`APP_PORT` | Uvicorn 监听地址和端口 |
 | API | `API_PREFIX`、`PUBLIC_API_PREFIX`、`CORS_ORIGINS` | 后端内部路由前缀、Nginx 对外路由前缀和允许访问的管理端前端来源 |
 | 管理认证 | `ADMIN_KEY`、`ADMIN_TOKEN_TTL_SECONDS`、`ADMIN_TOKEN_CACHE_MAX_SIZE` | 管理员共享密钥、token 有效期和单进程缓存上限 |
@@ -196,7 +196,6 @@ cp .env.example .env
 | 客户端后端 | `CLIENT_BACKEND_BASE_URL`、`CLIENT_BACKEND_TIMEOUT_SECONDS` | 客户端后端局域网服务地址和请求超时 |
 | 图片缓存 | `IMAGE_CACHE_SECONDS` | 所有图片响应的浏览器私有缓存时效，单位为秒 |
 | DeepSeek 模型 | `DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL`、`DEEPSEEK_MODEL`、`DEEPSEEK_HTTP_TIMEOUT_SECONDS` | 与客户端后端共享的 OpenAI 兼容模型密钥、地址、模型名称和调用超时 |
-| OpenAI 模型 | `OPENAI_API_KEY` | 预留的原生 OpenAI API Key，可在未使用时留空 |
 
 配置由 `pydantic-settings` 从根目录 `.env` 和进程环境变量加载并校验。数据库密码使用 `SecretStr` 保存，构造连接地址时通过 SQLAlchemy `URL` 处理特殊字符。
 
@@ -221,7 +220,7 @@ DEEPSEEK_HTTP_TIMEOUT_SECONDS=60
 
 ### 3.3 激活赛季配置变更窗口
 
-`ACTIVE_SEASON_CONFIG_EDIT_WINDOW_HOURS` 统一定义当前激活赛季开始后仍可执行高影响配置变更的时长。当前赛季仍按 `season.status = 1` 识别；由于赛季表只保存日期，窗口起点统一解释为 `season.start_date` 当日 `00:00`，并使用应用部署时区计算。
+`ACTIVE_SEASON_CONFIG_EDIT_WINDOW_HOURS` 统一定义当前激活赛季开始后仍可执行高影响配置变更的时长。当前赛季仍按 `season.status = 1` 识别；由于赛季表只保存日期，窗口起点统一解释为 `season.start_date` 在 `Asia/Shanghai` 时区的当日 `00:00`。业务代码显式使用该时区，不依赖宿主机或容器的默认时区。
 
 该配置计划用于以下写操作：
 

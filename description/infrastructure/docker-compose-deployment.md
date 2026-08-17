@@ -63,6 +63,8 @@ flowchart LR
 
 Compose 会把共享的 `MYSQL_USER`、`MYSQL_PASSWORD`、`MYSQL_DATABASE` 和四项 `DEEPSEEK_*` 配置注入管理端后端，并将数据库主机固定为 `mysql:3306`。客户端后端默认使用 `http://backend:8000/flame/api/admin`；只有 Compose 服务名或管理接口路径变化时才调整该环境变量，生产容器不得误走公网。
 
+管理端后端容器固定注入 `TZ=Asia/Shanghai`，镜像也使用相同默认值。涉及赛季日期边界的业务代码仍应显式使用 `Asia/Shanghai`，不得只依赖容器系统时区。
+
 > **警告**
 >
 > `.env.example` 只能保存占位符。真实 MySQL 密码、管理员密码和模型密钥不得进入 Dockerfile、Compose 文件、镜像层或项目文档。
