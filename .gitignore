@@ -10,6 +10,9 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
+# 本地测试代码不纳入版本控制。
+tests/
+
 # 本地虚拟环境。
 .venv/
 venv/

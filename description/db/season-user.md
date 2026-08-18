@@ -31,6 +31,7 @@
 | level_id     | BIGINT UNSIGNED  |       否 |   NULL | 用户本赛季选择的项目等级，关联 `project_level.id` |
 | participated_at | DATETIME      |       否 |   NULL | 首次成功锁定挑战等级的正式报名时间 |
 | final_points | INT UNSIGNED     |       否 |   NULL | 用户本赛季最终获得的积分                          |
+| points_issued | TINYINT UNSIGNED |      是 |      0 | 积分发放状态：`0` 未发放，`1` 已发放             |
 | status       | TINYINT UNSIGNED |       是 |      0 | 已锁定项目数量，用于判断用户是否满足当前赛季参与要求 |
 
 ---
@@ -125,6 +126,21 @@ NULL = 尚未结算
 
 ---
 
+### points_issued
+
+记录 `final_points` 是否已经计入用户全局积分流水：
+
+```text
+0 = 未发放
+1 = 已发放
+```
+
+`final_points = NULL` 时必须保持为 `0`。只有对应 `season_reward` 积分流水及其 `points_after` 在同一事务内成功写入后，才能更新为 `1`。
+
+该字段默认值为 `0`。现有记录迁移后均保持未发放状态，不根据 `final_points` 自动推断。
+
+---
+
 ### status
 
 用户当前赛季已锁定项目数量。
@@ -159,6 +175,7 @@ CREATE TABLE season_user (
   level_id BIGINT UNSIGNED DEFAULT NULL COMMENT '项目等级ID',
   participated_at DATETIME DEFAULT NULL COMMENT '正式报名时间（首次锁定挑战等级时写入）',
   final_points INT UNSIGNED DEFAULT NULL COMMENT '赛季最终获得积分，NULL表示尚未结算',
+  points_issued TINYINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '积分发放状态：0未发放，1已发放',
   status TINYINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '已锁定项目数量',
   PRIMARY KEY (id),
   UNIQUE KEY uk_season_user (season_id, user_id),
@@ -167,6 +184,10 @@ CREATE TABLE season_user (
   KEY idx_season_user_level_id (level_id),
   KEY idx_season_user_participated_at (participated_at),
   KEY idx_season_user_status (status),
+  CONSTRAINT chk_season_user_points_issued
+    CHECK (points_issued IN (0, 1)),
+  CONSTRAINT chk_season_user_points_issued_finalized
+    CHECK (points_issued = 0 OR final_points IS NOT NULL),
   CONSTRAINT fk_season_user_season
     FOREIGN KEY (season_id) REFERENCES season(id),
   CONSTRAINT fk_season_user_user
@@ -174,4 +195,19 @@ CREATE TABLE season_user (
   CONSTRAINT fk_season_user_level
     FOREIGN KEY (level_id) REFERENCES project_level(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='赛季用户表';
+```
+
+---
+
+## 现有数据库迁移
+
+```sql
+ALTER TABLE season_user
+  ADD COLUMN points_issued TINYINT UNSIGNED NOT NULL DEFAULT 0
+    COMMENT '积分发放状态：0未发放，1已发放'
+    AFTER final_points,
+  ADD CONSTRAINT chk_season_user_points_issued
+    CHECK (points_issued IN (0, 1)),
+  ADD CONSTRAINT chk_season_user_points_issued_finalized
+    CHECK (points_issued = 0 OR final_points IS NOT NULL);
 ```

@@ -25,7 +25,7 @@
 | id             | BIGINT UNSIGNED  |       是 |   自增 | 赛季用户项目记录主键 ID                |
 | season_user_id | BIGINT UNSIGNED  |       是 |     无 | 赛季用户记录 ID，关联 `season_user.id` |
 | project_id     | BIGINT UNSIGNED  |       是 |     无 | 项目 ID，关联 `project.id`             |
-| completion_progress | DECIMAL(5,4) | 是 | 0.0000 | 本赛季该项目完成进度，范围 `0`～`1` |
+| completion_progress | DECIMAL(5,4) | 是 | 0.0000 | 本赛季项目完成进度，取值 `0.0000`～`1.0000` |
 | status         | TINYINT UNSIGNED |       是 |      1 | 状态：`1` 已锁定，`0` 无效/取消        |
 
 ---
@@ -121,7 +121,7 @@ CREATE TABLE season_user_project (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '赛季用户项目记录ID',
   season_user_id BIGINT UNSIGNED NOT NULL COMMENT '赛季用户记录ID',
   project_id BIGINT UNSIGNED NOT NULL COMMENT '项目ID',
-  completion_progress DECIMAL(5,4) NOT NULL DEFAULT 0.0000 COMMENT '本赛季项目完成进度：0未完成，1已完成',
+  completion_progress DECIMAL(5,4) NOT NULL DEFAULT 0.0000 COMMENT '本赛季项目完成进度，取值0.0000～1.0000',
   status TINYINT UNSIGNED NOT NULL DEFAULT 1 COMMENT '状态：1已锁定，0无效/取消',
   PRIMARY KEY (id),
   UNIQUE KEY uk_season_user_project (season_user_id, project_id),
@@ -142,7 +142,7 @@ CREATE TABLE season_user_project (
 ```sql
 ALTER TABLE season_user_project
   ADD COLUMN completion_progress DECIMAL(5,4) NOT NULL DEFAULT 0.0000
-    COMMENT '本赛季项目完成进度：0未完成，1已完成' AFTER project_id,
+    COMMENT '本赛季项目完成进度，取值0.0000～1.0000' AFTER project_id,
   ADD CONSTRAINT chk_season_user_project_completion_progress
     CHECK (completion_progress >= 0 AND completion_progress <= 1);
 ```

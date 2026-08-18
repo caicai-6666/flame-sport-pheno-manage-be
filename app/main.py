@@ -1,5 +1,6 @@
+import asyncio
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 import uvicorn
 from fastapi import FastAPI
@@ -7,22 +8,42 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.clients.client_backend import ClientBackendClient
 from app.core.config import get_settings
-from app.db.session import engine
+from app.db.session import async_session_factory, engine
+from app.jobs.season_status import run_season_status_scheduler
 from app.router import router
 
 settings = get_settings()
 
 
-# 管理应用级共享资源，并确保 HTTP 客户端和数据库连接池在退出时可靠释放。
+# 管理应用级共享资源和赛季结算任务，并在退出时按依赖顺序可靠释放。
 @asynccontextmanager
 async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     application.state.client_backend = ClientBackendClient(
         base_url=str(settings.client_backend_base_url),
         timeout_seconds=settings.client_backend_timeout_seconds,
     )
+    season_status_task: asyncio.Task[None] | None = None
+    if settings.season_status_check_enabled:
+        season_status_task = asyncio.create_task(
+            run_season_status_scheduler(
+                async_session_factory,
+                application.state.client_backend,
+                settings.season_status_check_interval_seconds,
+                settings.season_settlement_review_batch_size,
+                settings.season_settlement_review_concurrency,
+                settings.season_settlement_user_batch_size,
+                settings.season_settlement_auto_complete_enabled,
+                settings.season_settlement_auto_complete_after_days,
+            ),
+            name="season-status-scheduler",
+        )
     try:
         yield
     finally:
+        if season_status_task is not None:
+            season_status_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await season_status_task
         await application.state.client_backend.aclose()
         await engine.dispose()
 

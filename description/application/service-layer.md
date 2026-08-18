@@ -38,14 +38,15 @@ services：用例规则、事务边界、调用编排、稳定应用异常
 | --- | --- | --- | --- |
 | `app/services/admin_auth.py` | 管理员登录 | `AdminTokenCache` | 校验签发结果，返回稳定令牌数据，隐藏缓存失败语义 |
 | `app/services/season_statistics.py` | 查询当前赛季统计与指定用户项目进度 | 赛季统计仓储 | 管理只读事务，确保当前赛季唯一，查询有效参赛项目，将仓储一致性异常转换为应用异常 |
-| `app/services/seasons.py` | 查询与创建赛季 | 赛季仓储、项目仓储 | 映射赛季状态含义；校验完整日历月，在事务锁保护下复核历史结束边界和可见项目容量，再按请求项目数创建未开始赛季 |
+| `app/services/seasons.py` | 查询与创建赛季 | 赛季仓储、项目仓储 | 映射赛季状态含义；校验完整日历月、历史边界和项目容量并创建未开始赛季 |
+| `app/services/season_settlements.py` | 查询、初始化并持续收敛赛季结算 | 结算仓储、积分仓储、凭证服务、通知仓储、客户端后端 | 在只读事务返回唯一结算赛季、正式参赛记录、批量用户详情及待终审队列；推进到期状态并清空资格；补齐遗留初审；分用户登记资格、定分；按用户级锁写入赛季奖励流水并标记发放；结束已完全收敛的赛季 |
 | `app/services/users.py` | 批量查询用户基础信息 | 用户仓储 | 用户 ID 保序去重，管理只读事务，编排批量查询 |
 | `app/services/suggestions.py` | 查询、处理用户意见 | 意见仓储 | 只查询可见且待处理的意见；在行锁保护下将意见标记为拒绝或已解决，并保证重复动作幂等 |
 | `app/services/projects.py` | 查询与创建项目、查询项目等级规则、修改项目可见状态 | 项目仓储、配置窗口守卫、客户端后端 | 管理查询和写事务；创建时校验 WebP 与完整规则矩阵，原子写入项目配置，并通过固定上游接口保存唯一地址图标；状态修改在窗口与项目行锁保护下完成 |
 | `app/services/configuration_guard.py` | 校验激活赛季配置变更窗口 | 激活赛季锁定仓储、环境配置 | 统一识别当前激活赛季、计算配置截止时刻，并拒绝超时或多激活赛季下的高影响写入 |
 | `app/services/project_levels.py` | 查询、创建挑战等级，修改奖励积分与项目规则配置 | 挑战等级仓储、项目规则仓储、配置窗口守卫 | 管理查询和写事务；原子创建等级及空值规则，在窗口与行锁保护下覆盖奖励积分或局部修改既有规则指标值，并映射业务冲突 |
 | `app/services/products.py` | 新增与查询商品、修改商品基础资料与可见状态、查询兑换礼品与奖品信息，处理发放审核 | 商品仓储、通知仓储、配置窗口服务、客户端图片服务 | 管理查询和写事务；新增奖品默认上架，数据库提交后落盘 WebP；基础资料局部更新在提交后上传新图和清理旧图；既有奖品积分修改受配置窗口保护；上下架在商品行锁下幂等更新；发放审核首次进入终态时原子创建结果通知，拒绝时同时锁定用户最新积分流水并新增退款流水 |
-| `app/services/proofs.py` | 查询待终审凭证、记录终审 | 凭证仓储、通知仓储 | 管理查询与终审事务；拒绝时撤销贡献，按终审通过优先顺序回补项目进度，并原子创建终审拒绝通知 |
+| `app/services/proofs.py` | 查询待终审凭证、记录终审 | 凭证仓储、通知仓储、结算服务 | 管理查询与终审事务；拒绝时撤销贡献并回补项目进度；结算中同步补传资格并在最后一条终审通过后立即尝试定分 |
 | `app/services/images.py` | 中转头像、项目图标、商品图片与运动凭证图片，上传新项目图标与商品图片 | 客户端后端适配器 | 按预定义资源固定上游路径、隔离网络与状态异常、校验图片媒体类型、附带缓存时效；按固定 multipart 协议上传 WebP 项目图标，并向 `/product/replace` 上传 WebP 奖品图片和替换地址 |
 
 `app/services/__init__.py` 只声明包，不集中重新导出所有服务，避免形成隐式公共 API 和循环依赖。
@@ -129,7 +130,9 @@ async with session.begin():
 
 商品基础资料更新先在事务外限量读取并校验可选图片，声明媒体类型和真实格式都必须是 WebP；有效图片会获得不复用的 `.webp` 地址。服务随后在单一数据库事务内锁定商品并应用显式补丁。只有补丁包含 `points_required` 时才执行激活赛季配置窗口校验；名称、描述和图片可独立修改。图片变更时，数据库事务先提交，再检查旧地址是否仍被其他商品引用，最后通过 multipart 调用客户端 `/product/replace` 上传新图并按需清理旧图。该顺序避免数据库失败后旧文件已被删除，但客户端失败会形成数据库已提交而新图未写入的部分成功结果，必须向路由传播而不能伪装回滚。
 
-业务结果通知使用事务内通知记录实现可靠交接。凭证只在终审拒绝时创建通知；礼品只在首次进入 `distributed` 或 `rejected` 时创建通知。通知初始状态为 `pending`，与对应审核状态、进度调整和积分退款一起提交；通知写入失败会使当前业务事务整体回滚。管理端后端不在事务中调用钉钉接口。
+业务结果通知使用事务内通知记录实现可靠交接。凭证只在普通终审拒绝时创建通知；赛季定分创建一条汇总通知；礼品只在首次进入 `distributed` 或 `rejected` 时创建通知。通知初始状态为 `pending`，与对应审核状态、资格、定分、进度调整或积分退款一起提交；通知写入失败会使当前业务事务整体回滚。管理端后端不在事务中调用钉钉接口。
+
+赛季结算任务由 `app/jobs/season_status.py` 触发。状态转换和资格表清空使用同一事务；遗留初审在事务外调用客户端后端；每个用户以独立事务锁定 `season_user` 并处理审核、进度、资格、定分和通知。任务按主键游标分批读取，单个用户失败不会扩大到其他已提交用户。
 
 服务异常不包含 SQL、连接地址或未知上游响应正文。路由只根据异常类型选择状态码，不能依赖解析异常字符串判断业务分支。
 
@@ -165,7 +168,7 @@ async with session.begin():
 在仓库根目录执行服务层测试：
 
 ```bash
-python -m unittest tests.test_services tests.test_project_status tests.test_project_creation -v
+python -m unittest tests.test_services tests.test_project_status tests.test_project_creation tests.test_season_settlement -v
 ```
 
 测试覆盖：
@@ -189,6 +192,9 @@ python -m unittest tests.test_services tests.test_project_status tests.test_proj
 - [管理端密钥认证 API](../api/admin-authentication.md)
 - [赛季统计 API](../api/season-statistics.md)
 - [赛季管理 API](../api/season.md)
+- [赛季状态与结算定时任务](../job/season-status-transition.md)
+- [赛季结算应用编排](season-settlement.md)
+- [赛季结算 API](../api/settlement.md)
 - [用户基础信息 API](../api/user.md)
 - [用户意见 API](../api/suggestion.md)
 - [图片安全中转 API](../api/image.md)

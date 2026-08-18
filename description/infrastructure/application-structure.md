@@ -22,6 +22,7 @@ app/
 │   ├── proof.py                  # 凭证查询与终审请求、响应
 │   ├── season.py                 # 赛季管理请求与响应
 │   ├── season_statistics.py      # 赛季统计响应结构
+│   ├── settlement.py             # 结算赛季查询响应结构
 │   ├── suggestion.py             # 用户意见请求与响应
 │   └── user.py                   # 用户查询参数类型与响应结构
 ├── router/
@@ -36,6 +37,7 @@ app/
 │   ├── proof.py                  # 待终审凭证查询与终审写入路由
 │   ├── season.py                 # 赛季查询与创建路由
 │   ├── season_statistics.py      # 赛季统计子路由
+│   ├── settlement.py             # 结算赛季查询与后续结算操作路由
 │   ├── suggestion.py             # 待处理用户意见查询与处理路由
 │   └── user.py                   # 用户基础信息查询路由
 ├── clients/
@@ -48,6 +50,9 @@ app/
 ├── db/
 │   ├── __init__.py
 │   └── session.py                # 异步 MySQL 引擎和会话工厂
+├── jobs/
+│   ├── __init__.py
+│   └── season_status.py          # 赛季状态与结算定时任务
 ├── services/
 │   ├── __init__.py
 │   ├── admin_auth.py             # 管理员登录用例
@@ -57,6 +62,7 @@ app/
 │   ├── project_levels.py         # 挑战等级、奖励积分与项目规则配置用例
 │   ├── projects.py               # 项目查询、创建、可见状态修改与等级规则用例
 │   ├── proofs.py                 # 待终审查询与终审进度编排用例
+│   ├── season_settlements.py     # 遗留初审、补传资格与最终定分用例
 │   ├── seasons.py                # 赛季查询、创建与状态含义映射用例
 │   ├── season_statistics.py      # 当前赛季统计查询用例
 │   ├── suggestions.py            # 待处理用户意见查询与处理用例
@@ -68,7 +74,8 @@ app/
     ├── project_levels.py         # 挑战等级查询、创建与奖励积分更新
     ├── projects.py               # 项目查询、项目及子配置持久化
     ├── proofs.py                 # 待终审查询、行锁与进度写入
-    ├── seasons.py                # 赛季查询、日期边界锁定与创建持久化
+    ├── season_settlements.py     # 结算状态、资格、进度和定分数据访问
+    ├── seasons.py                # 赛季查询、日期边界锁定与创建
     ├── season_statistics.py      # 当前赛季、正式参赛人员与项目进度查询
     ├── suggestions.py            # 待处理意见查询、处理行锁与阶段写入
     └── users.py                  # 用户与部门基础信息查询
@@ -98,6 +105,9 @@ tests/
 ├── test_proof.py                 # 待终审凭证接口、服务与仓储测试
 ├── test_proof_final_review.py    # 终审状态、进度回退与回补测试
 ├── test_season_statistics_router.py # 受保护路由聚合测试
+├── test_season_settlement.py     # 结算分支、资格、积分和连续奖励测试
+├── test_settlement_route.py      # 结算赛季查询路由、服务与仓储测试
+├── test_season_status_job.py     # 状态结算调度、配置与生命周期测试
 ├── test_schema_boundaries.py     # HTTP Schema 放置与依赖方向约束测试
 ├── test_services.py              # 应用服务编排、事务和异常测试
 ├── test_suggestion.py            # 待处理意见接口、服务与仓储测试
@@ -122,6 +132,7 @@ script/
 | `app/clients/` | 隔离客户端后端及后续其他外部服务的 HTTP 协议 |
 | `app/core/` | 维护应用级配置及不属于具体业务域的核心能力 |
 | `app/db/` | 维护数据库引擎、连接池和请求级会话 |
+| `app/jobs/` | 维护进程内定时任务的触发、重试、日志和生命周期接入 |
 | `app/services/` | 编排业务用例、事务、下层依赖和稳定应用异常，不处理 HTTP 协议 |
 | `app/repositories/` | 集中维护业务数据访问和聚合 SQL，不处理 HTTP 协议 |
 | `tests/` | 维护可使用项目既定命令运行的自动化测试 |
@@ -154,10 +165,11 @@ from app.main import app
 
 1. 启动时创建可复用连接池的客户端后端 HTTP 客户端。
 2. 将客户端保存在 `app.state.client_backend`，供后续依赖注入层获取。
-3. 退出时关闭 HTTP 客户端连接池。
-4. 退出时释放异步 MySQL 引擎的连接池。
+3. 配置启用时启动赛季状态与结算后台任务，并立即执行一次停机补偿检查。
+4. 退出时取消后台任务，再关闭 HTTP 客户端连接池。
+5. 最后释放异步 MySQL 引擎的连接池。
 
-启动阶段不会主动访问 MySQL 或客户端后端，因此缺少外部连接时仍可导入应用并执行存活检查。需要依赖可用性判断时，应由独立的就绪检查承担。
+模块导入不会主动访问 MySQL 或客户端后端。生命周期启动后，赛季任务会访问 MySQL，并可能调用固定的客户端立即初审接口；单次失败只记录日志并等待下个周期，不阻止 HTTP 服务启动。需要依赖可用性判断时，应由独立的就绪检查承担。
 
 ---
 
@@ -191,6 +203,7 @@ cp .env.example .env
 | API | `API_PREFIX`、`PUBLIC_API_PREFIX`、`CORS_ORIGINS` | 后端内部路由前缀、Nginx 对外路由前缀和允许访问的管理端前端来源 |
 | 管理认证 | `ADMIN_KEY`、`ADMIN_TOKEN_TTL_SECONDS`、`ADMIN_TOKEN_CACHE_MAX_SIZE` | 管理员共享密钥、token 有效期和单进程缓存上限 |
 | 赛季配置保护 | `ACTIVE_SEASON_CONFIG_EDIT_WINDOW_HOURS` | 当前激活赛季开始后允许调整高影响业务配置的窗口，单位为小时 |
+| 赛季结算 | `SEASON_STATUS_CHECK_ENABLED`、`SEASON_STATUS_CHECK_INTERVAL_SECONDS`、`SEASON_SETTLEMENT_REVIEW_BATCH_SIZE`、`SEASON_SETTLEMENT_REVIEW_CONCURRENCY`、`SEASON_SETTLEMENT_USER_BATCH_SIZE`、`SEASON_SETTLEMENT_AUTO_COMPLETE_ENABLED`、`SEASON_SETTLEMENT_AUTO_COMPLETE_AFTER_DAYS`、`SEASON_SETTLEMENT_TWO_MONTH_STREAK_BONUS_POINTS`、`SEASON_SETTLEMENT_THREE_MONTH_STREAK_BONUS_POINTS` | 任务开关、轮询间隔、遗留初审批次与并发、自动收口期限、用户批次及连续完成奖励积分 |
 | MySQL | `MYSQL_HOST`、`MYSQL_PORT`、`MYSQL_USER`、`MYSQL_PASSWORD`、`MYSQL_DATABASE` | 异步数据库连接信息 |
 | 连接池 | `MYSQL_POOL_SIZE`、`MYSQL_MAX_OVERFLOW`、`MYSQL_POOL_RECYCLE_SECONDS` | 数据库连接池容量与回收周期 |
 | 客户端后端 | `CLIENT_BACKEND_BASE_URL`、`CLIENT_BACKEND_TIMEOUT_SECONDS` | 客户端后端局域网服务地址和请求超时 |
@@ -198,6 +211,24 @@ cp .env.example .env
 | DeepSeek 模型 | `DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL`、`DEEPSEEK_MODEL`、`DEEPSEEK_HTTP_TIMEOUT_SECONDS` | 与客户端后端共享的 OpenAI 兼容模型密钥、地址、模型名称和调用超时 |
 
 配置由 `pydantic-settings` 从根目录 `.env` 和进程环境变量加载并校验。数据库密码使用 `SecretStr` 保存，构造连接地址时通过 SQLAlchemy `URL` 处理特殊字符。
+
+连续完整完成赛季的奖励可按部署环境配置：
+
+```dotenv
+SEASON_SETTLEMENT_TWO_MONTH_STREAK_BONUS_POINTS=50
+SEASON_SETTLEMENT_THREE_MONTH_STREAK_BONUS_POINTS=100
+```
+
+两个值必须是 `0～4294967295` 的整数，修改后需要重启应用。配置只参与尚未定分用户的连续奖励计算，已经持久化的 `final_points` 不会随配置变化而重算。
+
+自动一键结算使用以下配置：
+
+```dotenv
+SEASON_SETTLEMENT_AUTO_COMPLETE_ENABLED=false
+SEASON_SETTLEMENT_AUTO_COMPLETE_AFTER_DAYS=7
+```
+
+等待天数必须是 `0～365` 的整数，并按 `Asia/Shanghai` 自然日计算。自动开关只在 `SEASON_STATUS_CHECK_ENABLED=true` 时生效；默认关闭，启用或修改等待天数后需要重启应用。
 
 客户端后端使用一个环境变量保存协议、局域网服务名、端口和管理接口基础路径：
 
@@ -295,7 +326,7 @@ async def example_service(
 - 对非成功响应调用 `raise_for_status()`；
 - 在应用退出时关闭连接池。
 
-路由通过 `ClientBackend` 依赖从 `app.state.client_backend` 获取共享客户端并传给应用服务，不得在每个请求中重复创建 `httpx.AsyncClient`。当前图片中转服务只固定调用客户端后端 `/avator`、`/project_icon`、`/product` 与 `/proof_record/{id}`；项目创建使用固定的 `POST /project_icon` multipart 协议上传 WebP；奖品新增和商品资料修改先校验真实 WebP 并生成唯一地址，在数据库提交后使用固定的 `POST /product/replace` multipart 协议落盘新图并按需清理无共享引用的旧图。具体管理端协议参见 [运动项目管理 API](../api/project.md)与[积分商城商品 API](../api/product.md)。
+路由和后台任务复用 `app.state.client_backend` 中的共享客户端，不得为每次请求或每条凭证重复创建 `httpx.AsyncClient`。图片中转使用固定资源路径；项目和商品图片使用固定 multipart 写入协议；赛季结算只调用固定的 `POST /proof_record/{id}/preliminary-review` 立即初审接口。具体协议参见[客户端立即初审集成](client-preliminary-review.md)、[运动项目管理 API](../api/project.md)与[积分商城商品 API](../api/product.md)。
 
 该内部客户端设置 `trust_env=False`，不会隐式读取宿主机的 `HTTP_PROXY`、`HTTPS_PROXY` 或 SOCKS 代理。这样可以避免内部服务请求因开发机代理设置而改变路由；如果部署环境确实要求代理，应在明确安全边界后通过专门配置实现。
 
@@ -303,7 +334,7 @@ async def example_service(
 
 > **注意**
 >
-> 当前图片 `/avator`、`/project_icon`、`/product` 与 `/proof_record/{id}` 读取接口、`POST /project_icon` 上传接口，以及 `POST /product/replace` 商品图片替换接口已有明确契约，并由图片服务处理状态与内容校验。后续新增客户端后端接口前，仍必须取得对应的路径、认证、超时、重试和错误协议，不能从已有图片接口自行推导。
+> 当前图片读取与写入接口以及赛季结算立即初审接口已有明确契约。后续新增客户端后端接口前，仍必须取得对应的路径、认证、超时、重试和错误协议，不能从现有接口自行推导。
 
 ---
 

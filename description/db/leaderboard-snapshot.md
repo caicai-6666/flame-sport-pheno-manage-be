@@ -19,7 +19,7 @@
 | -------------- | --------------- | -------: | ----------------: | -------------------------------------- |
 | id             | BIGINT UNSIGNED |       是 |              自增 | 排行榜快照记录主键 ID                  |
 | season_user_id | BIGINT UNSIGNED |       是 |                无 | 赛季用户记录 ID，关联 `season_user.id` |
-| checkin_count  | INT UNSIGNED    |       是 |                 0 | 当前赛季累计打卡次数                   |
+| checkin_count  | INT UNSIGNED    |       是 |                 0 | 该赛季符合排行榜统计口径的有效打卡次数 |
 
 ---
 
@@ -60,7 +60,7 @@ user_id
 
 ### checkin_count
 
-当前赛季累计打卡次数。
+该赛季符合排行榜统计口径的有效打卡次数。
 
 该字段是排行榜排序的核心指标。
 
@@ -102,7 +102,7 @@ LeaderboardRuntime.calculated_at
 CREATE TABLE leaderboard_snapshot (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '排行榜快照记录ID',
   season_user_id BIGINT UNSIGNED NOT NULL COMMENT '赛季用户记录ID',
-  checkin_count INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '当前赛季累计打卡次数',
+  checkin_count INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '该赛季符合排行榜统计口径的有效打卡次数',
   PRIMARY KEY (id),
   UNIQUE KEY uk_leaderboard_snapshot_season_user (season_user_id),
   KEY idx_leaderboard_snapshot_checkin_count (checkin_count),

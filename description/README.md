@@ -34,7 +34,7 @@ description/
 ├── application/              # 应用用例与事务编排文档
 ├── domain/                   # 核心业务规则与领域设计文档
 ├── infrastructure/           # 数据访问、运行依赖和外部集成文档
-├── job/                      # 定时任务与异步任务文档，按需创建
+├── job/                      # 定时任务与异步任务文档
 └── features/                 # 跨层完整功能总览，按需创建
 ```
 
@@ -48,7 +48,7 @@ description/
 | `description/application/` | 已存在 | 存放应用服务职责、用例流程与事务编排文档 |
 | `description/domain/` | 已存在 | 存放赛季生命周期等核心业务规则与状态流转文档 |
 | `description/infrastructure/` | 已存在 | 存放运行依赖、数据访问和外部系统集成文档 |
-| `description/job/` | 按需创建 | 有定时或异步任务文档后创建 |
+| `description/job/` | 已存在 | 存放赛季状态检查等定时任务文档 |
 | `description/features/` | 按需创建 | 一个功能横跨多个层级、需要统一导航时创建 |
 
 > **说明**
@@ -100,6 +100,7 @@ description/
 | `season_user` | [赛季用户表说明](db/season-user.md) | 用户参与、统一挑战等级和最终积分 |
 | `season_user_project` | [赛季用户项目表说明](db/season-user-project.md) | 用户锁定项目和项目完成进度 |
 | `proof_record` | [凭证记录表说明](db/proof-record.md) | 运动凭证、审核状态和进度贡献 |
+| `season_supplement_eligibility` | [赛季补传资格表说明](db/season-supplement-eligibility.md) | 结算中赛季允许用户补传的凭证记录 |
 | `leaderboard_snapshot` | [排行榜快照表说明](db/leaderboard-snapshot.md) | 当前赛季最新排行榜快照 |
 
 ### 4.4 积分与商品
@@ -125,6 +126,7 @@ description/
 | [管理端密钥认证 API](api/admin-authentication.md) | 管理员密钥换取短期 token、统一鉴权和内存缓存边界 |
 | [赛季管理 API 路由](api/season.md) | 获取全部赛季列表，校验时间边界与可见项目容量并创建未开始赛季 |
 | [赛季统计 API 路由](api/season-statistics.md) | 赛季聚合查询的统一路由边界、扩展规则和当前限制 |
+| [赛季结算 API 路由](api/settlement.md) | 查询结算赛季、用户详情和待终审队列，执行结算终审、积分发放及一键赛季收口 |
 | [用户基础信息 API](api/user.md) | 按用户 ID 批量获取名称、部门名称和头像地址 |
 | [用户意见 API](api/suggestion.md) | 拉取可见且待处理的意见，并将其标记为拒绝或已解决 |
 | [图片安全中转 API](api/image.md) | 经客户端后端安全读取并返回用户头像、项目图标、商品图片和运动凭证图片 |
@@ -138,6 +140,7 @@ description/
 | 文档 | 主要内容 |
 | --- | --- |
 | [FastAPI 应用结构与基础连接](infrastructure/application-structure.md) | 应用目录、配置、MySQL 会话、客户端后端连接、启动和测试 |
+| [客户端立即初审集成](infrastructure/client-preliminary-review.md) | 结算遗留凭证立即初审的内部 HTTP 契约、失败语义和安全边界 |
 | [Python 运行依赖](infrastructure/python-dependencies.md) | Python 环境基线、依赖用途、安装、验证和安全要求 |
 | [管理端 Docker Compose 部署](infrastructure/docker-compose-deployment.md) | 管理端后端镜像、Compose 服务拓扑、根环境变量、启动顺序和生产入口 |
 
@@ -146,12 +149,20 @@ description/
 | 文档 | 主要内容 |
 | --- | --- |
 | [应用服务层设计](application/service-layer.md) | 路由、服务、仓储与客户端的职责边界，事务和异常编排规则 |
+| [赛季结算应用编排](application/season-settlement.md) | 状态初始化、遗留初审、资格、定分、发放及手动或自动收口的事务边界 |
 
 ### 5.4 领域文档
 
 | 文档 | 主要内容 |
 | --- | --- |
 | [赛季生命周期](domain/season-lifecycle.md) | 赛季四态定义、正常流转、查询边界和历史数据迁移规则 |
+| [赛季结算规则](domain/season-settlement.md) | 用户分组、补传资格、基础积分与连续完成奖励 |
+
+### 5.5 定时任务文档
+
+| 文档 | 主要内容 |
+| --- | --- |
+| [赛季状态与结算定时任务](job/season-status-transition.md) | 按上海业务日期推进状态、持续常规结算并在配置期限后自动收口 |
 
 ---
 
@@ -167,18 +178,18 @@ description/
 | 项目图标读取 | [图片安全中转 API](api/image.md) | [项目表](db/project.md) |
 | 商品图片读取 | [图片安全中转 API](api/image.md)、[积分商城商品 API](api/product.md) | [商品表](db/product.md) |
 | 运动凭证图片读取 | [图片安全中转 API](api/image.md)、[凭证终审 API](api/proof.md) | [凭证记录表](db/proof-record.md)、[赛季用户表](db/season-user.md)、[赛季表](db/season.md) |
-| 业务结果通知 | [通知写入规则](application/result-notifications.md)、[凭证终审 API](api/proof.md)、[礼品发放 API](api/product.md) | [用户通知表](db/notification.md)、[凭证记录表](db/proof-record.md)、[积分流水表](db/point-record.md)、[用户表](db/user.md) |
+| 业务结果通知 | [通知写入规则](application/result-notifications.md)、[赛季结算应用编排](application/season-settlement.md)、[凭证终审 API](api/proof.md)、[礼品发放 API](api/product.md) | [用户通知表](db/notification.md)、[赛季用户表](db/season-user.md)、[凭证记录表](db/proof-record.md)、[积分流水表](db/point-record.md)、[用户表](db/user.md) |
 | 用户反馈管理 | [用户意见 API](api/suggestion.md)、[管理端职责边界](project.md) | [用户建议表](db/user-suggestion.md)、[用户表](db/user.md) |
 | 运动项目查询、创建、状态与规则展示 | [运动项目管理 API](api/project.md) | [项目表](db/project.md)、[挑战等级表](db/project-level.md)、[项目规则表](db/project-rule.md)、[上传配置表](db/project-upload-config.md) |
 | 运动项目配置管理 | [运动项目管理 API](api/project.md)、[项目与挑战规则](project.md) | [项目表](db/project.md)、[挑战等级表](db/project-level.md)、[项目规则表](db/project-rule.md)、[上传配置表](db/project-upload-config.md) |
 | 挑战等级与规则配置管理 | [挑战等级管理 API](api/project-level.md)、[项目与挑战规则](project.md) | [挑战等级表](db/project-level.md)、[项目规则表](db/project-rule.md)、[赛季用户表](db/season-user.md) |
-| 赛季管理 | [赛季管理 API 路由](api/season.md)、[赛季生命周期](domain/season-lifecycle.md)、[赛季规则](project.md) | [赛季表](db/season.md)、[赛季用户表](db/season-user.md)、[赛季用户项目表](db/season-user-project.md) |
+| 赛季管理 | [赛季管理 API 路由](api/season.md)、[赛季生命周期](domain/season-lifecycle.md)、[赛季状态与结算定时任务](job/season-status-transition.md)、[赛季规则](project.md) | [赛季表](db/season.md)、[赛季用户表](db/season-user.md)、[赛季用户项目表](db/season-user-project.md) |
 | 赛季统计查询 | [赛季统计 API 路由](api/season-statistics.md) | [赛季表](db/season.md)、[赛季用户表](db/season-user.md)、[赛季用户项目表](db/season-user-project.md)、[凭证记录表](db/proof-record.md) |
 | 报名或参与记录 | [参与赛季规则](project.md) | [赛季表](db/season.md)、[赛季用户表](db/season-user.md)、[赛季用户项目表](db/season-user-project.md) |
 | 凭证查询与终审 | [凭证终审 API](api/proof.md)、[凭证审核规则](project.md) | [凭证记录表](db/proof-record.md)、[赛季用户项目表](db/season-user-project.md)、[项目规则表](db/project-rule.md) |
 | 进度回退与回补 | [进度规则](project.md) | [凭证记录表](db/proof-record.md)、[赛季用户项目表](db/season-user-project.md) |
 | 排行榜 | [排行榜规则](project.md) | [排行榜快照表](db/leaderboard-snapshot.md)、[凭证记录表](db/proof-record.md)、[赛季用户表](db/season-user.md)、[用户表](db/user.md)、[部门表](db/department.md) |
-| 赛季结算 | [赛季生命周期](domain/season-lifecycle.md)、[结算规则](project.md) | [赛季表](db/season.md)、[赛季用户表](db/season-user.md)、[赛季用户项目表](db/season-user-project.md)、[挑战等级表](db/project-level.md)、[积分流水表](db/point-record.md) |
+| 赛季结算 | [赛季结算 API 路由](api/settlement.md)、[赛季结算规则](domain/season-settlement.md)、[赛季结算应用编排](application/season-settlement.md)、[赛季状态与结算定时任务](job/season-status-transition.md)、[客户端立即初审集成](infrastructure/client-preliminary-review.md) | [赛季表](db/season.md)、[赛季用户表](db/season-user.md)、[赛季用户项目表](db/season-user-project.md)、[凭证记录表](db/proof-record.md)、[赛季补传资格表](db/season-supplement-eligibility.md)、[挑战等级表](db/project-level.md) |
 | 积分管理 | [积分结算与商城规则](project.md) | [积分流水表](db/point-record.md)、[用户表](db/user.md) |
 | 商品管理与礼品发放 | [积分商城商品 API](api/product.md)、[积分商城规则](project.md) | [商品表](db/product.md)、[积分流水表](db/point-record.md) |
 | 环境安装或依赖维护 | [Python 运行依赖](infrastructure/python-dependencies.md) | 无 |

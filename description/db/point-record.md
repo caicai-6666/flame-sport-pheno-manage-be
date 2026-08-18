@@ -29,7 +29,7 @@
 | `points_after` | `INT UNSIGNED` | 是 | 无 | 本次变动后的用户积分余额 |
 | `description` | `VARCHAR(255)` | 否 | `NULL` | 积分变动描述 |
 | `status` | `TINYINT UNSIGNED` | 是 | `1` | 记录状态：`1` 有效，`0` 作废 |
-| `gift_distribution_status` | `VARCHAR(16)` | 是 | `pending` | 礼品发放状态：`pending` 待发放，`distributed` 已发放，`rejected` 拒绝发放 |
+| `gift_distribution_status` | `VARCHAR(16)` | 是 | `pending` | 商品兑换礼品发放状态，仅 `change_type = exchange` 时有效 |
 | `created_at` | `DATETIME` | 是 | `CURRENT_TIMESTAMP` | 积分变动时间 |
 
 ---
@@ -270,7 +270,7 @@ CREATE TABLE point_record (
   points_after INT UNSIGNED NOT NULL COMMENT '变动后的积分余额',
   description VARCHAR(255) DEFAULT NULL COMMENT '积分变动描述',
   status TINYINT UNSIGNED NOT NULL DEFAULT 1 COMMENT '状态：1有效，0作废',
-  gift_distribution_status VARCHAR(16) NOT NULL DEFAULT 'pending' COMMENT '礼品发放状态：pending待发放，distributed已发放，rejected拒绝发放',
+  gift_distribution_status VARCHAR(16) NOT NULL DEFAULT 'pending' COMMENT '商品兑换礼品发放状态，仅change_type=exchange时有效：pending待发放，distributed已发放，rejected拒绝发放',
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '积分变动时间',
   PRIMARY KEY (id),
   KEY idx_point_record_user_created_at (user_id, created_at),

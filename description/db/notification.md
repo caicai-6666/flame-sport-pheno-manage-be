@@ -17,7 +17,7 @@
 | `user_id` | `VARCHAR(64)` | 是 | 无 | 接收用户 ID，关联 `user.id` |
 | `message_title` | `VARCHAR(100)` | 是 | 无 | Markdown 工作通知标题 |
 | `message_fields` | `JSON` | 是 | 无 | 按展示顺序保存的消息键值列表 |
-| `notification_status` | `VARCHAR(32)` | 是 | `pending` | 通知投递状态 |
+| `notification_status` | `VARCHAR(32)` | 是 | `pending` | 通知状态，覆盖待发送至失败的完整投递阶段 |
 | `notification_updated_at` | `DATETIME(6)` | 是 | `CURRENT_TIMESTAMP(6)` | 通知状态最后更新时间 |
 | `created_at` | `DATETIME(6)` | 是 | `CURRENT_TIMESTAMP(6)` | 通知创建时间 |
 
@@ -89,7 +89,7 @@ CREATE TABLE notification (
     COMMENT '接收通知的用户ID',
   message_title VARCHAR(100) NOT NULL COMMENT 'Markdown工作通知标题',
   message_fields JSON NOT NULL COMMENT '按展示顺序保存的消息键值列表',
-  notification_status VARCHAR(32) NOT NULL DEFAULT 'pending' COMMENT '通知投递状态',
+  notification_status VARCHAR(32) NOT NULL DEFAULT 'pending' COMMENT '通知状态：pending待发送，processing发送中，accepted已受理，delivered已送达，read已读，failed失败',
   notification_updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT '通知状态最后更新时间',
   created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT '通知创建时间',
   PRIMARY KEY (id),

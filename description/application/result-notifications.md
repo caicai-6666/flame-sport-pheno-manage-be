@@ -2,7 +2,7 @@
 
 > **文档目的**
 >
-> 本文档说明管理端在凭证终审拒绝和礼品发放审核完成后创建 Markdown 工作通知的规则与事务边界。
+> 本文档说明管理端在凭证终审拒绝、赛季定分和礼品发放审核完成后创建 Markdown 工作通知的规则与事务边界。
 
 ## 1. 功能目标
 
@@ -17,10 +17,16 @@
 | 业务场景 | 通知标题 | 消息字段 |
 | --- | --- | --- |
 | 凭证终审拒绝 | `运动凭证终审结果` | 审核结果、运动项目、凭证日期、审核意见 |
+| 结算额外凭证收口 | `赛季凭证处理提示` | 赛季、处理结果、关闭记录数、处理说明 |
+| 赛季定分 | `赛季结算结果` | 赛季、完成项目、最终积分，以及按需显示的结算说明或连续完成奖励 |
 | 奖品确认发放 | `奖品发放结果` | 发放结果、奖品名称、兑换时间 |
 | 奖品拒绝发放 | `奖品发放结果` | 发放结果、奖品名称、兑换时间、退还积分、处理说明 |
 
 凭证终审通过不创建通知。终审拒绝未填写审核意见时，通知中的审核意见使用 `未填写`。
+
+一个项目都未完成的用户只生成赛季结算汇总通知，不为任务自动拒绝的每条凭证生成终审拒绝通知。赛季定分与通知在同一用户事务内写入。
+
+项目已由终审通过记录独立达标时，额外待终审凭证按批次只生成一条 `赛季凭证处理提示`，不再逐条创建普通终审拒绝通知。
 
 ---
 
@@ -37,6 +43,8 @@ notification_status = pending
 
 礼品确认发放把兑换流水终态更新和通知创建放在同一个事务中。礼品拒绝发放还会在该事务中更新原兑换流水并新增 `exchange_refund` 积分流水。
 
+赛季定分把 `season_user.final_points`、必要的审核和资格状态调整以及结算通知放在同一事务中。当前定分不修改用户全局积分。
+
 ---
 
 ## 4. 幂等与失败处理
@@ -45,6 +53,7 @@ notification_status = pending
 - 礼品发放只在 `pending` 首次转换为 `distributed` 或 `rejected` 时创建通知。
 - 重复提交相同礼品终态按幂等成功处理，不重复创建通知。
 - 礼品终态冲突不创建通知。
+- 赛季定分使用 `final_points IS NULL` 条件写入，重复任务不会重复创建结算通知。
 - 通知写入失败时，当前业务事务整体回滚。
 
 ---
@@ -54,11 +63,13 @@ notification_status = pending
 - [用户通知表](../db/notification.md)
 - [凭证记录表](../db/proof-record.md)
 - [赛季用户表](../db/season-user.md)
+- [赛季补传资格表](../db/season-supplement-eligibility.md)
 - [项目表](../db/project.md)
 - [积分变动记录表](../db/point-record.md)
 - [商品表](../db/product.md)
 - `app/repositories/notifications.py`
 - `app/services/proofs.py`
+- `app/services/season_settlements.py`
 - `app/services/products.py`
 
 ---
@@ -66,10 +77,10 @@ notification_status = pending
 ## 6. 验证方式
 
 ```bash
-python -m unittest tests.test_notifications tests.test_proof_final_review tests.test_product_distribution -v
+python -m unittest tests.test_notifications tests.test_proof_final_review tests.test_season_settlement tests.test_product_distribution -v
 ```
 
-测试覆盖通知 JSON 序列化、通知展示字段、终审通过不通知、终审拒绝通知、礼品两种终态通知、重复终态幂等和通知失败事务回滚。
+测试覆盖通知 JSON 序列化、通知展示字段、终审通过不通知、终审拒绝通知、额外凭证批量提示、赛季定分通知、礼品两种终态通知、重复终态幂等和通知失败事务回滚。
 
 ---
 

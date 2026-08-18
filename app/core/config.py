@@ -35,6 +35,47 @@ class Settings(BaseSettings):
     # 统一限制激活赛季开始后仍可调整高影响业务配置的小时数，零表示不保留修改窗口。
     active_season_config_edit_window_hours: int = Field(default=24, ge=0)
 
+    # 控制赛季状态后台检查；默认启用，并限制轮询间隔以避免异常配置造成数据库忙轮询。
+    season_status_check_enabled: bool = True
+    season_status_check_interval_seconds: int = Field(
+        default=60,
+        ge=1,
+        le=86400,
+    )
+    season_settlement_review_batch_size: int = Field(
+        default=100,
+        ge=1,
+        le=1000,
+    )
+    season_settlement_review_concurrency: int = Field(
+        default=5,
+        ge=1,
+        le=50,
+    )
+    season_settlement_user_batch_size: int = Field(
+        default=100,
+        ge=1,
+        le=1000,
+    )
+    # 自动一键结算默认关闭；启用后按上海业务日期等待配置天数再强制收口。
+    season_settlement_auto_complete_enabled: bool = False
+    season_settlement_auto_complete_after_days: int = Field(
+        default=7,
+        ge=0,
+        le=365,
+    )
+    # 连续完整达成赛季的奖励允许按部署环境调整，默认值保持现行业务规则。
+    season_settlement_two_month_streak_bonus_points: int = Field(
+        default=50,
+        ge=0,
+        le=4_294_967_295,
+    )
+    season_settlement_three_month_streak_bonus_points: int = Field(
+        default=100,
+        ge=0,
+        le=4_294_967_295,
+    )
+
     mysql_host: str = "127.0.0.1"
     mysql_port: int = Field(default=3306, ge=1, le=65535)
     mysql_user: str = "root"

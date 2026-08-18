@@ -41,6 +41,10 @@ class ProofProgressConsistencyError(RuntimeError):
     """凭证贡献与用户项目进度不一致，终审事务必须停止。"""
 
 
+class ProofNotInSettlingSeasonError(RuntimeError):
+    """凭证不属于当前结算中赛季的正式参赛用户。"""
+
+
 @dataclass(frozen=True, slots=True)
 class FinalReviewResult:
     proof_record_id: int
@@ -202,7 +206,94 @@ async def reject_proof_record(
     )
 
 
-# 在单一事务中记录终审决定；拒绝分支先锁项目进度，再锁凭证以避免同项目并发重复回补。
+# 在调用方事务内执行终审核心；结算专用入口必须拒绝普通赛季凭证。
+async def _record_proof_final_review_in_transaction(
+    session: AsyncSession,
+    proof_record_id: int,
+    review_comment: str | None,
+    decision: Literal["approved", "rejected"],
+    *,
+    require_settling_season: bool,
+) -> FinalReviewResult:
+    proof_snapshot = validate_pending_final_review_proof(
+        await fetch_proof_for_final_review(
+            session,
+            proof_record_id,
+            for_update=False,
+        )
+    )
+    from app.repositories.season_settlements import (
+        close_supplement_eligibility,
+    )
+    from app.services.season_settlements import (
+        ZERO_COMPLETION_REJECTION_COMMENT,
+        prepare_settling_user_for_final_review,
+        settle_locked_user,
+    )
+
+    settlement_policy = await prepare_settling_user_for_final_review(
+        session,
+        proof_snapshot.season_user_id,
+        proof_record_id,
+    )
+    if require_settling_season and not settlement_policy.applies:
+        raise ProofNotInSettlingSeasonError
+    if settlement_policy.already_finalized:
+        raise ProofFinalReviewConflictError
+    if settlement_policy.automatic_result is not None:
+        await settle_locked_user(
+            session,
+            proof_snapshot.season_user_id,
+        )
+        return settlement_policy.automatic_result
+    effective_decision: Literal["approved", "rejected"] = decision
+    effective_comment = review_comment
+    if settlement_policy.force_rejection:
+        effective_decision = "rejected"
+        effective_comment = ZERO_COMPLETION_REJECTION_COMMENT
+
+    if effective_decision == "approved":
+        result = await approve_proof_record(
+            session,
+            proof_record_id,
+            effective_comment,
+        )
+        if settlement_policy.applies:
+            await close_supplement_eligibility(
+                session,
+                proof_record_id,
+            )
+    else:
+        result = await reject_proof_record(
+            session,
+            proof_snapshot,
+            effective_comment,
+        )
+        if not settlement_policy.force_rejection:
+            notification_context = await fetch_proof_notification_context(
+                session,
+                proof_record_id,
+            )
+            if notification_context is None:
+                raise ProofProgressConsistencyError
+            await insert_notification(
+                session,
+                notification_context.user_id,
+                PROOF_REJECTION_NOTIFICATION_TITLE,
+                build_proof_rejection_notification_fields(
+                    notification_context,
+                    effective_comment,
+                ),
+            )
+    if settlement_policy.applies:
+        await settle_locked_user(
+            session,
+            proof_snapshot.season_user_id,
+        )
+    return result
+
+
+# 在单一事务中记录通用终审决定，并对结算用户自动同步资格和尝试定分。
 async def record_proof_final_review(
     session: AsyncSession,
     proof_record_id: int,
@@ -210,37 +301,27 @@ async def record_proof_final_review(
     decision: Literal["approved", "rejected"],
 ) -> FinalReviewResult:
     async with session.begin():
-        proof_snapshot = validate_pending_final_review_proof(
-            await fetch_proof_for_final_review(
-                session,
-                proof_record_id,
-                for_update=False,
-            )
-        )
-        if decision == "approved":
-            return await approve_proof_record(
-                session,
-                proof_record_id,
-                review_comment,
-            )
-        result = await reject_proof_record(
-            session,
-            proof_snapshot,
-            review_comment,
-        )
-        notification_context = await fetch_proof_notification_context(
+        return await _record_proof_final_review_in_transaction(
             session,
             proof_record_id,
+            review_comment,
+            decision,
+            require_settling_season=False,
         )
-        if notification_context is None:
-            raise ProofProgressConsistencyError
-        await insert_notification(
+
+
+# 在单一事务中执行结算专用终审，禁止借该入口处理普通赛季凭证。
+async def record_settlement_proof_final_review(
+    session: AsyncSession,
+    proof_record_id: int,
+    review_comment: str | None,
+    decision: Literal["approved", "rejected"],
+) -> FinalReviewResult:
+    async with session.begin():
+        return await _record_proof_final_review_in_transaction(
             session,
-            notification_context.user_id,
-            PROOF_REJECTION_NOTIFICATION_TITLE,
-            build_proof_rejection_notification_fields(
-                notification_context,
-                review_comment,
-            ),
+            proof_record_id,
+            review_comment,
+            decision,
+            require_settling_season=True,
         )
-        return result

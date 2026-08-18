@@ -39,9 +39,21 @@ stateDiagram-v2
 1. 赛季从 `1` 进入 `2` 后，不再属于当前赛季。
 2. 待完成的终审、进度修正与积分结算在 `2` 阶段处理。
 3. 只有结算工作全部完成后，赛季才进入 `3`。
-4. 当前尚未实现赛季状态流转接口，因此逆向流转、跳跃流转和管理员纠错权限仍待后续接口需求确认。
+4. 正向状态由定时任务推进；逆向流转、跳跃流转和管理员纠错权限仍待后续接口需求确认。
 
-### 2.1 创建赛季规则
+### 2.1 到期自动进入结算中
+
+管理端后端通过[赛季状态与结算定时任务](../job/season-status-transition.md)自动执行 `1 进行中 → 2 结算中`。`end_date` 是有效期内最后一个完整自然日；上海业务日期严格晚于结束日期后的首次检查才执行流转。
+
+任务锁定现有结算赛季和到期赛季，保证同一时间最多一个赛季进入结算。首次流转与清空临时补传资格处于同一事务，后续轮询不会重复清空。
+
+### 2.2 结算完成后自动结束
+
+赛季进入结算中后，任务持续执行[赛季结算规则](season-settlement.md)。只有全部正式参赛用户的 `final_points` 已写入，并且不存在有效补传资格时，任务才执行 `2 结算中 → 3 已结束`。
+
+存在遗留待初审、待终审或开放补传资格时，赛季保持 `status = 2`。日期经过本身不能使结算赛季进入已结束。
+
+### 2.3 创建赛季规则
 
 新赛季创建后固定处于 `0 未开始`，并必须满足以下不变量：
 
@@ -64,7 +76,7 @@ stateDiagram-v2
 后续开发应遵守以下规则：
 
 - 当前赛季、报名、正常上传和当前排行榜等开放期能力，只能基于 `status = 1`；
-- 赛季结算能力应面向 `status = 2`，并具备事务、幂等和审计设计；
+- 赛季结算能力只面向 `status = 2`，并按用户行锁与条件更新保持幂等；
 - `status = 3` 表示结算已完成，不能仅根据 `end_date` 自动推导；
 - 状态值必须使用明确枚举或常量表达，禁止在新增业务代码中散落缺少语义的数字。
 
@@ -95,8 +107,11 @@ stateDiagram-v2
 - [赛季统计 API](../api/season-statistics.md)
 - [赛季管理 API](../api/season.md)
 - `app/services/seasons.py`
+- `app/services/season_settlements.py`
 - `app/repositories/seasons.py`
+- `app/repositories/season_settlements.py`
 - `app/repositories/season_statistics.py`
+- `app/jobs/season_status.py`
 - `script/migrate-season-settling-status.sql`
 
 ---
@@ -110,16 +125,17 @@ stateDiagram-v2
 - 当前赛季查询仍只使用 `status = 1`；
 - 开发库现有进行中赛季数量未发生变化。
 
-现有接口回归测试命令：
+相关回归测试命令：
 
 ```bash
-python -m unittest tests.test_current_season_statistics tests.test_season_statistics_router -v
+python -m unittest tests.test_current_season_statistics tests.test_season_statistics_router tests.test_season_status_job tests.test_season_settlement -v
 ```
 
 ---
 
 ## 7. 已知限制
 
-- 当前项目已经支持创建 `0 未开始` 赛季，但尚无赛季状态流转接口或自动结算任务。
-- 进入结算中和完成结算的具体操作权限、幂等键及审计字段尚未定义。
+- 当前没有赛季状态流转接口；到期流转由后台任务自动完成。
+- 当前没有补传提交与补传期限收口能力，存在开放资格时赛季会持续保持结算中。
+- 结算过程使用状态、行锁、唯一键和通知事务保证幂等，但尚无独立结算执行审计表。
 - 数据库目前通过字段语义约束状态范围，尚未增加 `CHECK` 约束。

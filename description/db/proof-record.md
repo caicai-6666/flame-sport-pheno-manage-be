@@ -26,7 +26,7 @@
 | note           | VARCHAR(255)     |       否 |        NULL | 用户备注                               |
 | proof_date     | DATE             |       是 |          无 | 凭证对应的实际运动日期                 |
 | review_status  | VARCHAR(32)      |       是 |     pending | 初审与终审状态                         |
-| review_comment | VARCHAR(500)     |       否 |        NULL | 审核评论，用于后台人员填写审核说明     |
+| review_comment | VARCHAR(500)     |       否 |        NULL | 初审或终审的审核说明，终审时可覆盖初审意见 |
 | progress_delta | DECIMAL(5,4) | 是 | 0.0000 | 大模型初审给出的原始项目进度增量 |
 | increase       | DECIMAL(5,4) | 是 | 0.0000 | 当前凭证实际分配到项目进度条的贡献 |
 | status         | TINYINT UNSIGNED |       是 |           1 | 记录状态：`1` 正常，`0` 无效/删除      |
@@ -249,7 +249,7 @@ completion_progress <= 1.0000
 
 审核评论。
 
-该字段用于后台审核人员填写审核说明、补充判断依据或拒绝原因。
+该字段用于保存模型初审或管理员终审的审核说明、判断依据或拒绝原因。管理员终审时可以覆盖初审意见。
 
 示例：
 ```text
@@ -308,7 +308,7 @@ CREATE TABLE proof_record (
   note VARCHAR(255) DEFAULT NULL COMMENT '用户备注',
   proof_date DATE NOT NULL COMMENT '凭证对应的实际运动日期',
   review_status VARCHAR(32) NOT NULL DEFAULT 'pending' COMMENT '审核状态：pending待初审，preliminary_approved初审通过，preliminary_rejected初审失败，approved终审通过，rejected终审失败',
-  review_comment VARCHAR(500) DEFAULT NULL COMMENT '审核评论，用于后台人员填写审核说明',
+  review_comment VARCHAR(500) DEFAULT NULL COMMENT '初审或终审的审核说明，终审时可覆盖初审意见',
   progress_delta DECIMAL(5,4) NOT NULL DEFAULT 0.0000 COMMENT '大模型初审给出的原始项目进度增量',
   `increase` DECIMAL(5,4) NOT NULL DEFAULT 0.0000 COMMENT '当前凭证实际分配到项目进度条的贡献',
   status TINYINT UNSIGNED NOT NULL DEFAULT 1 COMMENT '状态：1正常，0无效/删除',

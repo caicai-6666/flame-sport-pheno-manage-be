@@ -12,6 +12,7 @@ from app.router import (
     proof,
     season,
     season_statistics,
+    settlement,
     suggestion,
     user,
 )
@@ -24,6 +25,7 @@ router.include_router(admin_auth.router)
 protected_router = APIRouter(dependencies=[Depends(require_admin_token)])
 protected_router.include_router(season.router)
 protected_router.include_router(season_statistics.router)
+protected_router.include_router(settlement.router)
 protected_router.include_router(user.router)
 protected_router.include_router(image.router)
 protected_router.include_router(product.router)
