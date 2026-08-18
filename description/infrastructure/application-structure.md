@@ -16,6 +16,7 @@ app/
 │   ├── __init__.py               # HTTP Schema 包声明，不集中重导出模型
 │   ├── admin_auth.py             # 管理员认证请求与响应结构
 │   ├── health.py                 # 健康检查响应结构
+│   ├── image.py                  # 海报替换响应结构
 │   ├── product.py                # 商品与礼品履约请求、响应及字段校验
 │   ├── project.py                # 项目请求、响应及 multipart JSON 适配器
 │   ├── project_level.py          # 挑战等级与规则配置请求、响应
@@ -30,7 +31,7 @@ app/
 │   ├── dependencies.py           # 管理路由统一认证依赖
 │   ├── admin_auth.py             # 管理员密钥换取 token
 │   ├── health.py                 # 服务存活检查
-│   ├── image.py                  # 客户端后端图片安全中转
+│   ├── image.py                  # 客户端后端图片读取与固定海报替换路由
 │   ├── product.py                # 商品列表、资料修改、上下架、礼品查询与发放审核路由
 │   ├── project.py                # 项目查询、创建、可见状态与等级规则接口
 │   ├── project_level.py          # 挑战等级、奖励积分与项目规则配置路由
@@ -57,7 +58,7 @@ app/
 │   ├── __init__.py
 │   ├── admin_auth.py             # 管理员登录用例
 │   ├── configuration_guard.py    # 激活赛季高影响配置变更窗口守卫
-│   ├── images.py                 # 图片中转、项目图标上传与商品图片替换适配
+│   ├── images.py                 # 图片中转、项目/商品图片写入与固定海报替换适配
 │   ├── products.py               # 商品查询、资料与状态修改、礼品审核及拒绝退款用例
 │   ├── project_levels.py         # 挑战等级、奖励积分与项目规则配置用例
 │   ├── projects.py               # 项目查询、创建、可见状态修改与等级规则用例
@@ -89,6 +90,7 @@ tests/
 ├── test_database_session.py      # 请求级数据库会话依赖测试
 ├── test_health.py                # 基础应用生命周期与健康接口测试
 ├── test_image_avatar.py          # 头像、项目图标、商品与凭证图片安全中转测试
+├── test_poster.py                # 固定活动海报读取与替换中转测试
 ├── test_project_level.py         # 挑战等级创建、查询、积分修改与事务测试
 ├── test_project_rule_update.py   # 项目等级规则局部更新、窗口与行锁测试
 ├── test_project_list.py          # 可见项目列表接口与仓储测试
@@ -326,7 +328,7 @@ async def example_service(
 - 对非成功响应调用 `raise_for_status()`；
 - 在应用退出时关闭连接池。
 
-路由和后台任务复用 `app.state.client_backend` 中的共享客户端，不得为每次请求或每条凭证重复创建 `httpx.AsyncClient`。图片中转使用固定资源路径；项目和商品图片使用固定 multipart 写入协议；赛季结算只调用固定的 `POST /proof_record/{id}/preliminary-review` 立即初审接口。具体协议参见[客户端立即初审集成](client-preliminary-review.md)、[运动项目管理 API](../api/project.md)与[积分商城商品 API](../api/product.md)。
+路由和后台任务复用 `app.state.client_backend` 中的共享客户端，不得为每次请求或每条凭证重复创建 `httpx.AsyncClient`。图片中转使用固定资源路径；项目、商品和活动海报使用各自固定的 multipart 写入协议；赛季结算只调用固定的 `POST /proof_record/{id}/preliminary-review` 立即初审接口。具体协议参见[图片安全中转 API](../api/image.md)、[客户端立即初审集成](client-preliminary-review.md)、[运动项目管理 API](../api/project.md)与[积分商城商品 API](../api/product.md)。
 
 该内部客户端设置 `trust_env=False`，不会隐式读取宿主机的 `HTTP_PROXY`、`HTTPS_PROXY` 或 SOCKS 代理。这样可以避免内部服务请求因开发机代理设置而改变路由；如果部署环境确实要求代理，应在明确安全边界后通过专门配置实现。
 

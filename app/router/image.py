@@ -3,26 +3,53 @@
 from collections.abc import Awaitable
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Path, Query, Response, status
+from fastapi import (
+    APIRouter,
+    File,
+    HTTPException,
+    Path,
+    Query,
+    Response,
+    UploadFile,
+    status,
+)
 
 from app.core.config import get_settings
 from app.router.dependencies import ClientBackend
+from app.schemas.image import PosterReplacementResponse
 from app.services.images import (
     EmptyImageAddressError,
+    EmptyPosterImageError,
     ImageBackendResponseError,
     ImageBackendUnavailableError,
     ImageNotFoundError,
     InvalidImageContentError,
     InvalidImagePathError,
+    InvalidPosterMediaTypeError,
+    InvalidPosterUploadError,
+    MAX_POSTER_UPLOAD_SIZE_BYTES,
+    PosterBackendResponseError,
+    PosterBackendUnavailableError,
+    PosterUploadTooLargeError,
     ProxiedImage,
     get_avatar_image,
+    get_poster_image,
     get_product_image,
     get_project_icon_image,
     get_proof_record_image,
+    replace_poster_image,
 )
 
 router = APIRouter(prefix="/image", tags=["image"])
 settings = get_settings()
+
+
+# 限量读取并关闭海报上传文件，避免超大内容继续占用应用内存和临时句柄。
+async def read_poster_file(image: UploadFile) -> bytes:
+    try:
+        return await image.read(MAX_POSTER_UPLOAD_SIZE_BYTES + 1)
+    finally:
+        await image.close()
 
 
 # 将图片服务结果与异常统一映射为安全 HTTP 响应，避免不同图片接口产生协议偏差。
@@ -220,4 +247,92 @@ async def get_proof_record(
             proof_record_id,
             settings.image_cache_seconds,
         )
+    )
+
+
+# 从固定客户后端资源读取唯一活动海报，并明确禁止浏览器复用旧海报缓存。
+@router.get(
+    "/poster",
+    response_class=Response,
+    summary="获取活动海报",
+    responses={
+        status.HTTP_200_OK: {
+            "description": "当前活动海报",
+            "content": {"image/webp": {}},
+        },
+        status.HTTP_404_NOT_FOUND: {"description": "活动海报文件不存在"},
+        status.HTTP_502_BAD_GATEWAY: {
+            "description": "客户端后端活动海报服务不可用或响应异常"
+        },
+    },
+)
+async def get_poster(
+    client_backend: ClientBackend,
+) -> Response:
+    response = await build_image_response(
+        get_poster_image(client_backend)
+    )
+    response.headers["Cache-Control"] = "private, no-store"
+    return response
+
+
+# 将管理端上传的候选图片中转至固定海报接口，不接受文件名或目标路径参数。
+@router.post(
+    "/poster",
+    response_model=PosterReplacementResponse,
+    summary="变更活动海报",
+    responses={
+        status.HTTP_400_BAD_REQUEST: {
+            "description": "海报为空、声明类型或实际内容无效"
+        },
+        status.HTTP_413_CONTENT_TOO_LARGE: {
+            "description": "活动海报超过 10 MiB"
+        },
+        status.HTTP_502_BAD_GATEWAY: {
+            "description": "客户端后端活动海报服务不可用或响应异常"
+        },
+    },
+)
+async def update_poster(
+    client_backend: ClientBackend,
+    image: Annotated[
+        UploadFile,
+        File(
+            description="JPEG、PNG 或 WebP 活动海报，最大 10 MiB",
+        ),
+    ],
+) -> PosterReplacementResponse:
+    image_media_type = image.content_type
+    image_content = await read_poster_file(image)
+    try:
+        replaced_poster = await replace_poster_image(
+            client_backend,
+            image_content,
+            image_media_type,
+        )
+    except (
+        EmptyPosterImageError,
+        InvalidPosterMediaTypeError,
+        InvalidPosterUploadError,
+    ) as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(error),
+        ) from error
+    except PosterUploadTooLargeError as error:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=str(error),
+        ) from error
+    except (
+        PosterBackendUnavailableError,
+        PosterBackendResponseError,
+    ) as error:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=str(error),
+        ) from error
+    return PosterReplacementResponse(
+        image_url=replaced_poster.image_url,
+        size_bytes=replaced_poster.size_bytes,
     )

@@ -1,4 +1,4 @@
-"""编排客户端后端图片读取、项目图标上传与商品图片替换。"""
+"""编排客户端后端图片读取、业务图片写入与固定活动海报替换。"""
 
 from dataclasses import dataclass
 from typing import NoReturn
@@ -10,6 +10,11 @@ from app.clients.client_backend import ClientBackendClient
 ALLOWED_IMAGE_MEDIA_TYPES = frozenset(
     {"image/jpeg", "image/png", "image/webp", "image/gif"}
 )
+ALLOWED_POSTER_UPLOAD_MEDIA_TYPES = frozenset(
+    {"image/jpeg", "image/png", "image/webp"}
+)
+MAX_POSTER_UPLOAD_SIZE_BYTES = 10 * 1024 * 1024
+POSTER_IMAGE_URL = "/活动规则.webp"
 
 
 class ImageServiceError(RuntimeError):
@@ -70,6 +75,34 @@ class ProductImageReplacementBackendUnavailableError(
     """客户端后端商品图片替换服务连接失败或超时。"""
 
 
+class PosterReplacementError(ImageServiceError):
+    """活动海报替换失败的可预期异常基类。"""
+
+
+class EmptyPosterImageError(PosterReplacementError):
+    """上传的活动海报没有任何内容。"""
+
+
+class InvalidPosterMediaTypeError(PosterReplacementError):
+    """活动海报声明的媒体类型不受支持。"""
+
+
+class InvalidPosterUploadError(PosterReplacementError):
+    """客户端后端拒绝了活动海报的实际图片内容。"""
+
+
+class PosterUploadTooLargeError(PosterReplacementError):
+    """活动海报超过双方约定的十 MiB 上限。"""
+
+
+class PosterBackendUnavailableError(PosterReplacementError):
+    """客户端后端活动海报服务连接失败或超时。"""
+
+
+class PosterBackendResponseError(PosterReplacementError):
+    """客户端后端返回了未约定的活动海报响应。"""
+
+
 @dataclass(frozen=True, slots=True)
 class ProxiedImage:
     content: bytes
@@ -98,6 +131,12 @@ class ReplacedProductImage:
     image_url: str
     size_bytes: int
     old_image_removed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ReplacedPosterImage:
+    image_url: str
+    size_bytes: int
 
 
 AVATAR_RESOURCE = ImageResourceDefinition(
@@ -134,6 +173,15 @@ PROOF_RECORD_RESOURCE = ImageResourceDefinition(
     unavailable_detail="客户端后端凭证图片服务不可用",
     response_error_detail="客户端后端凭证图片服务响应异常",
     invalid_content_detail="客户端后端返回了无效的凭证图片内容",
+)
+
+POSTER_RESOURCE = ImageResourceDefinition(
+    empty_detail="活动海报不能为空",
+    invalid_path_detail="活动海报请求非法",
+    not_found_detail="活动海报文件不存在",
+    unavailable_detail="客户端后端活动海报服务不可用",
+    response_error_detail="客户端后端活动海报服务响应异常",
+    invalid_content_detail="客户端后端返回了无效的活动海报内容",
 )
 
 
@@ -339,6 +387,105 @@ async def get_product_image(
         PRODUCT_IMAGE_RESOURCE,
         "/product",
         "image_url",
+    )
+
+
+# 从固定客户端接口读取唯一活动海报，并拒绝空响应或非 WebP 内容。
+async def get_poster_image(
+    client_backend: ClientBackendClient,
+) -> ProxiedImage:
+    image = await request_proxied_image(
+        client_backend,
+        "/poster",
+        0,
+        POSTER_RESOURCE,
+    )
+    if image.media_type != "image/webp" or not image.content:
+        raise InvalidImageContentError(
+            POSTER_RESOURCE.invalid_content_detail
+        )
+    return image
+
+
+# 校验上传边界后将原图中转到固定海报接口，并验证上游返回的固定资源信息。
+async def replace_poster_image(
+    client_backend: ClientBackendClient,
+    image_content: bytes,
+    image_media_type: str | None,
+) -> ReplacedPosterImage:
+    if not image_content:
+        raise EmptyPosterImageError("活动海报不能为空")
+    if len(image_content) > MAX_POSTER_UPLOAD_SIZE_BYTES:
+        raise PosterUploadTooLargeError("活动海报不能超过 10 MiB")
+
+    normalized_media_type = (
+        image_media_type or ""
+    ).partition(";")[0].strip().lower()
+    if normalized_media_type not in ALLOWED_POSTER_UPLOAD_MEDIA_TYPES:
+        raise InvalidPosterMediaTypeError(
+            "活动海报仅支持 JPEG、PNG 或 WebP"
+        )
+
+    upload_filename = {
+        "image/jpeg": "poster-upload.jpg",
+        "image/png": "poster-upload.png",
+        "image/webp": "poster-upload.webp",
+    }[normalized_media_type]
+    try:
+        upstream_response = await client_backend.request(
+            "POST",
+            "/poster",
+            files={
+                "image": (
+                    upload_filename,
+                    image_content,
+                    normalized_media_type,
+                )
+            },
+        )
+    except httpx.HTTPStatusError as error:
+        if error.response.status_code == 400:
+            raise InvalidPosterUploadError(
+                get_upstream_error_detail(
+                    error.response,
+                    "上传内容不是有效的活动海报",
+                )
+            ) from error
+        if error.response.status_code == 413:
+            raise PosterUploadTooLargeError(
+                get_upstream_error_detail(
+                    error.response,
+                    "活动海报不能超过 10 MiB",
+                )
+            ) from error
+        raise PosterBackendResponseError(
+            "客户端后端活动海报服务响应异常"
+        ) from error
+    except httpx.RequestError as error:
+        raise PosterBackendUnavailableError(
+            "客户端后端活动海报服务不可用"
+        ) from error
+
+    try:
+        response_payload = upstream_response.json()
+        image_url = response_payload["image_url"]
+        size_bytes = response_payload["size_bytes"]
+    except (ValueError, KeyError, TypeError) as error:
+        raise PosterBackendResponseError(
+            "客户端后端活动海报服务响应异常"
+        ) from error
+    if (
+        image_url != POSTER_IMAGE_URL
+        or isinstance(size_bytes, bool)
+        or not isinstance(size_bytes, int)
+        or size_bytes <= 0
+    ):
+        raise PosterBackendResponseError(
+            "客户端后端活动海报服务响应异常"
+        )
+    return ReplacedPosterImage(
+        image_url=image_url,
+        size_bytes=size_bytes,
     )
 
 

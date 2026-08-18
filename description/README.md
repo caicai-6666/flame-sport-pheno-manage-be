@@ -129,7 +129,7 @@ description/
 | [赛季结算 API 路由](api/settlement.md) | 查询结算赛季、用户详情和待终审队列，执行结算终审、积分发放及一键赛季收口 |
 | [用户基础信息 API](api/user.md) | 按用户 ID 批量获取名称、部门名称和头像地址 |
 | [用户意见 API](api/suggestion.md) | 拉取可见且待处理的意见，并将其标记为拒绝或已解决 |
-| [图片安全中转 API](api/image.md) | 经客户端后端安全读取并返回用户头像、项目图标、商品图片和运动凭证图片 |
+| [图片安全中转 API](api/image.md) | 经客户端后端安全读取用户头像、项目图标、商品图片、运动凭证和活动海报，并中转替换固定海报 |
 | [运动项目管理 API](api/project.md) | 获取或创建项目、读取规则内容，并在赛季配置窗口内修改项目可见状态 |
 | [挑战等级管理 API](api/project-level.md) | 获取全部挑战等级，在赛季配置窗口内创建等级、初始化项目规则、修改奖励积分及按既有标签配置规则值 |
 | [积分商城商品 API](api/product.md) | 新增带 WebP 图片的奖品，获取完整商品列表，局部修改商品资料与图片，切换上下架状态，查询待发放兑换流水与奖品信息，并处理发放或拒绝退款 |
@@ -178,6 +178,7 @@ description/
 | 项目图标读取 | [图片安全中转 API](api/image.md) | [项目表](db/project.md) |
 | 商品图片读取 | [图片安全中转 API](api/image.md)、[积分商城商品 API](api/product.md) | [商品表](db/product.md) |
 | 运动凭证图片读取 | [图片安全中转 API](api/image.md)、[凭证终审 API](api/proof.md) | [凭证记录表](db/proof-record.md)、[赛季用户表](db/season-user.md)、[赛季表](db/season.md) |
+| 活动海报读取与替换 | [图片安全中转 API](api/image.md) | 无 |
 | 业务结果通知 | [通知写入规则](application/result-notifications.md)、[赛季结算应用编排](application/season-settlement.md)、[凭证终审 API](api/proof.md)、[礼品发放 API](api/product.md) | [用户通知表](db/notification.md)、[赛季用户表](db/season-user.md)、[凭证记录表](db/proof-record.md)、[积分流水表](db/point-record.md)、[用户表](db/user.md) |
 | 用户反馈管理 | [用户意见 API](api/suggestion.md)、[管理端职责边界](project.md) | [用户建议表](db/user-suggestion.md)、[用户表](db/user.md) |
 | 运动项目查询、创建、状态与规则展示 | [运动项目管理 API](api/project.md) | [项目表](db/project.md)、[挑战等级表](db/project-level.md)、[项目规则表](db/project-rule.md)、[上传配置表](db/project-upload-config.md) |
