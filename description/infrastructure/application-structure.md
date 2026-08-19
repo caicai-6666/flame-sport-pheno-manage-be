@@ -2,7 +2,7 @@
 
 > **文档目的**
 >
-> 本文档说明管理端后端初始化后的 FastAPI 目录结构、HTTP Schema 分层、环境配置、异步 MySQL 会话和客户端后端 HTTP 连接边界，为后续业务模块开发提供统一入口。
+> 本文档说明管理端后端当前的 FastAPI 目录结构、HTTP Schema 分层、环境配置、异步 MySQL 会话和客户端后端 HTTP 连接边界，为业务开发与排障提供统一入口。
 
 ## 1. 应用结构
 
@@ -71,6 +71,7 @@ app/
 └── repositories/
     ├── __init__.py
     ├── configuration_guard.py    # 激活赛季配置窗口共享锁定查询
+    ├── notifications.py          # 业务结果通知持久化
     ├── products.py               # 商品与礼品查询、资料、状态和退款持久化
     ├── project_levels.py         # 挑战等级查询、创建与奖励积分更新
     ├── projects.py               # 项目查询、项目及子配置持久化
@@ -81,48 +82,7 @@ app/
     ├── suggestions.py            # 待处理意见查询、处理行锁与阶段写入
     └── users.py                  # 用户与部门基础信息查询
 
-tests/
-├── __init__.py
-├── test_active_season_config.py # 激活赛季配置变更窗口校验测试
-├── test_admin_auth.py            # 管理员认证与 token 缓存测试
-├── test_configuration_guard.py  # 激活赛季配置窗口与锁定查询测试
-├── test_current_season_statistics.py # 当前赛季接口与仓储测试
-├── test_database_session.py      # 请求级数据库会话依赖测试
-├── test_health.py                # 基础应用生命周期与健康接口测试
-├── test_image_avatar.py          # 头像、项目图标、商品与凭证图片安全中转测试
-├── test_poster.py                # 固定活动海报读取与替换中转测试
-├── test_project_level.py         # 挑战等级创建、查询、积分修改与事务测试
-├── test_project_rule_update.py   # 项目等级规则局部更新、窗口与行锁测试
-├── test_project_list.py          # 可见项目列表接口与仓储测试
-├── test_project_creation.py      # 项目创建、规则矩阵、WebP 上传与事务测试
-├── test_project_rule.py          # 项目等级规则接口、服务与仓储测试
-├── test_project_status.py        # 项目可见状态、配置窗口与行锁测试
-├── test_product_pending_distribution.py # 待发放礼品接口、服务与仓储测试
-├── test_product_info.py          # 奖品信息接口、服务与仓储测试
-├── test_product_list.py          # 完整商品列表接口、服务与仓储测试
-├── test_product_creation.py      # 奖品新增、WebP 落盘与部分成功测试
-├── test_product_status.py        # 商品上下架、行锁、幂等与认证测试
-├── test_product_update.py        # 商品资料补丁、配置窗口与图片替换顺序测试
-├── test_product_distribution.py  # 礼品发放状态、幂等与并发保护测试
-├── test_proof.py                 # 待终审凭证接口、服务与仓储测试
-├── test_proof_final_review.py    # 终审状态、进度回退与回补测试
-├── test_season_statistics_router.py # 受保护路由聚合测试
-├── test_season_settlement.py     # 结算分支、资格、积分和连续奖励测试
-├── test_settlement_route.py      # 结算赛季查询路由、服务与仓储测试
-├── test_season_status_job.py     # 状态结算调度、配置与生命周期测试
-├── test_schema_boundaries.py     # HTTP Schema 放置与依赖方向约束测试
-├── test_services.py              # 应用服务编排、事务和异常测试
-├── test_suggestion.py            # 待处理意见接口、服务与仓储测试
-├── test_suggestion_processing.py # 意见处理接口、行锁、幂等与冲突测试
-└── test_user_info.py             # 用户基础信息接口与仓储测试
-
-script/
-├── migrate-point-record-gift-distribution-rejected.sql
-│                                 # 已有两态礼品状态升级为三态的增量脚本
-├── migrate-point-record-gift-distribution-status.sql
-│                                 # 首次增加礼品履约三态的生产迁移脚本
-└── migrate-user-suggestion-status-and-processing-stage.sql
-                                  # 用户建议表一次性生产迁移脚本
+tests/                            # 本地未跟踪的 unittest 测试集，存在时用于回归验证
 ```
 
 各目录职责如下：
@@ -137,7 +97,7 @@ script/
 | `app/jobs/` | 维护进程内定时任务的触发、重试、日志和生命周期接入 |
 | `app/services/` | 编排业务用例、事务、下层依赖和稳定应用异常，不处理 HTTP 协议 |
 | `app/repositories/` | 集中维护业务数据访问和聚合 SQL，不处理 HTTP 协议 |
-| `tests/` | 维护可使用项目既定命令运行的自动化测试 |
+| `tests/` | 本地存在时维护自动化测试；该目录按项目约定不纳入 Git 跟踪 |
 
 业务领域和数据库模型目录应在产生真实功能时按职责创建，不提前建立空目录。
 
@@ -255,7 +215,7 @@ DEEPSEEK_HTTP_TIMEOUT_SECONDS=60
 
 `ACTIVE_SEASON_CONFIG_EDIT_WINDOW_HOURS` 统一定义当前激活赛季开始后仍可执行高影响配置变更的时长。当前赛季仍按 `season.status = 1` 识别；由于赛季表只保存日期，窗口起点统一解释为 `season.start_date` 在 `Asia/Shanghai` 时区的当日 `00:00`。业务代码显式使用该时区，不依赖宿主机或容器的默认时区。
 
-该配置计划用于以下写操作：
+该配置用于以下写操作：
 
 - 修改挑战等级对应积分；
 - 新建挑战等级；
@@ -273,7 +233,7 @@ ACTIVE_SEASON_CONFIG_EDIT_WINDOW_HOURS=24
 
 > **当前边界**
 >
-> 挑战等级创建、奖励积分修改、项目等级规则配置和项目可见状态修改已经接入共享窗口守卫。新建运动项目和修改奖品积分值等后续写接口仍需复用同一守卫，不得在各路由中重复实现时间判断。
+> 挑战等级创建、奖励积分修改、项目等级规则配置、项目创建、项目可见状态修改，以及既有奖品积分修改均已接入共享窗口守卫。新增奖品、商品上下架及只修改名称、描述或图片不受当前窗口约束；后续改变该口径前必须先确认业务规则。
 
 ---
 
@@ -418,9 +378,9 @@ python -m unittest tests.test_database_session -v
 ## 8. 已知限制
 
 - 已使用当前开发配置完成 MySQL 只读连通验证，但健康接口仍不表达数据库就绪状态。
-- 除已经记录的图片读取、项目图标上传与商品图片替换接口外，其他客户端后端接口契约和服务间认证方式尚未确定。
+- 当前只允许调用文档已经明确的图片、固定海报、项目图标、商品图片和立即初审接口；客户端后端仍未提供独立服务间认证。
 - 当前只有共享密钥认证；管理员个人身份、角色权限和操作审计仍待确认。
-- 尚未选择数据库迁移工具，初始化过程不会创建或改变数据库表。
+- 尚未选择统一数据库迁移工具，应用启动过程不会创建或改变数据库表。
 - 当前健康接口只表达进程存活，不表达外部依赖就绪。
 
 这些限制在对应需求确认前不得通过硬编码或猜测补全。

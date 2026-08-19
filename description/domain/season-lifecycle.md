@@ -91,7 +91,7 @@ stateDiagram-v2
 3 = 已结束
 ```
 
-因此迁移必须将所有历史 `status = 2` 更新为 `status = 3`。迁移脚本位于 `script/migrate-season-settling-status.sql`，执行前必须确认目标数据库、备份数据并停止赛季状态写入。
+因此，从旧结构升级的环境必须将历史 `status = 2` 更新为 `status = 3`。当前仓库不保留可直接执行的通用迁移脚本；旧环境升级前必须依据实际状态分布单独制定并评审迁移 SQL，同时确认目标数据库、备份数据并停止赛季状态写入。
 
 > **警告**
 >
@@ -112,7 +112,6 @@ stateDiagram-v2
 - `app/repositories/season_settlements.py`
 - `app/repositories/season_statistics.py`
 - `app/jobs/season_status.py`
-- `script/migrate-season-settling-status.sql`
 
 ---
 
