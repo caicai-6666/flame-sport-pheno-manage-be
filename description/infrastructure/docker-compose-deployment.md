@@ -2,7 +2,7 @@
 
 > **文档目的**
 >
-> 本文档说明管理端后端如何加入 `/home/ubuntu/flame/docker-compose.yml`，以及容器内数据库、客户端后端、管理端前端之间的连接边界。
+> 本文档说明管理端后端如何加入 `/home/ubuntu/flame-sport-pheno-deploy/docker-compose.yml`，以及容器内数据库、客户端后端、管理端前端之间的连接边界。
 
 管理端后端使用服务名 `manage-backend`，容器内监听 `8000`，宿主机默认仅通过 `127.0.0.1:18001` 访问。本地 IDE 开发仍使用 `8001`，与容器内部端口相互独立。
 
@@ -40,7 +40,7 @@ flowchart LR
 
 ## 3. 环境配置
 
-根目录 `/home/ubuntu/flame/.env` 是 Compose 的实际配置源，模板位于 `/home/ubuntu/flame/.env.example`。
+根目录 `/home/ubuntu/flame-sport-pheno-deploy/.env` 是 Compose 的实际配置源，模板位于 `/home/ubuntu/flame-sport-pheno-deploy/.env.example`。
 
 管理端主要变量如下：
 
@@ -60,8 +60,10 @@ flowchart LR
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | DeepSeek OpenAI 兼容接口地址 |
 | `DEEPSEEK_MODEL` | `deepseek-v4-flash` | 两个后端共享的默认模型名称 |
 | `DEEPSEEK_HTTP_TIMEOUT_SECONDS` | `60` | DeepSeek 单次 HTTP 请求超时 |
+| `DEEPSEEK_QUERY_*_MAX_TOKENS` | 见查询智能体运行文档 | 各查询阶段（含结果翻译）的单次生成上限 |
+| `AGENT_QUERY_*` | 见查询智能体运行文档 | 查询生成轮次、翻译字段并发、工具次数和进程内会话资源上限 |
 
-Compose 会把共享的 `MYSQL_USER`、`MYSQL_PASSWORD`、`MYSQL_DATABASE` 和四项 `DEEPSEEK_*` 配置注入管理端后端，并将数据库主机固定为 `mysql:3306`。客户端后端默认使用 `http://backend:8000/flame/api/admin`；只有 Compose 服务名或管理接口路径变化时才调整该环境变量，生产容器不得误走公网。
+Compose 会把共享的 `MYSQL_USER`、`MYSQL_PASSWORD`、`MYSQL_DATABASE`、基础 `DEEPSEEK_*` 配置，以及查询智能体的 `DEEPSEEK_QUERY_*`、`AGENT_QUERY_*` 配置注入管理端后端，并将数据库主机固定为 `mysql:3306`。客户端后端默认使用 `http://backend:8000/flame/api/admin`；只有 Compose 服务名或管理接口路径变化时才调整该环境变量，生产容器不得误走公网。
 
 管理端后端容器固定注入 `TZ=Asia/Shanghai`，镜像也使用相同默认值。涉及赛季日期边界的业务代码仍应显式使用 `Asia/Shanghai`，不得只依赖容器系统时区。
 
@@ -93,7 +95,7 @@ Compose 按健康状态建立依赖：
 
 ## 6. 验证方式
 
-在 `/home/ubuntu/flame` 执行：
+在 `/home/ubuntu/flame-sport-pheno-deploy` 执行：
 
 ```bash
 docker compose config --quiet

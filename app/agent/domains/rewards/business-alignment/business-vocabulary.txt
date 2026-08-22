@@ -1,0 +1,59 @@
+TERM: 当前积分余额
+CANONICAL: 用户当前可用积分
+DEFINITION: 用户当前能够用于商品兑换的积分余额，不等于历史积分变动记录的数量。
+
+TERM: 还有多少积分
+CANONICAL: 用户当前可用积分
+DEFINITION: 查询用户当前可用的积分余额。
+
+TERM: 积分流水
+CANONICAL: 积分变动明细
+DEFINITION: 用户每一次积分增加、扣减、退款或后台调整的业务记录。
+
+TERM: 积分明细
+CANONICAL: 积分变动明细
+DEFINITION: 按时间查看用户积分变化及每次变化后的余额。
+
+TERM: 赛季积分
+CANONICAL: 用户赛季结算积分
+DEFINITION: 用户在指定赛季结算后获得的最终积分结果。
+
+TERM: 积分发放状态
+CANONICAL: 赛季积分入账状态
+DEFINITION: 赛季结算积分是否已经写入用户全局积分账户。
+
+TERM: 商品
+CANONICAL: 积分商城商品
+DEFINITION: 可以使用平台积分兑换的商品目录条目。
+
+TERM: 兑换记录
+CANONICAL: 商品兑换履约记录
+DEFINITION: 用户已经使用积分兑换商品形成的逐条业务记录。
+
+TERM: 待发放奖品
+CANONICAL: 待处理商品兑换
+DEFINITION: 已完成有效积分兑换、但实物奖品尚未确认发放的兑换记录。
+
+TERM: 已发放奖品
+CANONICAL: 已完成商品履约
+DEFINITION: 商品兑换记录已经由管理员确认完成发放。
+
+TERM: 拒绝发放
+CANONICAL: 商品履约拒绝
+DEFINITION: 管理员拒绝本次商品兑换的履约，并按照规则产生兑换积分退款。
+
+TERM: 上架商品
+CANONICAL: 当前可兑换商品
+DEFINITION: 当前对用户开放展示和兑换的商品。
+
+TERM: 下架商品
+CANONICAL: 当前不可兑换商品
+DEFINITION: 不再对用户开放兑换，但历史兑换记录仍然保留的商品。
+
+TERM: 奖励积分
+CANONICAL: 正向积分变动
+DEFINITION: 增加用户全局积分的业务变动，可能来自赛季奖励或后台调整。
+
+TERM: 兑换消耗
+CANONICAL: 商品兑换扣减
+DEFINITION: 用户兑换商品时从全局积分中扣除的积分变动。

@@ -29,12 +29,16 @@ python -m pip install -r requirements.txt
 | `greenlet` | 支撑 SQLAlchemy 相关异步桥接能力 |
 | `python-multipart` | 解析表单和文件上传请求 |
 | `httpx` | 发起异步 HTTP 请求及编写接口测试 |
-| `openai` | 调用 OpenAI 兼容 API，包括后续 DeepSeek 模型辅助能力 |
+| `socksio` | 为配置 SOCKS 代理的 HTTP 客户端提供传输支持 |
+| `openai` | 通过 OpenAI 兼容协议调用查询智能体使用的 DeepSeek 模型 |
+| `langgraph` | 编排业务对齐、查询规划、SQL 查询、结果翻译和结果审计状态图 |
+| `sqlglot` | 在候选读取和最终 SQL 执行前解析 MySQL AST，并执行静态安全校验 |
+| `PyYAML` | 将查询智能体的业务上下文、表结构、查询计划和审计事实渲染为带固定字段语义的可读 YAML |
 | `Pillow` | 校验和处理上传图片 |
 
 > **注意**
 >
-> 依赖存在不等于所有相关能力都由本进程直接执行。认证、数据库会话、内部 HTTP 和图片中转已经按对应功能文档落地；OpenAI SDK 当前只保留 DeepSeek 兼容配置，管理端不会因配置密钥而直接发起模型初审。
+> 查询智能体会在操作员创建查询后调用 DeepSeek，但不会执行凭证初审。认证、数据库会话、内部 HTTP、图片中转和查询运行时仍按各自功能文档保持独立边界；仅配置密钥不会自动发起模型请求。
 
 ---
 
@@ -46,6 +50,8 @@ python -m pip install -r requirements.txt
 - `cryptography` 只能使用经过验证的高层协议和项目既定方案，禁止自行设计加密算法。
 - 依赖升级前应检查兼容性，并执行与变更风险相称的测试。
 
+查询智能体的模型、SQL 与 SSE 安全约束见 [查询智能体运行时与业务域扩展](query-agent-runtime.md)。
+
 ---
 
 ## 4. 验证方式
@@ -53,7 +59,7 @@ python -m pip install -r requirements.txt
 安装完成后，至少执行以下导入检查：
 
 ```bash
-python -c "import fastapi, uvicorn, sqlmodel, asyncmy, cryptography, pydantic_settings, greenlet, multipart, httpx, openai, PIL"
+python -c "import fastapi, uvicorn, sqlmodel, asyncmy, cryptography, pydantic_settings, greenlet, multipart, httpx, socksio, openai, langgraph, sqlglot, yaml, PIL"
 ```
 
 还应检查 pip 能否解析出一致的依赖关系：

@@ -97,6 +97,33 @@ class Settings(BaseSettings):
     deepseek_base_url: AnyHttpUrl = AnyHttpUrl("https://api.deepseek.com")
     deepseek_model: str = Field(default="deepseek-v4-flash", min_length=1)
     deepseek_http_timeout_seconds: float = Field(default=60.0, gt=0)
+    # 查询智能体为不同职责设定单次生成硬上限，防止工具循环或 JSON 输出意外放大成本。
+    deepseek_query_alignment_max_tokens: int = Field(default=1200, ge=128, le=8192)
+    deepseek_query_planning_max_tokens: int = Field(default=3000, ge=256, le=8192)
+    deepseek_query_inspection_max_tokens: int = Field(default=800, ge=128, le=4096)
+    deepseek_query_sql_max_tokens: int = Field(default=1200, ge=128, le=4096)
+    deepseek_query_translation_max_tokens: int = Field(
+        default=1000,
+        ge=128,
+        le=4096,
+    )
+    deepseek_query_audit_max_tokens: int = Field(default=500, ge=128, le=2048)
+
+    # 分阶段限制正式查询智能体的模型轮次和工具调用，避免单次请求无限消耗资源。
+    agent_query_alignment_max_generations: int = Field(default=10, ge=1, le=30)
+    agent_query_planning_max_generations: int = Field(default=30, ge=1, le=60)
+    agent_query_planning_max_tool_calls: int = Field(default=30, ge=1, le=100)
+    agent_query_sql_max_generations: int = Field(default=4, ge=1, le=10)
+    agent_query_translation_max_parallel_fields: int = Field(
+        default=4,
+        ge=1,
+        le=16,
+    )
+    # 查询会话暂存于单进程内存；容量、事件历史和过期时间共同限制资源占用。
+    agent_query_max_active_sessions: int = Field(default=20, ge=1, le=200)
+    agent_query_event_history_size: int = Field(default=200, ge=20, le=2000)
+    agent_query_session_ttl_seconds: int = Field(default=3600, ge=60, le=86400)
+    agent_query_sse_heartbeat_seconds: int = Field(default=15, ge=5, le=60)
 
     # 使用 SQLAlchemy URL 安全拼装异步 MySQL 地址，避免密码中的特殊字符破坏连接串。
     @property

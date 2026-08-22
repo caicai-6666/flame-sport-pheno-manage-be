@@ -6,6 +6,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.agent.query_manager import AgentQueryManager
 from app.clients.client_backend import ClientBackendClient
 from app.core.config import get_settings
 from app.db.session import async_session_factory, engine
@@ -22,6 +23,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         base_url=str(settings.client_backend_base_url),
         timeout_seconds=settings.client_backend_timeout_seconds,
     )
+    application.state.agent_query_manager = AgentQueryManager(settings)
     season_status_task: asyncio.Task[None] | None = None
     if settings.season_status_check_enabled:
         season_status_task = asyncio.create_task(
@@ -40,6 +42,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        await application.state.agent_query_manager.shutdown()
         if season_status_task is not None:
             season_status_task.cancel()
             with suppress(asyncio.CancelledError):

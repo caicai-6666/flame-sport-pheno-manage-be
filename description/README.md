@@ -35,7 +35,7 @@ description/
 ├── domain/                   # 核心业务规则与领域设计文档
 ├── infrastructure/           # 数据访问、运行依赖和外部集成文档
 ├── job/                      # 定时任务与异步任务文档
-└── features/                 # 跨层完整功能总览，按需创建
+└── features/                 # 跨层完整功能总览
 ```
 
 目录状态说明：
@@ -49,7 +49,7 @@ description/
 | `description/domain/` | 已存在 | 存放赛季生命周期等核心业务规则与状态流转文档 |
 | `description/infrastructure/` | 已存在 | 存放运行依赖、数据访问和外部系统集成文档 |
 | `description/job/` | 已存在 | 存放赛季状态检查等定时任务文档 |
-| `description/features/` | 按需创建 | 一个功能横跨多个层级、需要统一导航时创建 |
+| `description/features/` | 已存在 | 存放查询智能体等跨层完整功能总览 |
 
 > **说明**
 >
@@ -125,6 +125,7 @@ description/
 | --- | --- |
 | [服务健康检查 API](api/health.md) | 管理服务存活接口、响应结构和边界语义 |
 | [管理端密钥认证 API](api/admin-authentication.md) | 管理员密钥换取短期 token、统一鉴权和内存缓存边界 |
+| [查询智能体 API](api/agent-query.md) | 创建自然语言查询、订阅 SSE、处理交互、读取结果和取消任务 |
 | [赛季管理 API 路由](api/season.md) | 获取全部赛季列表，校验时间边界与可见项目容量并创建未开始赛季 |
 | [赛季统计 API 路由](api/season-statistics.md) | 赛季聚合查询的统一路由边界、扩展规则和当前限制 |
 | [赛季结算 API 路由](api/settlement.md) | 查询结算赛季、用户详情和待终审队列，执行结算终审、积分发放及一键赛季收口 |
@@ -144,6 +145,7 @@ description/
 | [客户端立即初审集成](infrastructure/client-preliminary-review.md) | 结算遗留凭证立即初审的内部 HTTP 契约、失败语义和安全边界 |
 | [Python 运行依赖](infrastructure/python-dependencies.md) | Python 环境基线、依赖用途、安装、验证和安全要求 |
 | [管理端 Docker Compose 部署](infrastructure/docker-compose-deployment.md) | 管理端后端镜像、Compose 服务拓扑、根环境变量、启动顺序和生产入口 |
+| [查询智能体运行时与业务域扩展](infrastructure/query-agent-runtime.md) | 通用工作流、业务域配置、模型与只读 SQL 安全、SSE 和扩展方法 |
 
 ### 5.3 应用服务文档
 
@@ -151,15 +153,24 @@ description/
 | --- | --- |
 | [应用服务层设计](application/service-layer.md) | 路由、服务、仓储与客户端的职责边界，事务和异常编排规则 |
 | [赛季结算应用编排](application/season-settlement.md) | 状态初始化、遗留初审、资格、定分、发放及手动或自动收口的事务边界 |
+| [查询智能体应用编排](application/query-agent.md) | 五阶段查询流水线、会话、用户交互、SSE 进度、友好轨迹、表格结果、并发和失败处理 |
+| [查询结果表项意图路由设计](application/query-result-intent-routing.md) | 以对齐问题和单条表项无状态选择详情工具、补查参数及处理歧义的设计草案 |
+| [积分与奖品查询业务域](application/rewards-query.md) | 积分余额、积分流水、赛季结算积分、商品目录和奖品履约查询口径 |
 
-### 5.4 领域文档
+### 5.4 跨层功能文档
+
+| 文档 | 主要内容 |
+| --- | --- |
+| [可交互数据查询智能体](features/query-agent.md) | 自然语言只读查询的端到端能力、安全边界和各层文档入口 |
+
+### 5.5 领域文档
 
 | 文档 | 主要内容 |
 | --- | --- |
 | [赛季生命周期](domain/season-lifecycle.md) | 赛季四态定义、正常流转、查询边界和历史数据迁移规则 |
 | [赛季结算规则](domain/season-settlement.md) | 用户分组、补传资格、基础积分与连续完成奖励 |
 
-### 5.5 定时任务文档
+### 5.6 定时任务文档
 
 | 文档 | 主要内容 |
 | --- | --- |
@@ -174,6 +185,8 @@ description/
 | 开发任务 | 首要业务入口 | 相关数据库文档 |
 | --- | --- | --- |
 | 管理端认证与 token | [管理端密钥认证 API](api/admin-authentication.md)、[应用服务层设计](application/service-layer.md) | 无 |
+| 自然语言业务数据查询、结果表项意图路由与业务域扩展 | [可交互数据查询智能体](features/query-agent.md)、[查询智能体 API](api/agent-query.md)、[查询结果表项意图路由设计](application/query-result-intent-routing.md)、[查询智能体运行时](infrastructure/query-agent-runtime.md) | 按目标业务域的允许表继续选择 |
+| 积分余额、积分流水、赛季积分和奖品履约查询 | [积分与奖品查询业务域](application/rewards-query.md)、[可交互数据查询智能体](features/query-agent.md) | [部门表](db/department.md)、[用户表](db/user.md)、[赛季表](db/season.md)、[赛季用户表](db/season-user.md)、[商品表](db/product.md)、[积分流水表](db/point-record.md) |
 | 部门与用户查询 | [用户基础信息 API](api/user.md) | [部门表](db/department.md)、[用户表](db/user.md) |
 | 用户头像读取 | [图片安全中转 API](api/image.md) | [用户表](db/user.md) |
 | 项目图标读取 | [图片安全中转 API](api/image.md) | [项目表](db/project.md) |

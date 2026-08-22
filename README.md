@@ -2,7 +2,7 @@
 
 > **项目定位**
 >
-> 本仓库提供“燃动现象”企业运动平台的管理端后端服务，负责赛季与挑战配置、运动凭证终审、赛季结算、积分和奖品履约、用户意见处理，以及客户端后端图片资源的安全中转。
+> 本仓库提供“燃动现象”企业运动平台的管理端后端服务，负责赛季与挑战配置、运动凭证终审、赛季结算、积分和奖品履约、用户意见处理、自然语言只读数据查询，以及客户端后端图片资源的安全中转。
 
 ## 1. 项目概览
 
@@ -34,6 +34,7 @@
 | 图片资源 | 安全中转头像、项目图标、商品图、凭证图和活动海报，并支持替换固定海报 | [图片安全中转 API](description/api/image.md) |
 | 用户与意见 | 批量查询用户展示信息，查询并处理用户意见 | [用户信息 API](description/api/user.md)、[用户意见 API](description/api/suggestion.md) |
 | 业务通知 | 将终审、结算和礼品结果写入通知表，交由客户端后端投递钉钉工作通知 | [业务结果通知写入](description/application/result-notifications.md) |
+| 查询智能体 | 通过业务对齐、用户确认、查询规划、安全 SQL、状态翻译和结果审计回答运动及积分奖品业务数据问题，并使用 SSE 推送进度；创建查询时通过 `domain_key` 选择 `sports` 或 `rewards` | [可交互数据查询智能体](description/features/query-agent.md)、[积分与奖品查询业务域](description/application/rewards-query.md) |
 | 后台任务 | 按上海业务日期推进赛季状态、持续结算，并可按配置自动一键收口 | [赛季状态与结算定时任务](description/job/season-status-transition.md) |
 
 赛季主状态按以下方向流转：
@@ -50,8 +51,11 @@
 
 ```mermaid
 flowchart LR
-    MF[管理端前端] -->|HTTP + Bearer Token| API[FastAPI 管理接口]
+    MF[管理端前端] -->|HTTP / SSE + Bearer Token| API[FastAPI 管理接口]
     API --> S[应用服务与事务编排]
+    API --> AQ[查询智能体会话与工作流]
+    AQ --> DS[DeepSeek 兼容 API]
+    AQ -->|只读事务| DB
     S --> R[仓储层]
     R --> DB[(MySQL)]
     S --> C[客户端后端适配器]
@@ -73,6 +77,7 @@ router → services → repositories / clients
 
 | 目录 | 职责 |
 | --- | --- |
+| `app/agent/` | 可注入业务域的查询工作流、通用工具、只读运行时、会话交互和进度事件 |
 | `app/router/` | HTTP 路径、认证依赖、参数位置、服务调用和异常映射 |
 | `app/schemas/` | Pydantic 请求响应模型及传输层字段校验 |
 | `app/services/` | 业务用例、事务边界、跨仓储和外部服务编排 |
@@ -96,7 +101,7 @@ router → services → repositories / clients
 | 配置管理 | pydantic-settings、根目录 `.env` |
 | 内部 HTTP | HTTPX，共享异步连接池 |
 | 文件处理 | python-multipart、Pillow |
-| 模型兼容 | OpenAI SDK；当前管理端仅接入 DeepSeek 配置，不直接执行凭证初审 |
+| 查询智能体 | OpenAI SDK、DeepSeek、LangGraph、SQLGlot、PyYAML；不执行凭证初审 |
 | 自动化验证 | Python 标准库 `unittest`、`compileall` |
 | 部署 | Docker、单进程 Uvicorn、`Asia/Shanghai` 时区 |
 
@@ -203,13 +208,14 @@ Authorization: Bearer <access-token>
 | MySQL | `MYSQL_*` | 数据库连接、字符集、日志和连接池 |
 | 客户端后端 | `CLIENT_BACKEND_BASE_URL`、`CLIENT_BACKEND_TIMEOUT_SECONDS` | 内部管理接口基础地址和超时 |
 | 图片缓存 | `IMAGE_CACHE_SECONDS` | 可缓存图片中转响应的私有缓存秒数 |
-| DeepSeek | `DEEPSEEK_*` | OpenAI 兼容配置；当前管理端不直接调用模型 |
+| DeepSeek | `DEEPSEEK_*` | OpenAI 兼容模型连接及查询各阶段单次输出预算；仅创建查询后调用 |
+| 查询智能体 | `AGENT_QUERY_*` | 生成与工具预算、活动会话、事件历史、会话保留和 SSE 心跳 |
 
 业务日期统一使用 `Asia/Shanghai`。容器时区也固定为该值，但日期边界相关代码仍显式指定时区，不依赖宿主机默认配置。
 
 > **警告**
 >
-> 管理员 Token 只保存在当前进程内。现阶段必须使用单 Worker、单实例部署；服务重启会使已有 Token 失效。启用多 Worker 或横向扩容前，必须先引入共享会话存储。
+> 管理员 Token、查询任务、待回答交互和 SSE 历史都只保存在当前进程内。现阶段必须使用单 Worker、单实例部署；服务重启会使已有 Token 和查询任务失效。启用多 Worker 或横向扩容前，必须先引入共享认证与查询会话存储。
 
 ---
 
@@ -222,6 +228,7 @@ FastAPI 内部基础路径为 `/flame/admin/api`。开发环境经 Nginx 暴露�
 | 路由组 | 文档 |
 | --- | --- |
 | `/health`、`/auth` | [健康检查](description/api/health.md)、[管理员认证](description/api/admin-authentication.md) |
+| `/agent/queries` | [查询智能体](description/api/agent-query.md) |
 | `/season`、`/season-statistics` | [赛季管理](description/api/season.md)、[赛季统计](description/api/season-statistics.md) |
 | `/settlement` | [赛季结算](description/api/settlement.md) |
 | `/project`、`/project-level` | [运动项目管理](description/api/project.md)、[挑战等级管理](description/api/project-level.md) |
@@ -310,6 +317,8 @@ docker build -t flame-sport-pheno-manage-be .
 | [文档撰写规范](description/document-style.md) | Markdown 结构、格式、表达和维护要求 |
 | [应用服务层设计](description/application/service-layer.md) | 分层、依赖方向、事务和异常规则 |
 | [应用结构与基础连接](description/infrastructure/application-structure.md) | 目录、配置、数据库、客户端后端、启动和验证 |
+| [可交互数据查询智能体](description/features/query-agent.md) | 自然语言只读查询、用户交互、进度和安全边界 |
+| [查询智能体运行时](description/infrastructure/query-agent-runtime.md) | 通用引擎、业务域扩展、模型、SQL 和 SSE 运行约束 |
 | [赛季结算规则](description/domain/season-settlement.md) | 补传资格、定分、连续奖励和一键收口口径 |
 | [赛季结算应用编排](description/application/season-settlement.md) | 结算阶段、事务、幂等和外部失败恢复 |
 
@@ -328,4 +337,4 @@ docker build -t flame-sport-pheno-manage-be .
 - 多个列表和结算队列接口当前按业务规模一次返回，数据增长后需要按各 API 文档增加分页。
 - 商品图片写入是数据库提交后的跨服务操作，上游失败可能形成文档中明确说明的部分成功状态。
 - 排行榜刷新、管理员细粒度权限和独立兑换订单模型尚未在本仓库实现。
-
+- 查询任务、待回答交互和 SSE 历史只保存在单进程内存，重启不能恢复，当前不得使用多 Worker 或多实例分担查询。

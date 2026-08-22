@@ -1,0 +1,103 @@
+"""声明企业运动查询业务域。"""
+
+from pathlib import Path
+
+from app.agent.domains.base import QueryDomainProfile, freeze_table_labels
+from app.agent.domains.sports.planning_policy import (
+    validate_sports_alignment,
+    validate_sports_query_plan,
+)
+
+
+SPORTS_DOMAIN_ROOT = Path(__file__).resolve().parent
+
+SPORTS_QUERY_PROFILE = QueryDomainProfile(
+    key="sports",
+    display_name="运动数据",
+    query_scope="企业运动赛季、报名、项目、进度、凭证和排行榜的只读查询",
+    root_directory=SPORTS_DOMAIN_ROOT,
+    allowed_tables=(
+        "department",
+        "leaderboard_snapshot",
+        "project",
+        "project_level",
+        "project_rule",
+        "proof_record",
+        "season",
+        "season_supplement_eligibility",
+        "season_user",
+        "season_user_project",
+        "user",
+    ),
+    table_context_files=(
+        "department.txt",
+        "user.txt",
+        "season.txt",
+        "project.txt",
+        "project-level.txt",
+        "project-rule.txt",
+        "season-user.txt",
+        "season-user-project.txt",
+        "proof-record.txt",
+        "season-supplement-eligibility.txt",
+        "leaderboard-snapshot.txt",
+    ),
+    table_labels=freeze_table_labels(
+        {
+            "department": "部门信息",
+            "leaderboard_snapshot": "排行榜快照",
+            "project": "运动项目",
+            "project_level": "挑战等级",
+            "project_rule": "项目挑战规则",
+            "proof_record": "运动记录",
+            "season": "赛季信息",
+            "season_supplement_eligibility": "赛季补传资格",
+            "season_user": "赛季参与信息",
+            "season_user_project": "项目完成进度",
+            "user": "用户信息",
+        }
+    ),
+    protected_database_identifiers=frozenset(
+        {
+            "department",
+            "leaderboard_snapshot",
+            "project",
+            "project_level",
+            "project_rule",
+            "proof_record",
+            "season",
+            "season_supplement_eligibility",
+            "season_user",
+            "season_user_project",
+            "user",
+            "id",
+            "status",
+            "season_id",
+            "user_id",
+            "level_id",
+            "completion_progress",
+            "participated_at",
+            "final_points",
+            "points_issued",
+        }
+    ),
+    query_plan_validator=validate_sports_query_plan,
+    alignment_validator=validate_sports_alignment,
+    alignment_prompt_instructions=(
+        "当用户要求查看运动凭证、运动记录或打卡记录关联的图片时，"
+        "必须保留“查看图片”的业务意图，但不得把它改写成“返回图片内容”或“返回图片地址”。"
+        "对齐需求应表达为查看凭证关联图片，只需保留每条凭证的唯一标识，"
+        "后续根据标识查看图片；这只是业务交付规则，不代表查询结果中存在图片内容字段。\n\n"
+        "对齐需求必须明确查询主体。用户询问运动记录、运动凭证或打卡记录时，"
+        "主体是逐条运动凭证明细；图片查看和凭证标识只是附加要求，不能替代该主体。"
+        "只有用户明确表示只需要凭证标识时，才将查询主体对齐为凭证标识。"
+    ),
+    planning_prompt_instructions=(
+        "当对齐需求包含查看凭证关联图片时，凭证唯一标识是对原有返回内容的附加要求，"
+        "不是替代项。必须保留用户原问题和对齐需求中已经要求的其他返回内容；"
+        "只有对齐需求明确只要求凭证标识时，才可以生成只返回标识的查询计划。\n\n"
+        "生成计划前必须先确定查询主体，并在 `query_goal` 与 `row_granularity` 中明确表达。"
+        "一行应描述用户真正要查询的主体；如果主体是逐条运动凭证明细，"
+        "`proof_record.id` 只能作为辅助定位字段，不能让返回字段退化为 ID 清单。"
+    ),
+)

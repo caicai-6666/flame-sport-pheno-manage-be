@@ -1,0 +1,16 @@
+TABLE: season_user
+ROW_GRAIN: 一行代表一名用户参与一个赛季的记录。
+PURPOSE: 连接用户与赛季，并保存该用户的挑战等级选择、已锁定项目数量和赛季结算结果。
+QUERY_ROLE: 用于从用户进入特定赛季、判断是否正式参与、读取挑战等级或赛季最终积分；项目级当前进度应继续查询 season_user_project，凭证明细应继续查询 proof_record。
+DATA_CHARACTER: 赛季参与与结算状态。一个用户在一个赛季最多一条记录；记录存在不等于已正式参与。正式参与必须同时满足 season_user.status = season.required_project_count 且 season_user.level_id 非空。participated_at 只记录首次正式报名时间，不能单独作为正式参与筛选条件。
+QUERY_INVARIANTS:
+- `season_user.status` 不是启停状态，而是已锁定项目数量；不得将它写成 `status = 1` 的通用有效记录筛选。
+- 统计正式参与、报名完成或赛季完成用户时，必须同时满足 `season_user.status = season.required_project_count` 和 `season_user.level_id IS NOT NULL`，除非用户明确要求包含未完成报名用户。
+RELATIONSHIPS:
+- season: many-to-one。多条赛季参与记录可以属于同一个赛季；每条记录属于一个赛季。
+- user: many-to-one。多条赛季参与记录可以属于同一个用户；每条记录对应一个用户。
+- project_level: many-to-one。多条赛季参与记录可以选择同一个挑战等级；每条记录选择一个等级。
+- season_user_project: one-to-many。一条赛季参与记录可以包含多个已选运动项目；每条赛季用户项目记录属于一个赛季参与记录。
+- proof_record: one-to-many。一条赛季参与记录可以有多条运动凭证；每条凭证属于一个赛季参与记录。
+- leaderboard_snapshot: one-to-zero-or-one。一条赛季参与记录最多对应一条排行榜快照；每条快照属于一个赛季参与记录。
+- season_supplement_eligibility: one-to-many。一条赛季参与记录可以有多条补传资格；每条补传资格属于一个赛季参与记录。

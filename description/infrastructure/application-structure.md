@@ -12,9 +12,18 @@
 app/
 ├── __init__.py
 ├── main.py                       # FastAPI 应用工厂、生命周期和启动入口
+├── agent/                        # 可配置业务域的只读查询智能体运行时
+│   ├── domains/                  # 业务词汇、规则、表范围和实体匹配配置
+│   ├── engine/                   # 对齐、规划、SQL、审计子图和完整流水线
+│   ├── events/                   # 友好进度事件和 SSE 编码
+│   ├── interaction/              # 查询会话、用户交互暂停恢复和事件订阅
+│   ├── runtime/                  # 模型选项、结构缓存和只读数据适配器
+│   ├── tools/                    # 通用 Pydantic 工具协议
+│   └── query_manager.py          # 后台任务、容量和生命周期管理
 ├── schemas/
 │   ├── __init__.py               # HTTP Schema 包声明，不集中重导出模型
 │   ├── admin_auth.py             # 管理员认证请求与响应结构
+│   ├── agent_query.py             # 查询任务、交互和结果响应结构
 │   ├── health.py                 # 健康检查响应结构
 │   ├── image.py                  # 海报替换响应结构
 │   ├── product.py                # 商品与礼品履约请求、响应及字段校验
@@ -30,6 +39,7 @@ app/
 │   ├── __init__.py               # 公开与受保护路由聚合
 │   ├── dependencies.py           # 管理路由统一认证依赖
 │   ├── admin_auth.py             # 管理员密钥换取 token
+│   ├── agent_query.py             # 查询创建、SSE、交互、结果与取消路由
 │   ├── health.py                 # 服务存活检查
 │   ├── image.py                  # 客户端后端图片读取与固定海报替换路由
 │   ├── product.py                # 商品列表、资料修改、上下架、礼品查询与发放审核路由
@@ -57,6 +67,7 @@ app/
 ├── services/
 │   ├── __init__.py
 │   ├── admin_auth.py             # 管理员登录用例
+│   ├── agent_queries.py           # 查询会话操作与安全响应转换
 │   ├── configuration_guard.py    # 激活赛季高影响配置变更窗口守卫
 │   ├── images.py                 # 图片中转、项目/商品图片写入与固定海报替换适配
 │   ├── products.py               # 商品查询、资料与状态修改、礼品审核及拒绝退款用例
@@ -89,6 +100,7 @@ tests/                            # 本地未跟踪的 unittest 测试集，存�
 
 | 目录 | 职责 |
 | --- | --- |
+| `app/agent/` | 维护可注入业务域的查询工作流、通用工具、只读运行时、交互会话和进度事件 |
 | `app/schemas/` | 定义 Pydantic HTTP 请求、响应、字段级约束及纯传输格式适配，不依赖路由、服务或仓储 |
 | `app/router/` | 声明 HTTP 路径和参数位置，注入公共依赖，调用服务并映射响应与异常；不定义 Pydantic 模型或复杂业务规则 |
 | `app/clients/` | 隔离客户端后端及后续其他外部服务的 HTTP 协议 |
@@ -111,7 +123,7 @@ HTTP 路由从 `app/schemas/` 引用对应业务的请求与响应结构，再�
 - `admin_auth.router`：公开的 `/auth/login` 登录入口及受保护的会话校验；
 - `protected_router`：统一添加 Bearer Token 依赖，所有业务子路由必须接入此聚合器。
 
-认证机制、环境配置和进程内缓存边界以 [管理端密钥认证 API](../api/admin-authentication.md) 为准。
+认证机制以 [管理端密钥认证 API](../api/admin-authentication.md) 为准；查询任务的进程内会话边界以 [查询智能体应用编排](../application/query-agent.md) 为准。
 
 ---
 
@@ -127,9 +139,10 @@ from app.main import app
 
 1. 启动时创建可复用连接池的客户端后端 HTTP 客户端。
 2. 将客户端保存在 `app.state.client_backend`，供后续依赖注入层获取。
-3. 配置启用时启动赛季状态与结算后台任务，并立即执行一次停机补偿检查。
-4. 退出时取消后台任务，再关闭 HTTP 客户端连接池。
-5. 最后释放异步 MySQL 引擎的连接池。
+3. 创建单进程查询智能体管理器和专用工作线程池；只有收到查询请求后才调用模型或查询数据库。
+4. 配置启用时启动赛季状态与结算后台任务，并立即执行一次停机补偿检查。
+5. 退出时取消查询会话和后台任务，再关闭查询线程池与 HTTP 客户端连接池。
+6. 最后释放异步 MySQL 引擎的连接池。
 
 模块导入不会主动访问 MySQL 或客户端后端。生命周期启动后，赛季任务会访问 MySQL，并可能调用固定的客户端立即初审接口；单次失败只记录日志并等待下个周期，不阻止 HTTP 服务启动。需要依赖可用性判断时，应由独立的就绪检查承担。
 
@@ -170,7 +183,7 @@ cp .env.example .env
 | 连接池 | `MYSQL_POOL_SIZE`、`MYSQL_MAX_OVERFLOW`、`MYSQL_POOL_RECYCLE_SECONDS` | 数据库连接池容量与回收周期 |
 | 客户端后端 | `CLIENT_BACKEND_BASE_URL`、`CLIENT_BACKEND_TIMEOUT_SECONDS` | 客户端后端局域网服务地址和请求超时 |
 | 图片缓存 | `IMAGE_CACHE_SECONDS` | 所有图片响应的浏览器私有缓存时效，单位为秒 |
-| DeepSeek 模型 | `DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL`、`DEEPSEEK_MODEL`、`DEEPSEEK_HTTP_TIMEOUT_SECONDS` | 与客户端后端共享的 OpenAI 兼容模型密钥、地址、模型名称和调用超时 |
+| 查询智能体 | `DEEPSEEK_*`、`AGENT_QUERY_*` | 模型连接、各阶段单次输出、生成与工具次数、活动会话、事件历史、会话保留和 SSE 心跳 |
 
 配置由 `pydantic-settings` 从根目录 `.env` 和进程环境变量加载并校验。数据库密码使用 `SecretStr` 保存，构造连接地址时通过 SQLAlchemy `URL` 处理特殊字符。
 
@@ -207,9 +220,26 @@ DEEPSEEK_API_KEY=
 DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-v4-flash
 DEEPSEEK_HTTP_TIMEOUT_SECONDS=60
+DEEPSEEK_QUERY_ALIGNMENT_MAX_TOKENS=1200
+DEEPSEEK_QUERY_PLANNING_MAX_TOKENS=3000
+DEEPSEEK_QUERY_INSPECTION_MAX_TOKENS=800
+DEEPSEEK_QUERY_SQL_MAX_TOKENS=1200
+DEEPSEEK_QUERY_TRANSLATION_MAX_TOKENS=1000
+DEEPSEEK_QUERY_AUDIT_MAX_TOKENS=500
+AGENT_QUERY_ALIGNMENT_MAX_GENERATIONS=10
+AGENT_QUERY_PLANNING_MAX_GENERATIONS=30
+AGENT_QUERY_PLANNING_MAX_TOOL_CALLS=30
+AGENT_QUERY_SQL_MAX_GENERATIONS=4
+AGENT_QUERY_TRANSLATION_MAX_PARALLEL_FIELDS=4
+AGENT_QUERY_MAX_ACTIVE_SESSIONS=20
+AGENT_QUERY_EVENT_HISTORY_SIZE=200
+AGENT_QUERY_SESSION_TTL_SECONDS=3600
+AGENT_QUERY_SSE_HEARTBEAT_SECONDS=15
 ```
 
-管理端目前只完成配置接入，不会因存在密钥而自动发起模型请求。后续实现具体模型用例时，应通过现有 `openai` SDK 的兼容客户端读取这些配置，并在独立客户端适配器中统一处理超时、有限重试和安全错误映射。
+管理端不会因存在密钥而自动发起模型请求。只有创建查询任务后，业务对齐、查询规划、单表检索、SQL 生成、结果翻译和结果审计才会使用 DeepSeek Beta strict function calling。翻译层按待翻译字段独立调用模型，并受 `AGENT_QUERY_TRANSLATION_MAX_PARALLEL_FIELDS` 限制；`MAX_TOKENS`、并发数、生成轮次和工具次数分别构成独立预算，不能互相替代。
+
+查询会话与事件只保存在单进程内存，`AGENT_QUERY_MAX_ACTIVE_SESSIONS` 包含正在运行和等待用户回答的任务。当前部署必须保持单 Worker；配置与完整安全边界见 [查询智能体运行时与业务域扩展](query-agent-runtime.md)。修改配置后需要重启应用。
 
 ### 3.3 激活赛季配置变更窗口
 

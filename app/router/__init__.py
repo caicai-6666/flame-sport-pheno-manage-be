@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends
 
 from app.router import (
     admin_auth,
+    agent_query,
     health,
     image,
     product,
@@ -23,6 +24,7 @@ router.include_router(health.router)
 router.include_router(admin_auth.router)
 
 protected_router = APIRouter(dependencies=[Depends(require_admin_token)])
+protected_router.include_router(agent_query.router)
 protected_router.include_router(season.router)
 protected_router.include_router(season_statistics.router)
 protected_router.include_router(settlement.router)

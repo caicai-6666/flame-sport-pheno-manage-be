@@ -7,5 +7,9 @@ pydantic-settings
 greenlet
 python-multipart
 httpx
+socksio
 openai
+langgraph
+sqlglot
+PyYAML
 Pillow

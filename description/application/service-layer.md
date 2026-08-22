@@ -37,6 +37,7 @@ services：用例规则、事务边界、调用编排、稳定应用异常
 | 服务模块 | 当前用例 | 主要依赖 | 关键职责 |
 | --- | --- | --- | --- |
 | `app/services/admin_auth.py` | 管理员登录 | `AdminTokenCache` | 校验签发结果，返回稳定令牌数据，隐藏缓存失败语义 |
+| `app/services/agent_queries.py` | 创建、查询、恢复、取消智能体查询并读取结果 | `AgentQueryManager` | 将进程内会话和完整流水线结果转换为不含 SQL、模型原文与技术轨迹的安全 HTTP 数据 |
 | `app/services/season_statistics.py` | 查询当前赛季统计与指定用户项目进度 | 赛季统计仓储 | 管理只读事务，确保当前赛季唯一，查询有效参赛项目，将仓储一致性异常转换为应用异常 |
 | `app/services/seasons.py` | 查询与创建赛季 | 赛季仓储、项目仓储 | 映射赛季状态含义；校验完整日历月、历史边界和项目容量并创建未开始赛季 |
 | `app/services/season_settlements.py` | 查询、初始化并持续收敛赛季结算 | 结算仓储、积分仓储、凭证服务、通知仓储、客户端后端 | 在只读事务返回唯一结算赛季、正式参赛记录、批量用户详情及待终审队列；推进到期状态并清空资格；补齐遗留初审；分用户登记资格、定分；按用户级锁写入赛季奖励流水并标记发放；结束已完全收敛的赛季 |
@@ -52,6 +53,8 @@ services：用例规则、事务边界、调用编排、稳定应用异常
 `app/services/__init__.py` 只声明包，不集中重新导出所有服务，避免形成隐式公共 API 和循环依赖。
 
 健康检查只返回进程存活信息，不包含业务用例，因此仍由路由直接构造响应。`require_admin_token` 是所有受保护路由共享的 HTTP 认证依赖，也不迁入具体业务服务。
+
+查询智能体不使用请求级 `AsyncSession`。服务调用进程级查询管理器，模型和受限只读 SQL 在线程池及独立只读数据库事务中执行；详细编排见 [查询智能体应用编排](query-agent.md)。
 
 ---
 
@@ -203,5 +206,7 @@ python -m unittest tests.test_services tests.test_project_status tests.test_proj
 - [积分商城商品 API](../api/product.md)
 - [凭证终审 API](../api/proof.md)
 - [业务结果通知写入](result-notifications.md)
+- [查询智能体应用编排](query-agent.md)
+- [查询智能体 API](../api/agent-query.md)
 
 数据库字段事实仍以 [数据库文档目录](../README.md) 中的 `description/db/` 文档为准；服务分层不改变表结构或业务数据。

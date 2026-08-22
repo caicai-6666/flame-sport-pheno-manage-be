@@ -1,0 +1,11 @@
+TABLE: season_supplement_eligibility
+ROW_GRAIN: 一行代表结算中赛季内，一名赛季用户对一条原运动凭证拥有的补传资格。
+PURPOSE: 记录哪些凭证允许被用户补传覆盖，以及该资格是否仍有效。
+QUERY_ROLE: 用于查询用户是否具备补传资格、可补传哪些凭证或补传流程是否已关闭；不用于查询待审核队列、项目进度或普通凭证明细。
+DATA_CHARACTER: 结算期流程状态。每条资格只对应一条原凭证；补传成功或流程结束后资格关闭。赛季归属通过 season_user 间接确定。
+QUERY_INVARIANTS:
+- `season_supplement_eligibility.status = 1` 表示当前可补传；查询用户是否仍有补传资格、可补传哪些凭证时默认必须筛选此条件。
+- `status = 0` 表示资格已关闭；只有用户明确要求补传历史或已关闭原因时才可包含。
+RELATIONSHIPS:
+- season_user: many-to-one。多条补传资格可以属于同一条赛季参与记录；每条补传资格属于一个赛季参与用户。
+- proof_record: one-to-one。一条补传资格对应一条可补传的运动凭证；一条凭证最多对应一条补传资格。
