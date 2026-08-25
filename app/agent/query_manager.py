@@ -62,6 +62,7 @@ def _build_session_safe_result(
             "planning_result": None,
             "sql_result": None,
             "translation_result": None,
+            "shaping_result": None,
             "audit_result": safe_audit_result,
         }
     )

@@ -1,6 +1,8 @@
 """使用 LangGraph 编排 DeepSeek 思考、表结构查询与联合查询自然语言生成。"""
 
 import json
+import re
+from collections import Counter
 from collections.abc import Callable
 from typing import Any, Literal, TypedDict
 
@@ -8,7 +10,7 @@ from langgraph.graph import END, START, StateGraph
 from openai import OpenAI
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from app.agent.domains.base import QueryDomainProfile
+from app.agent.domains.base import QueryDomainProfile, QueryPlanPolicyIssue
 from app.agent.events.publisher import AgentProgressReporter, ProgressEmitter
 from app.core.config import Settings, get_settings
 from app.agent.runtime.model_options import (
@@ -41,6 +43,7 @@ from app.agent.tools.query_plan import (
     NATURAL_LANGUAGE_QUERY_TOOL_NAME,
     NaturalLanguageQueryPlan,
     QueryPlanningAbandonment,
+    ResultShapePlan,
     build_abandon_query_planning_tool_definition,
     build_natural_language_query_tool_definition,
     parse_abandon_query_planning_arguments,
@@ -50,7 +53,7 @@ from app.agent.tools.query_plan import (
 from app.agent.engine.planning_prompt import build_base_planning_prompt
 from app.agent.runtime.table_schema_reader import InformationSchemaTableSchemaReader
 from app.agent.runtime.table_schema_cache import CachingTableSchemaReader
-from app.agent.runtime.yaml_context import render_yaml_context
+from app.agent.runtime.yaml_context import parse_yaml_context, render_yaml_context
 from app.agent.tools.table_schema import (
     TABLE_SCHEMA_TOOL_NAME,
     TableSchemaToolResponse,
@@ -71,7 +74,7 @@ from app.agent.tools.argument_feedback import (
 
 DEFAULT_MAX_GENERATION_COUNT = 6
 DEFAULT_MAX_TOOL_CALL_COUNT = 12
-MAX_TERMINAL_ARGUMENT_REPAIR_COUNT = 3
+MAX_TERMINAL_ARGUMENT_REPAIR_COUNT = 5
 SchemaReader = Callable[[str], TableSchemaToolResponse]
 UserInputReader = Callable[[str], str]
 TraceWriter = Callable[[str], None]
@@ -79,6 +82,243 @@ DataInspector = Callable[
     [str, str, str, int, int, DataInspectionPurpose], TableDataInspectionResponse
 ]
 InspectionPageReader = Callable[[str], TableDataInspectionResponse]
+
+
+# 对比业务对齐的量词与布局要求和双计划输出，阻止语义缺失的计划进入 SQL 层。
+def _validate_query_plan_contract(
+    planning_input: str,
+    query_plan: NaturalLanguageQueryPlan,
+    result_shape_plan: ResultShapePlan,
+) -> tuple[QueryPlanPolicyIssue, ...]:
+    try:
+        planning_payload = parse_yaml_context(planning_input)
+    except ValueError:
+        return ()
+    aligned_query = planning_payload.get("aligned_query")
+    if not isinstance(aligned_query, dict):
+        return ()
+
+    issues: list[QueryPlanPolicyIssue] = []
+    aligned_constraints = aligned_query.get("logical_constraints")
+    if isinstance(aligned_constraints, list):
+        required_quantifiers = Counter(
+            (item.get("quantifier"), item.get("count"))
+            for item in aligned_constraints
+            if isinstance(item, dict) and isinstance(item.get("quantifier"), str)
+        )
+        planned_quantifiers = Counter(
+            (condition.quantifier, condition.count)
+            for condition in query_plan.quantified_conditions
+        )
+        missing_quantifiers = required_quantifiers - planned_quantifiers
+        if missing_quantifiers:
+            missing_descriptions = [
+                (
+                    f"{quantifier}(count={count})"
+                    if count is not None
+                    else str(quantifier)
+                )
+                for (quantifier, count), occurrence_count in missing_quantifiers.items()
+                for _ in range(occurrence_count)
+            ]
+            issues.append(
+                QueryPlanPolicyIssue(
+                    field_path="query_plan.quantified_conditions",
+                    message=(
+                        "查询计划遗漏业务对齐层确认的集合量化条件："
+                        + "、".join(missing_descriptions)
+                    ),
+                    repair_action=(
+                        "为上述每个量词新增一条 quantified_conditions 项，"
+                        "使用已读取的真实字段表达 predicate，并选择明确的实现方式。"
+                    ),
+                )
+            )
+
+    applied_business_rules = aligned_query.get("applied_business_rules")
+    if isinstance(applied_business_rules, list):
+        required_rule_ids = {
+            rule_id for rule_id in applied_business_rules if isinstance(rule_id, str)
+        }
+        implemented_rule_ids = {
+            implementation.rule_id
+            for implementation in query_plan.implemented_business_rules
+        }
+        missing_rule_ids = sorted(required_rule_ids - implemented_rule_ids)
+        if missing_rule_ids:
+            issues.append(
+                QueryPlanPolicyIssue(
+                    field_path="query_plan.implemented_business_rules",
+                    message=(
+                        "查询计划没有落实业务对齐层采用的核心规则："
+                        + "、".join(missing_rule_ids)
+                    ),
+                    repair_action=(
+                        "为每个缺失规则新增 implemented_business_rules 项，"
+                        "用 plan_references 指向实际落实该规则的 filters、joins、"
+                        "quantified_conditions、having 或其他已有计划组件。"
+                    ),
+                )
+            )
+
+    if (
+        aligned_query.get("result_scope") == "complete"
+        and query_plan.pagination.limit is not None
+    ):
+        issues.append(
+            QueryPlanPolicyIssue(
+                field_path="query_plan.pagination.limit",
+                message="用户要求完整导出，但 SQL 数据获取计划设置了行数上限。",
+                repair_action=(
+                    "将 query_plan.pagination.limit 改为 null，保持 offset 为 0，"
+                    "完整返回符合筛选条件的数据。"
+                ),
+            )
+        )
+
+    for index, condition in enumerate(query_plan.quantified_conditions):
+        normalized_predicate = re.sub(
+            r"\s+",
+            "",
+            condition.predicate.replace("`", "").lower(),
+        )
+        matching_filter_indexes = [
+            filter_index
+            for filter_index, query_filter in enumerate(query_plan.filters)
+            if re.sub(
+                r"\s+",
+                "",
+                query_filter.condition.replace("`", "").lower(),
+            )
+            == normalized_predicate
+        ]
+        if condition.quantifier in {"all", "none"} and matching_filter_indexes:
+            issues.append(
+                QueryPlanPolicyIssue(
+                    field_path=(
+                        "query_plan.filters["
+                        + ",".join(str(item) for item in matching_filter_indexes)
+                        + "]"
+                    ),
+                    message=(
+                        f"量词 {condition.quantifier} 的成员谓词被同时写成普通筛选，"
+                        "这会在量化判断前删除反例，使全部或没有条件失真。"
+                    ),
+                    repair_action=(
+                        "从 query_plan.filters 删除与该 quantified_conditions.predicate "
+                        "相同的普通筛选；filters 只保留集合范围条件，成员谓词仅在 "
+                        "NOT EXISTS、条件聚合、子查询或 CTE 的资格判断中计算。"
+                    ),
+                )
+            )
+        if (
+            result_shape_plan.shape_type == "pivot"
+            and condition.quantifier in {"all", "none"}
+            and condition.implementation_hint != "not_exists"
+        ):
+            issues.append(
+                QueryPlanPolicyIssue(
+                    field_path=(
+                        f"query_plan.quantified_conditions[{index}].implementation_hint"
+                    ),
+                    message=(
+                        "最终结果需要保留集合成员逐行供 pivot 展开；当前全称或否定"
+                        "量词没有使用可在外层保留成员行的 NOT EXISTS 资格判断。"
+                    ),
+                    repair_action=(
+                        "把 implementation_hint 精确改为 not_exists：all 在相关子查询中"
+                        "排除不满足 predicate 的反例成员，none 在相关子查询中排除满足"
+                        " predicate 的成员；外层继续返回合格主体的全部集合成员供塑形。"
+                    ),
+                )
+            )
+        if condition.implementation_hint == "having" and not query_plan.having:
+            issues.append(
+                QueryPlanPolicyIssue(
+                    field_path=f"query_plan.quantified_conditions[{index}]",
+                    message="该量化条件声明使用 having，但 query_plan.having 为空。",
+                    repair_action=(
+                        "在 query_plan.having 中加入落实该量化条件的聚合后筛选表达式；"
+                        "如果实际不用 HAVING，则把 implementation_hint 改为真实实现方式。"
+                    ),
+                )
+            )
+
+    presentation_requirements = aligned_query.get("presentation_requirements")
+    required_layouts = {
+        item.get("layout")
+        for item in presentation_requirements or []
+        if isinstance(item, dict)
+    }
+    if "pivot" in required_layouts and result_shape_plan.shape_type != "pivot":
+        issues.append(
+            QueryPlanPolicyIssue(
+                field_path="result_shape_plan.shape_type",
+                message="用户已明确要求动态按列展开，但塑形计划不是 pivot。",
+                repair_action=(
+                    "将 result_shape_plan.shape_type 改为 pivot，并完整填写分组字段、"
+                    "透传字段、动态列取值、组内排序和列标题模板。"
+                ),
+            )
+        )
+    if result_shape_plan.shape_type == "pivot":
+        selected_fields_by_result = {
+            select_field.result_field: select_field.field
+            for select_field in query_plan.select_fields
+        }
+        stable_identity_fields = [
+            field_name
+            for field_name in result_shape_plan.group_fields
+            if re.search(
+                r"(?:^|\.)id\b",
+                selected_fields_by_result.get(field_name, ""),
+                flags=re.IGNORECASE,
+            )
+        ]
+        if not stable_identity_fields:
+            issues.append(
+                QueryPlanPolicyIssue(
+                    field_path="result_shape_plan.group_fields",
+                    message=(
+                        "pivot 塑形没有使用最终行主体的稳定 ID 分组；"
+                        "仅按名称分组可能把同名主体合并为一行。"
+                    ),
+                    repair_action=(
+                        "在 query_plan.select_fields 中加入最终行主体真实表的 id 字段，"
+                        "为其声明稳定 result_field；把该 result_field 加入 "
+                        "result_shape_plan.group_fields 和 hidden_fields。"
+                        "名称等展示字段继续放在 passthrough_fields。"
+                    ),
+                )
+            )
+        requested_outputs = aligned_query.get("requested_outputs")
+        identifier_requested = any(
+            re.search(
+                r"(?:(?<![A-Za-z0-9_])id(?![A-Za-z0-9_])|标识|编号|主键)",
+                output,
+                flags=re.IGNORECASE,
+            )
+            for output in requested_outputs or []
+            if isinstance(output, str)
+        )
+        exposed_identity_fields = sorted(
+            set(stable_identity_fields) & set(result_shape_plan.passthrough_fields)
+        )
+        if exposed_identity_fields and not identifier_requested:
+            issues.append(
+                QueryPlanPolicyIssue(
+                    field_path="result_shape_plan.passthrough_fields",
+                    message=(
+                        "pivot 将仅用于稳定分组的主体 ID 暴露成了用户未要求的展示列："
+                        + "、".join(exposed_identity_fields)
+                    ),
+                    repair_action=(
+                        "从 passthrough_fields 删除上述 ID，并将其加入 hidden_fields；"
+                        "这些字段继续保留在 group_fields 和 query_plan.select_fields 中。"
+                    ),
+                )
+            )
+    return tuple(issues)
 
 
 class QueryPlanningAgentResult(BaseModel):
@@ -99,7 +339,10 @@ class QueryPlanningAgentResult(BaseModel):
     )
     user_interactions: list[UserInteraction] = Field(description="模型通过交互出口发起的澄清问答")
     query_plan: NaturalLanguageQueryPlan | None = Field(
-        default=None, description="成功时后续 SQL 生成器可消费的结构化查询计划"
+        default=None, description="成功时只供 SQL 查询执行层消费的数据获取计划"
+    )
+    result_shape_plan: ResultShapePlan | None = Field(
+        default=None, description="成功时只供翻译后本地塑形层消费的确定性计划"
     )
     query_request: str | None = Field(
         default=None, description="成功时可交给后续 SQL 执行器的联合查询自然语言"
@@ -114,8 +357,15 @@ class QueryPlanningAgentResult(BaseModel):
     @model_validator(mode="after")
     def validate_terminal_payload(self) -> "QueryPlanningAgentResult":
         if self.status == "success":
+            if self.result_shape_plan is None and self.query_plan is not None:
+                self.result_shape_plan = ResultShapePlan(
+                    passthrough_fields=[
+                        field.result_field for field in self.query_plan.select_fields
+                    ]
+                )
             if (
                 self.query_plan is None
+                or self.result_shape_plan is None
                 or self.query_request is None
                 or self.abandonment is not None
             ):
@@ -123,6 +373,7 @@ class QueryPlanningAgentResult(BaseModel):
         elif (
             self.abandonment is None
             or self.query_plan is not None
+            or self.result_shape_plan is not None
             or self.query_request is not None
         ):
             raise ValueError("查询规划放弃结果必须且只能包含 abandonment")
@@ -695,9 +946,16 @@ class DeepSeekQueryPlanningAgent:
                         "查询规划最终工具参数不符合约束",
                         raw_responses,
                     ) from error
-                policy_issues = self._domain_profile.validate_query_plan(
-                    state["user_question"],
-                    query_arguments.query_plan,
+                policy_issues = (
+                    _validate_query_plan_contract(
+                        state["user_question"],
+                        query_arguments.query_plan,
+                        query_arguments.result_shape_plan,
+                    )
+                    + self._domain_profile.validate_query_plan(
+                        state["user_question"],
+                        query_arguments.query_plan,
+                    )
                 )
                 if policy_issues:
                     if terminal_argument_repair_count < MAX_TERMINAL_ARGUMENT_REPAIR_COUNT:
@@ -727,8 +985,10 @@ class DeepSeekQueryPlanningAgent:
                         data_inspections=data_inspections,
                         user_interactions=user_interactions,
                         query_plan=query_arguments.query_plan,
+                        result_shape_plan=query_arguments.result_shape_plan,
                         query_request=render_natural_language_query_plan(
                             query_arguments.query_plan,
+                            query_arguments.result_shape_plan,
                         ),
                         raw_responses=raw_responses,
                         generation_count=generation_count,

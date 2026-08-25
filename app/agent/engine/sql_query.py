@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 from collections.abc import Callable
+from decimal import Decimal, InvalidOperation
 from typing import Any, Final, Literal, TypedDict
 
 import asyncmy
@@ -18,7 +19,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-from sqlglot import exp, parse
+from sqlglot import exp, parse, parse_one
 from sqlglot.errors import ParseError
 
 from app.agent.domains.base import QueryDomainProfile
@@ -131,6 +132,25 @@ class SqlValidationError(ValueError):
         self.code = code
         self.repair_action = repair_action
         self.retry_target = retry_target
+        self.details = details or {}
+
+
+class SqlExecutionError(RuntimeError):
+    """携带数据库安全诊断和有限重试策略的只读 SQL 执行异常。"""
+
+    # 保存稳定错误代码和明确修复动作，避免模型根据模糊“执行失败”盲目重写查询。
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        repair_action: str,
+        retryable: bool,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.repair_action = repair_action
+        self.retryable = retryable
         self.details = details or {}
 
 
@@ -284,6 +304,8 @@ def build_sql_query_tool_definition() -> dict[str, object]:
         SUBMIT_SQL_QUERY_TOOL_NAME,
         (
             "提交一条参数化 MySQL 只读查询草稿。外部筛选值必须使用命名占位符，"
+            "包括状态值、进度阈值和 NOT EXISTS 内的成员条件常量；"
+            "只有 EXISTS 投影的 SELECT 1 和 LIMIT 整数可以保留字面量。"
             "parameters 使用 name/value 固定结构列表，result_columns 必须与 SELECT 输出名称和顺序一致。"
         ),
         SqlQueryDraft,
@@ -328,6 +350,37 @@ def build_sql_validation_error_message(
     }
 
 
+# 将数据库执行错误转换为同一 SQL 工具调用的正常失败结果，模型只获得脱敏诊断和明确动作。
+def build_sql_execution_error_message(
+    tool_call_id: str,
+    error: SqlExecutionError,
+) -> dict[str, str]:
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call_id,
+        "content": json.dumps(
+            {
+                "status": "failure",
+                "error": {
+                    "code": error.code,
+                    "tool_name": SUBMIT_SQL_QUERY_TOOL_NAME,
+                    "message": str(error),
+                    "details": error.details,
+                    "repair_action": error.repair_action,
+                },
+                "retryable": error.retryable,
+                "retry_target": "sql_generation" if error.retryable else "none",
+                "next_action": (
+                    "按 repair_action 修正 SQL 后重新调用 submit_sql_query。"
+                    if error.retryable
+                    else "停止模型重试，由系统处理数据库基础设施错误。"
+                ),
+            },
+            ensure_ascii=False,
+        ),
+    }
+
+
 # 为 SQL 生成模型构造稳定系统提示词，约束其只将已确认的查询计划翻译为 SQL。
 def _build_sql_generation_system_prompt() -> str:
     """构造不擅自压缩完整查询结果的稳定 SQL 生成约束。"""
@@ -337,18 +390,21 @@ def _build_sql_generation_system_prompt() -> str:
 1. 必须且只能调用一次 submit_sql_query 工具提交结果，禁止输出普通文本、Markdown、解释和代码围栏。
 2. SQL 只能是一条 SELECT，或一条以 WITH 开头且最终为 SELECT 的查询；可按查询计划使用 JOIN、子查询或 CTE。
 3. 只能读取“允许读取的表”中列出的真实表；不得 SELECT *，不得使用注释、分号、多语句、写操作、锁、文件操作、管理语句或高风险函数。
-4. 外部筛选值必须使用 :parameter_name 命名占位符，并在 parameters 列表中提供 {"name": "parameter_name", "value": 对应JSON标量}；无参数时传空列表。不得拼接用户文本或未确认值。LIMIT 必须使用整数常量，不能参数化。
-5. 必须使用输入中提供的真实字段、外键和备注；基础表字段优先使用表名或别名限定。SQL 必须完整实现查询计划中的目标、关联、筛选、分组、聚合、排序和分页。
+4. WHERE、HAVING、JOIN ON 以及 EXISTS/NOT EXISTS 子查询中的所有字符串、数值、布尔和日期筛选值都必须使用 :parameter_name 命名占位符，并在 parameters 列表中提供 {"name": "parameter_name", "value": 对应JSON标量}；这包括查询计划已经给出的状态值和进度阈值。只有 EXISTS/NOT EXISTS 投影位置的 SELECT 1 以及 LIMIT/OFFSET 整数可以保留字面量。无参数时传空列表，不得拼接用户文本或未确认值。LIMIT 必须使用整数常量，不能参数化。
+5. 必须使用输入中提供的真实字段、外键和备注；基础表字段优先使用表名或 aliases 中声明的别名限定。SQL 必须完整实现查询计划中的目标、关联、筛选、集合量化条件、分组、聚合、HAVING、排序和分页。
 6. 查询计划是唯一业务事实来源。不要读取或假定用户原问题、规划阶段的思考过程、表概述或任何未提供数据。
-7. result_columns 必须按 SELECT 输出顺序列出最终列名或别名，且名称不得重复。若多个字段原名相同（例如多个表的 id 或 name），必须分别使用唯一的 AS 别名，并在 result_columns 中使用这些别名。
+7. 每个 select_fields 项都带有稳定 `result_field`。SELECT 必须按 select_fields 顺序为每项显式使用 `AS result_field`，result_columns 必须按相同顺序精确填写这些 result_field，不得新增、删除、改名或重复。
 8. 严格遵循查询计划的 pagination：limit 为 null 时不得自行添加 LIMIT；limit 为整数时必须使用该整数。不要为了审计模型上下文、性能猜测或其他自行判断增加或缩小结果范围。
+9. 对 all 和 none 量词，成员 predicate 不能先作为外层普通 WHERE 删除反例。必须按 quantified_conditions 的实现方式完成主体资格判断；EXISTS、NOT EXISTS 或相关子查询必须在同一个子查询内完整实现 correlation_condition、全部 collection_filters 和正确方向的成员 predicate/反条件。若最终还要返回集合成员行，应先确定合格主体，再在外层关联并返回成员。
 
 输入是合法 YAML，字段含义固定如下：
-- `query_plan` 是权威查询计划；`query_goal` 是查询目标，`row_granularity` 是结果一行的业务含义。
+- `query_plan` 是 SQL 层唯一权威的数据获取计划；不会提供也不得猜测结果塑形计划。`query_goal` 是查询目标，`row_granularity` 是 SQL 原始结果一行的业务含义。
 - `tables` 列出参与表；每项的 `table_name` 是真实表名，`role` 是本次职责。
-- `joins`、`filters` 分别是关联和筛选；每项的 `condition` 是原始字段条件，`reason` 是采用原因。
-- `select_fields` 是返回字段；每项的 `field` 是字段或表达式，`purpose` 是简短表头标签，不写查询策略或定位用途。`group_by` 是分组字段列表。
-- `aggregations` 是聚合列表；每项的 `expression` 是聚合表达式，`purpose` 是计算目的。`order_by` 中 `field` 是排序字段，`direction` 是 ASC 或 DESC。
+- `aliases` 声明表达式使用的别名及真实表或派生集合来源；未声明的别名不得使用。
+- `joins`、`filters` 分别是关联和普通筛选；每项的 `condition` 是原始字段条件，`reason` 是采用原因。`quantified_conditions` 是必须实现的集合量词约束：`predicate` 是成员应满足的正向条件，`correlation_condition` 是相关子查询连接外层主体的条件，`collection_filters` 是该量词自己的成员集合范围，三者不能互相替代，也不得退化为普通单行 WHERE。
+- `implemented_business_rules` 只把核心规则映射到 joins、filters、quantified_conditions 等已有计划组件，便于审计覆盖情况；不得把它当成第二份 SQL 表达式来源。SQL 只需准确实现被引用的正式计划组件。
+- `select_fields` 是返回字段；每项的 `field` 是字段或表达式，`result_field` 是 SQL 必须输出的 AS 别名，`purpose` 是简短表头标签。`group_by` 是分组字段列表。
+- `aggregations` 是聚合列表；`having` 是聚合后的筛选条件。`order_by` 中 `field` 是排序字段，`direction` 是 ASC 或 DESC。
 - `pagination.limit` 是最大结果行数或 null，`pagination.offset` 是偏移量；`query_strategy` 与 `strategy_reason` 是查询策略及原因。
 - `business_caliber` 是必须落实的业务口径；`assumptions` 是已确认允许保留的假设。
 - `allowed_table_schemas` 是允许读取的表结构列表；每项的 `table` 是真实表名，`columns` 是字段列表，`field_name`、`data_type`、`foreign_key`、`comment` 分别表示真实字段、数据库类型、外键目标和字段注释。
@@ -547,32 +603,387 @@ def _validate_ast_safety(
         )
 
 
+# 判断字面量最近所属的是筛选谓词还是 SELECT 投影，避免把 EXISTS 的 SELECT 1 误判为外部值。
+def _is_filter_predicate_literal(literal: exp.Literal) -> bool:
+    current = literal.parent
+    while current is not None:
+        if isinstance(current, (exp.Where, exp.Having, exp.Join)):
+            return True
+        if isinstance(current, exp.Select):
+            return False
+        current = current.parent
+    return False
+
+
 # 拒绝 WHERE、HAVING 和 JOIN ON 中的硬编码标量，确保用户或业务筛选值只能经参数绑定进入 SQL。
 def _validate_external_filter_values_parameterized(expression: exp.Expression) -> None:
-    predicate_roots: list[exp.Expression] = []
-    for where_clause in expression.find_all(exp.Where):
-        predicate_roots.append(where_clause.this)
-    for having_clause in expression.find_all(exp.Having):
-        predicate_roots.append(having_clause.this)
-    for join_clause in expression.find_all(exp.Join):
-        on_expression = join_clause.args.get("on")
-        if on_expression is not None:
-            predicate_roots.append(on_expression)
-    literal_values = [
-        literal.sql(dialect="mysql")
-        for predicate_root in predicate_roots
-        for literal in predicate_root.find_all(exp.Literal)
-    ]
-    if literal_values:
+    literal_locations: list[dict[str, str]] = []
+    for literal in expression.find_all(exp.Literal):
+        if not _is_filter_predicate_literal(literal):
+            continue
+        predicate = literal.parent
+        while predicate is not None and not isinstance(
+            predicate,
+            (exp.Predicate, exp.Join),
+        ):
+            predicate = predicate.parent
+        literal_locations.append(
+            {
+                "value": literal.sql(dialect="mysql"),
+                "predicate": (
+                    predicate.sql(dialect="mysql")
+                    if predicate is not None
+                    else literal.parent.sql(dialect="mysql")
+                ),
+            }
+        )
+    if literal_locations:
+        limited_locations = literal_locations[:10]
+        location_descriptions = [
+            f"`{item['predicate']}` 中的 `{item['value']}`"
+            for item in limited_locations
+        ]
         raise SqlValidationError(
             code="external_literal_not_parameterized",
             message="SQL 的筛选条件包含未参数化的外部值",
             repair_action=(
-                f"将筛选条件中的字面量 {literal_values[:10]} 逐一替换为 "
-                ":parameter_name 命名占位符，并在 parameters 中为每个占位符"
-                "提供同名 JSON 标量。"
+                "逐一修正以下位置："
+                + "；".join(location_descriptions)
+                + "。只替换指出的筛选字面量，不要改动比较运算符：为每个值使用"
+                " :parameter_name 命名占位符，并在 parameters 中提供同名 JSON 标量。"
             ),
-            details={"literal_values": literal_values[:10]},
+            details={"literal_locations": limited_locations},
+        )
+
+
+# 将 SQL 草稿中的命名占位符替换为绑定标量，仅用于 AST 语义比较，不生成执行 SQL。
+def _resolve_draft_parameter_ast(
+    expression: exp.Expression,
+    parameters: list[SqlQueryParameter],
+) -> exp.Expression:
+    parameter_values = {parameter.name: parameter.value for parameter in parameters}
+
+    # 只替换已声明命名占位符；参数缺失仍由后续统一参数校验产生精确错误。
+    def replace_placeholder(node: exp.Expression) -> exp.Expression:
+        if isinstance(node, exp.Placeholder) and node.name in parameter_values:
+            return exp.convert(parameter_values[node.name])
+        return node
+
+    return expression.copy().transform(replace_placeholder)
+
+
+# 将表达式列限定符中的表别名还原为真实表名，使量词语义比较不依赖规划或生成器命名风格。
+def _normalize_column_table_aliases(
+    expression: exp.Expression,
+    declared_aliases: dict[str, str] | None = None,
+) -> exp.Expression:
+    alias_to_table_name = dict(declared_aliases or {})
+    alias_to_table_name.update({
+        table.alias: table.name
+        for table in expression.find_all(exp.Table)
+        if table.alias and table.alias != table.name
+    })
+
+    # 只改写列的限定符，不改变表节点和 SQL 执行文本。
+    def replace_column_alias(node: exp.Expression) -> exp.Expression:
+        if isinstance(node, exp.Column) and node.table in alias_to_table_name:
+            node.set("table", exp.to_identifier(alias_to_table_name[node.table]))
+        return node
+
+    return expression.copy().transform(replace_column_alias)
+
+
+# 收集完整 SQL 中每个显式或隐式表别名的真实表名，供嵌套子查询统一还原限定符。
+def _build_sql_alias_mapping(expression: exp.Expression) -> dict[str, str]:
+    return {
+        table.alias_or_name: table.name
+        for table in expression.find_all(exp.Table)
+    }
+
+
+# 把简单比较谓词转换为逻辑反条件，用于验证 all 量词的 NOT EXISTS 反例查询。
+def _build_predicate_complement(predicate: exp.Expression) -> exp.Expression:
+    complement_types: dict[type[exp.Expression], type[exp.Expression]] = {
+        exp.EQ: exp.NEQ,
+        exp.NEQ: exp.EQ,
+        exp.GT: exp.LTE,
+        exp.GTE: exp.LT,
+        exp.LT: exp.GTE,
+        exp.LTE: exp.GT,
+    }
+    complement_type = complement_types.get(type(predicate))
+    if complement_type is None:
+        return exp.Not(this=predicate.copy())
+    return complement_type(
+        this=predicate.this.copy(),
+        expression=predicate.expression.copy(),
+    )
+
+
+# 将数值字面量归一化为相同十进制文本，避免 1、1.0 和 1.0000 被误判成不同业务阈值。
+def _normalize_numeric_literals(expression: exp.Expression) -> exp.Expression:
+    # 仅改写 SQL 数值节点，字符串中的数字仍保持其原始业务含义。
+    def replace_numeric_literal(node: exp.Expression) -> exp.Expression:
+        if not isinstance(node, exp.Literal) or not node.is_number:
+            return node
+        try:
+            normalized_value = Decimal(node.this).normalize()
+        except (InvalidOperation, TypeError, ValueError):
+            return node
+        normalized_text = format(normalized_value, "f")
+        if "." in normalized_text:
+            normalized_text = normalized_text.rstrip("0").rstrip(".")
+        return exp.Literal.number(normalized_text or "0")
+
+    return expression.copy().transform(replace_numeric_literal)
+
+
+# 使用归一化 MySQL 文本比较两个表达式子树，忽略排版和等值数值精度差异。
+def _expressions_are_equivalent(
+    left: exp.Expression,
+    right: exp.Expression,
+) -> bool:
+    normalized_left = _normalize_numeric_literals(left)
+    normalized_right = _normalize_numeric_literals(right)
+    if normalized_left.sql(dialect="mysql") == normalized_right.sql(
+        dialect="mysql"
+    ):
+        return True
+    if isinstance(normalized_left, (exp.EQ, exp.NEQ)) and isinstance(
+        normalized_right,
+        type(normalized_left),
+    ):
+        return (
+            normalized_left.this.sql(dialect="mysql")
+            == normalized_right.expression.sql(dialect="mysql")
+            and normalized_left.expression.sql(dialect="mysql")
+            == normalized_right.this.sql(dialect="mysql")
+        )
+    return False
+
+
+# 解析规划量词中的单条 MySQL 条件，并把不可执行计划明确归还查询规划层修复。
+def _parse_quantified_plan_condition(
+    condition_text: str,
+    condition_index: int,
+    field_name: str,
+) -> exp.Expression:
+    try:
+        condition_select = parse_one(
+            f"SELECT 1 WHERE {condition_text}",
+            read="mysql",
+        )
+    except ParseError as error:
+        raise SqlValidationError(
+            code="invalid_quantified_predicate",
+            message=f"查询计划中的量词字段 {field_name} 不是有效 MySQL 表达式",
+            repair_action=(
+                "返回查询规划阶段，把 quantified_conditions"
+                f"[{condition_index}].{field_name} 改为真实字段组成的单一 MySQL 条件。"
+            ),
+            retry_target="query_planning",
+            details={"condition_index": condition_index, "field_name": field_name},
+        ) from error
+    condition_where = condition_select.args.get("where")
+    if condition_where is None:
+        raise SqlValidationError(
+            code="invalid_quantified_predicate",
+            message=f"查询计划中的量词字段 {field_name} 为空",
+            repair_action=(
+                "返回查询规划阶段，为 quantified_conditions"
+                f"[{condition_index}].{field_name} 提供真实字段条件。"
+            ),
+            retry_target="query_planning",
+            details={"condition_index": condition_index, "field_name": field_name},
+        )
+    return condition_where.this
+
+
+# 判断一个子表达式是否包含与规划条件等价的完整谓词，比较前统一还原 SQL 表别名。
+def _expression_contains_condition(
+    expression: exp.Expression,
+    expected_condition: exp.Expression,
+    sql_aliases: dict[str, str],
+) -> bool:
+    return any(
+        _expressions_are_equivalent(
+            _normalize_column_table_aliases(candidate, sql_aliases),
+            expected_condition,
+        )
+        for candidate in expression.walk()
+    )
+
+
+# 校验相关子查询中的主体关联确实跨越内外层作用域，拒绝只关联两个内层表的伪相关条件。
+def _exists_contains_outer_correlation(
+    exists_expression: exp.Exists,
+    expected_correlation: exp.Expression,
+    sql_aliases: dict[str, str],
+) -> bool:
+    local_select = exists_expression.this
+    local_aliases = {
+        table.alias_or_name
+        for table in local_select.find_all(exp.Table)
+        if table.find_ancestor(exp.Select) is local_select
+    }
+    for candidate in local_select.find_all(exp.EQ):
+        normalized_candidate = _normalize_column_table_aliases(
+            candidate,
+            sql_aliases,
+        )
+        if not _expressions_are_equivalent(
+            normalized_candidate,
+            expected_correlation,
+        ):
+            continue
+        candidate_columns = list(candidate.find_all(exp.Column))
+        if len(candidate_columns) != 2:
+            continue
+        local_flags = [
+            bool(column.table) and column.table in local_aliases
+            for column in candidate_columns
+        ]
+        if any(local_flags) and not all(local_flags):
+            return True
+    return False
+
+
+# 要求成员条件、集合范围和内外层关联同时出现在同一个正确极性的 EXISTS 子查询中。
+def _exists_tree_satisfies_quantified_contract(
+    expression: exp.Expression,
+    expected_predicate: exp.Expression,
+    expected_correlation: exp.Expression | None,
+    expected_collection_filters: list[exp.Expression],
+    require_not_exists: bool,
+) -> bool:
+    sql_aliases = _build_sql_alias_mapping(expression)
+    for exists_expression in expression.find_all(exp.Exists):
+        parent = exists_expression.parent
+        is_not_exists = isinstance(parent, exp.Not)
+        if is_not_exists != require_not_exists:
+            continue
+        if not _expression_contains_condition(
+            exists_expression,
+            expected_predicate,
+            sql_aliases,
+        ):
+            continue
+        if expected_correlation is not None and not _exists_contains_outer_correlation(
+            exists_expression,
+            expected_correlation,
+            sql_aliases,
+        ):
+            continue
+        if not all(
+            _expression_contains_condition(
+                exists_expression,
+                collection_filter,
+                sql_aliases,
+            )
+            for collection_filter in expected_collection_filters
+        ):
+            continue
+        return True
+    return False
+
+
+# 对 EXISTS/NOT EXISTS 量词执行 AST 语义校验，防止运算符变化把 all、any、none 查询反转。
+def _validate_quantified_condition_implementation(
+    expression: exp.Expression,
+    draft: SqlQueryDraft,
+    query_plan: NaturalLanguageQueryPlan,
+) -> None:
+    resolved_expression = _resolve_draft_parameter_ast(
+        expression,
+        draft.parameters,
+    )
+    plan_aliases = {
+        alias.alias: alias.source_table
+        for alias in query_plan.aliases
+        if alias.source_table is not None
+    }
+    for index, condition in enumerate(query_plan.quantified_conditions):
+        if condition.implementation_hint not in {"exists", "not_exists"}:
+            continue
+        expected_predicate = _normalize_column_table_aliases(
+            _parse_quantified_plan_condition(
+                condition.predicate,
+                index,
+                "predicate",
+            ),
+            plan_aliases,
+        )
+        expected_correlation = (
+            _normalize_column_table_aliases(
+                _parse_quantified_plan_condition(
+                    condition.correlation_condition,
+                    index,
+                    "correlation_condition",
+                ),
+                plan_aliases,
+            )
+            if condition.correlation_condition is not None
+            else None
+        )
+        expected_collection_filters = [
+            _normalize_column_table_aliases(
+                _parse_quantified_plan_condition(
+                    collection_filter,
+                    index,
+                    f"collection_filters[{filter_index}]",
+                ),
+                plan_aliases,
+            )
+            for filter_index, collection_filter in enumerate(
+                condition.collection_filters
+            )
+        ]
+        require_not_exists = condition.implementation_hint == "not_exists"
+        if condition.quantifier == "all" and require_not_exists:
+            expected_predicate = _build_predicate_complement(expected_predicate)
+        elif condition.quantifier == "none" and require_not_exists:
+            expected_predicate = expected_predicate.copy()
+        elif condition.quantifier == "any" and not require_not_exists:
+            expected_predicate = expected_predicate.copy()
+        else:
+            continue
+        if _exists_tree_satisfies_quantified_contract(
+            resolved_expression,
+            expected_predicate,
+            expected_correlation,
+            expected_collection_filters,
+            require_not_exists,
+        ):
+            continue
+        expected_sql = expected_predicate.sql(dialect="mysql")
+        exists_keyword = "NOT EXISTS" if require_not_exists else "EXISTS"
+        correlation_sql = (
+            expected_correlation.sql(dialect="mysql")
+            if expected_correlation is not None
+            else "无"
+        )
+        collection_filter_sql = [
+            item.sql(dialect="mysql") for item in expected_collection_filters
+        ]
+        raise SqlValidationError(
+            code="quantified_condition_mismatch",
+            message=(
+                f"SQL 没有正确实现量词 {condition.quantifier} 的成员判断"
+            ),
+            repair_action=(
+                f"在同一个 {exists_keyword} 子查询中同时使用："
+                f"内外层关联 `{correlation_sql}`；"
+                f"集合范围 {collection_filter_sql or ['无额外条件']}；"
+                f"成员条件 `{expected_sql}`。不要把关联改成两个内层表之间的条件。"
+            ),
+            details={
+                "condition_index": index,
+                "quantifier": condition.quantifier,
+                "expected_member_condition": expected_sql,
+                "expected_correlation_condition": correlation_sql,
+                "expected_collection_filters": collection_filter_sql,
+                "implementation_hint": condition.implementation_hint,
+            },
         )
 
 
@@ -626,6 +1037,7 @@ def _resolve_effective_limit(
 def _validate_result_columns(
     expression: exp.Expression,
     result_columns: list[str],
+    query_plan: NaturalLanguageQueryPlan,
 ) -> None:
     if len(result_columns) != len(set(result_columns)):
         duplicate_columns = sorted(
@@ -659,6 +1071,23 @@ def _validate_result_columns(
             details={
                 "actual_result_columns": actual_result_columns,
                 "declared_result_columns": result_columns,
+            },
+        )
+    expected_result_columns = [
+        select_field.result_field for select_field in query_plan.select_fields
+    ]
+    if result_columns != expected_result_columns:
+        raise SqlValidationError(
+            code="query_plan_result_columns_mismatch",
+            message="SQL 输出列必须与查询计划的 result_field 按顺序完全一致",
+            repair_action=(
+                "按 query_plan.select_fields 的顺序，为每个 SELECT 表达式显式添加 "
+                "AS 别名，并把 result_columns 精确改为："
+                f"{expected_result_columns}。"
+            ),
+            details={
+                "expected_result_columns": expected_result_columns,
+                "actual_result_columns": result_columns,
             },
         )
 
@@ -776,8 +1205,9 @@ def validate_sql_draft(
         expression,
         set(_get_plan_table_names(query_plan, allowed_table_names)),
     )
+    _validate_quantified_condition_implementation(expression, draft, query_plan)
     _validate_external_filter_values_parameterized(expression)
-    _validate_result_columns(expression, draft.result_columns)
+    _validate_result_columns(expression, draft.result_columns, query_plan)
     _resolve_effective_limit(expression, query_plan)
     normalized_sql = expression.sql(dialect="mysql")
     return _compile_named_parameters(normalized_sql, draft.parameters)
@@ -804,9 +1234,45 @@ class AsyncMyReadOnlySqlExecutor:
                 )
             )
         except asyncio.TimeoutError as error:
-            raise RuntimeError("SQL 查询执行超时") from error
-        except (OSError, asyncmy.Error) as error:
-            raise RuntimeError("SQL 查询执行失败，请检查数据库连接和查询条件") from error
+            raise SqlExecutionError(
+                code="sql_execution_timeout",
+                message="SQL 查询执行超时",
+                repair_action="无需修改 SQL；由系统检查数据库负载或稍后重试。",
+                retryable=False,
+            ) from error
+        except asyncmy.Error as error:
+            mysql_code = error.args[0] if error.args and isinstance(error.args[0], int) else None
+            raw_message = str(error.args[1] if len(error.args) > 1 else error)
+            safe_message = re.sub(
+                r"(?i)\b(sk-[A-Za-z0-9_-]+|bearer\s+[A-Za-z0-9._-]+)\b",
+                "[REDACTED]",
+                raw_message,
+            )[:500]
+            repairable_codes = {1052, 1054, 1055, 1064, 1111, 1146, 1241, 1242}
+            retryable = mysql_code in repairable_codes
+            raise SqlExecutionError(
+                code=(
+                    f"mysql_query_error_{mysql_code}"
+                    if mysql_code is not None
+                    else "mysql_query_error"
+                ),
+                message=f"数据库拒绝执行当前只读 SQL：{safe_message}",
+                repair_action=(
+                    "依据数据库错误和已提供表结构修正 SQL 语法、字段限定、"
+                    "分组或子查询写法，保持查询计划业务口径不变。"
+                    if retryable
+                    else "无需修改 SQL；由系统检查数据库连接、权限或服务状态。"
+                ),
+                retryable=retryable,
+                details={"mysql_error_code": mysql_code},
+            ) from error
+        except OSError as error:
+            raise SqlExecutionError(
+                code="database_connection_failed",
+                message="无法连接只读数据库",
+                repair_action="无需修改 SQL；由系统检查数据库网络和服务状态。",
+                retryable=False,
+            ) from error
 
     # 在只读事务中执行参数化查询并回滚事务，避免执行路径意外留下数据库副作用。
     async def _execute_async(
@@ -884,7 +1350,14 @@ class SqlQuerySubgraph:
                 "end": END,
             },
         )
-        workflow.add_edge("execute_sql", END)
+        workflow.add_conditional_edges(
+            "execute_sql",
+            self._continue_after_execution,
+            {
+                "generate_sql": "generate_sql",
+                "end": END,
+            },
+        )
         self._workflow = workflow.compile()
 
     # 从应用配置创建真实 DeepSeek 客户端、可复用的结构读取器和只读 MySQL 执行器。
@@ -1222,8 +1695,8 @@ class SqlQuerySubgraph:
             return "execute_sql"
         return "end"
 
-    # 在第三节点中执行已绑定参数的只读 SQL，并将结果与草稿、结构读取记录一起返回。
-    def _execute_sql(self, state: _SqlQueryState) -> dict[str, SqlQuerySubgraphResult]:
+    # 在第三节点中执行已绑定参数的只读 SQL，可修复数据库错误按原工具调用 ID 反馈给模型。
+    def _execute_sql(self, state: _SqlQueryState) -> dict[str, Any]:
         try:
             self._progress_reporter.emit(
                 AgentProgressUpdate(
@@ -1267,7 +1740,41 @@ class SqlQuerySubgraph:
                 f"规划上限：{effective_limit if effective_limit is not None else '未设置'}\n"
                 f"达到行数上限：{'是' if limit_reached else '否'}"
             )
-            return {"result": result}
+            return {"result": result, "next_action": "end"}
+        except SqlExecutionError as error:
+            generation_count = state.get("generation_count", 0)
+            max_generation_count = state["max_generation_count"]
+            can_retry = error.retryable and generation_count < max_generation_count
+            messages = list(state.get("messages", []))
+            tool_call_id = state.get("current_tool_call_id")
+            if tool_call_id:
+                messages.append(build_sql_execution_error_message(tool_call_id, error))
+            message = f"SQL 执行失败：{error}"
+            self._write_trace(
+                "\n================ SQL 子图：执行失败 ================\n"
+                f"错误代码：{error.code}\n"
+                f"{message}\n"
+                f"{'将反馈给模型修复。' if can_retry else '不再进行 SQL 模型重试。'}"
+            )
+            if can_retry:
+                return {
+                    "messages": messages,
+                    "error": message,
+                    "error_code": error.code,
+                    "retry_target": "sql_generation",
+                    "next_action": "generate_sql",
+                }
+            failed_state = dict(state)
+            failed_state.update(
+                {
+                    "error_code": error.code,
+                    "retry_target": "none",
+                }
+            )
+            return {
+                "result": self._build_failure_result(failed_state, message),
+                "next_action": "end",
+            }
         except (RuntimeError, ValueError) as error:
             message = f"SQL 执行失败：{error}"
             self._write_trace(f"\n================ SQL 子图：执行失败 ================\n{message}")
@@ -1278,7 +1785,19 @@ class SqlQuerySubgraph:
                     "retry_target": "none",
                 }
             )
-            return {"result": self._build_failure_result(failed_state, message)}
+            return {
+                "result": self._build_failure_result(failed_state, message),
+                "next_action": "end",
+            }
+
+    # 执行成功或不可修复错误直接结束，仅可定位的 SQL 错误在预算内返回生成节点。
+    def _continue_after_execution(
+        self,
+        state: _SqlQueryState,
+    ) -> Literal["generate_sql", "end"]:
+        if state.get("next_action") == "generate_sql":
+            return "generate_sql"
+        return "end"
 
     # 将生成或校验阶段的状态归一为统一失败结果，保证调用方无需读取 LangGraph 内部字段。
     def _build_failure_result(

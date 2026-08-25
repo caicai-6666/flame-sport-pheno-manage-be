@@ -99,5 +99,13 @@ SPORTS_QUERY_PROFILE = QueryDomainProfile(
         "生成计划前必须先确定查询主体，并在 `query_goal` 与 `row_granularity` 中明确表达。"
         "一行应描述用户真正要查询的主体；如果主体是逐条运动凭证明细，"
         "`proof_record.id` 只能作为辅助定位字段，不能让返回字段退化为 ID 清单。"
+
+        "涉及全部有效锁定项目完成时，quantifier 必须为 all，成员 predicate 中的"
+        "完成边界统一写为 `season_user_project.completion_progress >= 1`；"
+        "不要改写为等号条件，SQL 层会用 `< 1` 作为可验证的反例条件。"
+        "同一量词的 correlation_condition 必须写为 "
+        "`season_user_project.season_user_id = season_user.id`，"
+        "collection_filters 必须且只能包含 `season_user_project.status = 1`，"
+        "从而只检查当前参与记录下的全部有效锁定项目。"
     ),
 )

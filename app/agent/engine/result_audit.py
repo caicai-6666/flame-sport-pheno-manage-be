@@ -14,6 +14,7 @@ from app.agent.domains.base import QueryDomainProfile
 from app.core.config import Settings, get_settings
 from app.agent.engine.business_alignment import BusinessAlignmentResult
 from app.agent.engine.query_planning import QueryPlanningAgentResult
+from app.agent.engine.result_shaping import ResultShapingSubgraphResult
 from app.agent.runtime.model_options import (
     DEFAULT_AUDIT_MAX_TOKENS,
     build_non_thinking_completion_options,
@@ -152,6 +153,7 @@ class _QueryResultAuditState(TypedDict, total=False):
     alignment_result: BusinessAlignmentResult
     planning_result: QueryPlanningAgentResult
     sql_result: SqlQuerySubgraphResult
+    shaping_result: ResultShapingSubgraphResult | None
     display_result: QueryDisplayResult
     statistics: QueryResultStatistics
     assessment: QueryResultAuditAssessment
@@ -246,7 +248,8 @@ def _build_display_headers(
             (
                 select_field.purpose
                 for select_field in select_fields
-                if select_field.field == column_name
+                if select_field.result_field == column_name
+                or select_field.field == column_name
                 or select_field.field.rsplit(".", maxsplit=1)[-1] == column_name
             ),
             None,
@@ -257,7 +260,8 @@ def _build_display_headers(
             (
                 select_field
                 for select_field in select_fields
-                if select_field.field == column_name
+                if select_field.result_field == column_name
+                or select_field.field == column_name
                 or select_field.field.rsplit(".", maxsplit=1)[-1] == column_name
                 or (
                     column_name.lower() == "proof_record_id"
@@ -285,7 +289,26 @@ def _build_display_headers(
 def build_display_result(
     planning_result: QueryPlanningAgentResult,
     sql_result: SqlQuerySubgraphResult,
+    shaping_result: ResultShapingSubgraphResult | None = None,
 ) -> QueryDisplayResult:
+    if shaping_result is not None:
+        if shaping_result.status != "success":
+            raise ValueError("失败的塑形结果不能构造前端表格")
+        headers = [
+            QueryResultHeader(key=column.key, label=column.label)
+            for column in shaping_result.columns
+        ]
+        rows = [
+            {header.key: _to_json_safe(row.get(header.key)) for header in headers}
+            for row in shaping_result.rows
+        ]
+        return QueryDisplayResult(
+            headers=headers,
+            rows=rows,
+            returned_row_count=len(rows),
+            effective_limit=sql_result.effective_limit,
+            limit_reached=sql_result.limit_reached,
+        )
     headers = _build_display_headers(sql_result.result_columns, planning_result)
     rows = [
         {header.key: _to_json_safe(row.get(header.key)) for header in headers}
@@ -371,18 +394,26 @@ def _build_numeric_extremes(
 # 基于完整 SQL 结果计算审计可依赖的行数、类别分布和业务数值极值。
 def build_query_result_statistics(
     sql_result: SqlQuerySubgraphResult,
+    shaping_result: ResultShapingSubgraphResult | None = None,
 ) -> QueryResultStatistics:
+    result_columns = sql_result.result_columns
+    rows = sql_result.rows
+    if shaping_result is not None:
+        if shaping_result.status != "success":
+            raise ValueError("失败的塑形结果不能生成统计信息")
+        result_columns = [column.key for column in shaping_result.columns]
+        rows = shaping_result.rows
     return QueryResultStatistics(
-        row_count=len(sql_result.rows),
+        row_count=len(rows),
         planned_limit=sql_result.planned_limit,
         limit_reached=sql_result.limit_reached,
         category_fields=_build_category_statistics(
-            sql_result.result_columns,
-            sql_result.rows,
+            result_columns,
+            rows,
         ),
         numeric_extremes=_build_numeric_extremes(
-            sql_result.result_columns,
-            sql_result.rows,
+            result_columns,
+            rows,
         ),
     )
 
@@ -470,6 +501,11 @@ def _build_audit_messages(
             ],
             "business_caliber": planning_result.query_plan.business_caliber,
         },
+        "result_shape_plan": (
+            planning_result.result_shape_plan.model_dump()
+            if planning_result.result_shape_plan is not None
+            else None
+        ),
         "executed_sql": sql_result.sql,
         "result_table": {
             "headers": [header.model_dump() for header in display_result.headers],
@@ -542,8 +578,12 @@ class QueryResultAuditSubgraph:
             "display_result": build_display_result(
                 state["planning_result"],
                 state["sql_result"],
+                state.get("shaping_result"),
             ),
-            "statistics": build_query_result_statistics(state["sql_result"]),
+            "statistics": build_query_result_statistics(
+                state["sql_result"],
+                state.get("shaping_result"),
+            ),
         }
 
     # 强制模型提交 strict 审计工具；协议或参数错误时反馈原因并允许一次修复重试。
@@ -639,6 +679,7 @@ class QueryResultAuditSubgraph:
         alignment_result: BusinessAlignmentResult,
         planning_result: QueryPlanningAgentResult,
         sql_result: SqlQuerySubgraphResult,
+        shaping_result: ResultShapingSubgraphResult | None = None,
     ) -> QueryResultAuditResult:
         if not original_question.strip():
             raise ValueError("用户原问题不能为空")
@@ -648,12 +689,15 @@ class QueryResultAuditSubgraph:
             raise ValueError("只有成功的查询规划结果可以进入末端审计")
         if sql_result.status != "success":
             raise ValueError("只有成功执行的 SQL 结果可以进入末端审计")
+        if shaping_result is not None and shaping_result.status != "success":
+            raise ValueError("只有成功的塑形结果可以进入末端审计")
         state = self._workflow.invoke(
             {
                 "original_question": original_question.strip(),
                 "alignment_result": alignment_result,
                 "planning_result": planning_result,
                 "sql_result": sql_result,
+                "shaping_result": shaping_result,
             }
         )
         if "error" in state:

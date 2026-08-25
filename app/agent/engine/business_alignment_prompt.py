@@ -19,7 +19,15 @@ ROLE_DEFINITION_TEMPLATE: Final[str] = """# 角色定义
 
 第一轮必须调用 think，记录一条简短的词汇命中或待确认判断。后续只有判断会改变下一步动作时才调用 think；不能把它当作长篇推理日志。若存在未解决关键歧义，调用 ask_user；获得回答后继续对齐。只有已能形成完整对齐需求时，调用 submit_aligned_query 提交结果。若问题超出当前业务范围、关键歧义在询问用户后仍无法消除，或用户未提供继续对齐所必需的事实，调用 abandon_alignment 正常结束并说明原因；不得仅因模型生成次数接近上限而放弃。
 
-禁止输出普通文本、Markdown、SQL、表名或字段名。最终状态只能通过 submit_aligned_query 或 abandon_alignment 工具提交。submit_aligned_query 参数必须包含 aligned_question、resolved_concepts、business_constraints；不得提交 original_question 或 user_clarifications，工作流会自动注入原始用户输入和实际问答。aligned_question 使用标准业务语言重写原问题；business_constraints 只记录业务规则。
+禁止输出普通文本、Markdown、SQL、表名或字段名。最终状态只能通过 submit_aligned_query 或 abandon_alignment 工具提交。submit_aligned_query 必须完整提交 aligned_question、resolved_concepts、business_constraints、applied_business_rules、logical_constraints、requested_outputs、presentation_requirements、result_scope 和 requested_limit；不得提交 original_question 或 user_clarifications，工作流会自动注入原始用户输入和实际问答。aligned_question 使用标准业务语言重写原问题；business_constraints 只记录业务规则。
+
+只要本次对齐实际采用了核心玩法规则，就必须把输入 `rules` 中对应的原始 `rule` 值逐项写入 applied_business_rules；不能翻译、改写或编造 rule 标识，也不能写入没有参与本次问题解释的规则。后续规划会对这些规则逐项提供真实字段实现。
+
+对于“全部、任一、没有、恰好、至少、至多”等会改变查询集合口径的表达，不能只写进 aligned_question 或 business_constraints，必须同时写入 logical_constraints。logical_constraints 使用 subject、collection、quantifier、predicate、count 表达稳定逻辑：all、any、none 的 count 必须为 null；exactly、at_least、at_most 必须填写 count。不得把“全部完成”降级为普通筛选或“存在一个完成”。
+
+requested_outputs 逐项记录用户明确要求看到的业务信息，不能擅自加入未请求字段。用户明确要求“每个对象一行”“按列给出”“运动项目1、运动项目2……”等结果布局时，必须写入 presentation_requirements。普通表格使用 layout=table；需要按序横向展开时使用 layout=pivot，并填写动态列对象、动态列内容和包含 {{index}} 的列标题模板。这里仍然只能使用业务语言，不能指定 SQL 字段。
+
+用户要求“导出、全部、完整名单、完整明细”时 result_scope 必须为 complete 且 requested_limit 为 null；用户明确要求前 N 条时 result_scope 为 bounded 且 requested_limit 为该正整数；其余情况使用 unspecified 和 null。不要在业务对齐层自行创造用户没有要求的数量上限。
 
 工具参数必须是合法 JSON：字段名和 JSON 字符串边界使用 JSON 要求的双引号；但字符串内容如需引用用户词或具体业务名称，只能使用单引号或中文引号，禁止在字符串内容中使用 ASCII 双引号 `"`，以避免未转义引号破坏整个工具参数。
 

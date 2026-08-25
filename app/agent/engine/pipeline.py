@@ -18,6 +18,10 @@ from app.agent.engine.result_audit import (
     QueryResultAuditResult,
     QueryResultAuditSubgraph,
 )
+from app.agent.engine.result_shaping import (
+    ResultShapingSubgraph,
+    ResultShapingSubgraphResult,
+)
 from app.agent.engine.result_translation import (
     ResultTranslationSubgraph,
     ResultTranslationSubgraphResult,
@@ -51,6 +55,7 @@ class AgentQueryPipelineResult(BaseModel):
     planning_result: QueryPlanningAgentResult | None = None
     sql_result: SqlQuerySubgraphResult | None = None
     translation_result: ResultTranslationSubgraphResult | None = None
+    shaping_result: ResultShapingSubgraphResult | None = None
     audit_result: QueryResultAuditResult | None = None
     user_message: str | None = None
     error: str | None = None
@@ -64,7 +69,7 @@ def _build_result_message(audit_result: QueryResultAuditResult) -> str:
 
 
 class AgentQueryPipeline:
-    """以业务域配置装配共享工具和五个子图，并通过统一事件出口报告关键阶段。"""
+    """以业务域配置装配共享工具和六个子图，并通过统一事件出口报告关键阶段。"""
 
     # 保存不可变业务域、运行预算和交互出口，实际模型与数据库适配器在单次运行中装配。
     def __init__(
@@ -127,7 +132,7 @@ class AgentQueryPipeline:
             "y",
         }
 
-    # 顺序运行五阶段查询；业务放弃正常结束，翻译失败降级原值，其余技术错误由会话层处理。
+    # 顺序运行对齐、规划、SQL、翻译、塑形和审计；翻译失败降级原值，塑形失败明确终止。
     def run(self, user_question: str) -> AgentQueryPipelineResult:
         normalized_question = user_question.strip()
         if not normalized_question:
@@ -307,6 +312,48 @@ class AgentQueryPipeline:
                 "业务状态转换暂不可用",
                 "查询结果将保留数据库原始值并继续生成表格。",
             )
+        assert planning_result.result_shape_plan is not None
+        self._emit(
+            "shaping",
+            "stage_started",
+            "running",
+            "正在整理表格结构",
+            "正在按已确认的结果布局整理行列。",
+        )
+        shaping_result = ResultShapingSubgraph().run(
+            planning_result.query_plan,
+            planning_result.result_shape_plan,
+            translated_sql_result.rows,
+        )
+        if shaping_result.status == "failure":
+            self._emit(
+                "shaping",
+                "stage_completed",
+                "failure",
+                "表格结构整理失败",
+                "查询数据已读取，但无法按确认的布局生成最终表格。",
+            )
+            return AgentQueryPipelineResult(
+                status="failure",
+                domain_key=self._domain_profile.key,
+                user_question=normalized_question,
+                alignment_result=alignment_result,
+                planning_result=planning_result,
+                sql_result=sql_result,
+                translation_result=translation_result,
+                shaping_result=shaping_result,
+                error=shaping_result.error or "结果塑形失败。",
+            )
+        self._emit(
+            "shaping",
+            "stage_completed",
+            "success",
+            "表格结构整理完成",
+            (
+                f"已将 {shaping_result.source_row_count} 条查询数据整理为 "
+                f"{shaping_result.result_row_count} 行结果。"
+            ),
+        )
         self._emit(
             "result",
             "stage_started",
@@ -323,6 +370,7 @@ class AgentQueryPipeline:
             alignment_result,
             planning_result,
             translated_sql_result,
+            shaping_result,
         )
         result_message = _build_result_message(audit_result)
         self._emit(
@@ -340,6 +388,7 @@ class AgentQueryPipeline:
             planning_result=planning_result,
             sql_result=sql_result,
             translation_result=translation_result,
+            shaping_result=shaping_result,
             audit_result=audit_result,
             user_message=result_message,
         )

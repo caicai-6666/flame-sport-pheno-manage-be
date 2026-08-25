@@ -135,7 +135,7 @@ data: {"stage":"confirmation","event_type":"interaction_required","status":"wait
 | --- | --- |
 | `query_id` | 查询任务标识 |
 | `sequence` | 查询内单调递增事件序号 |
-| `stage` | 当前阶段，例如 `alignment`、`planning`、`execution`、`translation` 或 `result` |
+| `stage` | 当前阶段，例如 `alignment`、`planning`、`execution`、`translation`、`shaping` 或 `result` |
 | `event_type` | 阶段开始、进度、交互、阶段完成或查询终态事件 |
 | `status` | `running`、`waiting`、`success`、`abandoned`、`cancelled` 或 `failure` |
 | `title`、`message` | 面向操作员的友好进度说明 |

@@ -15,6 +15,7 @@ AgentQueryStage = Literal[
     "sql_generation",
     "execution",
     "translation",
+    "shaping",
     "result",
 ]
 AgentEventType = Literal[

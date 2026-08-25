@@ -24,7 +24,10 @@ from app.agent.runtime.model_options import (
     build_non_thinking_completion_options,
     build_strict_tools_base_url,
 )
-from app.agent.runtime.yaml_context import render_yaml_context
+from app.agent.runtime.yaml_context import (
+    parse_tagged_context_records,
+    render_yaml_context,
+)
 from app.agent.tools.strict_schema import build_strict_tool_definition
 from app.agent.tools.thinking import (
     THINKING_TOOL_NAME,
@@ -61,6 +64,76 @@ class ResolvedBusinessConcept(BaseModel):
     alignment_reason: str = Field(description="依据词汇表得到该对齐的简短原因")
 
 
+class AlignedLogicalConstraint(BaseModel):
+    """不包含数据库实现的集合量化或数量业务约束。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    subject: str = Field(description="约束作用的业务主体")
+    collection: str = Field(description="需要判断的主体关联对象集合")
+    quantifier: Literal[
+        "all", "any", "none", "exactly", "at_least", "at_most"
+    ] = Field(description="全部、任一、没有、恰好、至少或至多")
+    predicate: str = Field(description="集合成员需要满足的标准业务条件")
+    count: int | None = Field(
+        default=None,
+        ge=0,
+        description="数量型量词对应的数量；all、any、none 时传 null",
+    )
+
+    # 保证数量约束和集合约束使用匹配的 count，避免规划层猜测量词含义。
+    @model_validator(mode="after")
+    def validate_quantifier_count(self) -> "AlignedLogicalConstraint":
+        count_quantifiers = {"exactly", "at_least", "at_most"}
+        if self.quantifier in count_quantifiers and self.count is None:
+            raise ValueError(f"量词 {self.quantifier} 必须提供 count")
+        if self.quantifier not in count_quantifiers and self.count is not None:
+            raise ValueError(f"量词 {self.quantifier} 的 count 必须为 null")
+        return self
+
+
+class AlignedPresentationRequirement(BaseModel):
+    """用户要求的最终行粒度和表格布局，不涉及数据库字段。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    layout: Literal["table", "pivot"] = Field(
+        description="普通表格使用 table；同类对象按序横向展开使用 pivot"
+    )
+    result_row_granularity: str = Field(description="最终结果每一行代表的业务主体")
+    dynamic_column_subject: str | None = Field(
+        default=None,
+        description="pivot 时按列展开的业务对象；table 时传 null",
+    )
+    dynamic_value_subject: str | None = Field(
+        default=None,
+        description="pivot 动态列中展示的业务内容；table 时传 null",
+    )
+    column_label_pattern: str | None = Field(
+        default=None,
+        description="pivot 动态列标题模板，包含 {index}；table 时传 null",
+    )
+
+    # 只在用户要求横向展开时保留动态列定义，普通表格不携带无效塑形参数。
+    @model_validator(mode="after")
+    def validate_layout_configuration(self) -> "AlignedPresentationRequirement":
+        dynamic_values = (
+            self.dynamic_column_subject,
+            self.dynamic_value_subject,
+            self.column_label_pattern,
+        )
+        if self.layout == "table":
+            if any(value is not None for value in dynamic_values):
+                raise ValueError("layout 为 table 时全部动态列字段必须为 null")
+            return self
+        if any(value is None for value in dynamic_values):
+            raise ValueError("layout 为 pivot 时全部动态列字段都必须提供")
+        assert self.column_label_pattern is not None
+        if "{index}" not in self.column_label_pattern:
+            raise ValueError("column_label_pattern 必须包含 {index} 占位符")
+        return self
+
+
 class AlignedQueryRequest(BaseModel):
     """业务对齐子图输出给查询规划阶段的无数据库实现查询需求。"""
 
@@ -74,9 +147,45 @@ class AlignedQueryRequest(BaseModel):
     business_constraints: list[str] = Field(
         description="为后续规划保留的稳定业务规则，不包含数据库实现"
     )
+    applied_business_rules: list[str] = Field(
+        default_factory=list,
+        description="本次对齐实际采用的 core rules.rule 稳定标识",
+    )
+    logical_constraints: list[AlignedLogicalConstraint] = Field(
+        default_factory=list,
+        description="从用户问题和业务规则提取的集合量化或数量约束",
+    )
+    requested_outputs: list[str] = Field(
+        default_factory=list,
+        description="用户明确要求返回的业务信息",
+    )
+    presentation_requirements: list[AlignedPresentationRequirement] = Field(
+        default_factory=list,
+        description="用户明确要求的最终行粒度和表格布局",
+    )
+    result_scope: Literal["complete", "bounded", "unspecified"] = Field(
+        default="unspecified",
+        description="完整导出、明确数量范围或未指定结果范围",
+    )
+    requested_limit: int | None = Field(
+        default=None,
+        ge=1,
+        description="用户明确要求的结果数量；未明确指定时传 null",
+    )
     user_clarifications: list[UserInteraction] = Field(
         description="本轮对齐中实际向用户确认并得到的事实；无提问时为空列表"
     )
+
+    # 保证传入规划层的结果范围已经闭合，不让规划模型猜测完整导出是否允许 LIMIT。
+    @model_validator(mode="after")
+    def validate_result_scope(self) -> "AlignedQueryRequest":
+        if self.result_scope == "bounded" and self.requested_limit is None:
+            raise ValueError("result_scope 为 bounded 时 requested_limit 不能为空")
+        if self.result_scope != "bounded" and self.requested_limit is not None:
+            raise ValueError(
+                "result_scope 为 complete 或 unspecified 时 requested_limit 必须为 null"
+            )
+        return self
 
     # 将已校验的业务语义渲染为规划阶段的唯一上游输入，保留必要约束但不泄漏模型轨迹或数据库实现。
     def render_for_query_planning(self) -> str:
@@ -92,6 +201,18 @@ class AlignedQueryRequest(BaseModel):
                         for concept in self.resolved_concepts
                     ],
                     "business_constraints": self.business_constraints,
+                    "applied_business_rules": self.applied_business_rules,
+                    "logical_constraints": [
+                        constraint.model_dump()
+                        for constraint in self.logical_constraints
+                    ],
+                    "requested_outputs": self.requested_outputs,
+                    "presentation_requirements": [
+                        requirement.model_dump()
+                        for requirement in self.presentation_requirements
+                    ],
+                    "result_scope": self.result_scope,
+                    "requested_limit": self.requested_limit,
                     "user_clarifications": [
                         {
                             "question": interaction.question,
@@ -116,6 +237,42 @@ class SubmittedAlignedQuery(BaseModel):
     business_constraints: list[str] = Field(
         description="为后续规划保留的稳定业务规则，不包含数据库实现"
     )
+    applied_business_rules: list[str] = Field(
+        default_factory=list,
+        description="实际采用的 core rules.rule 标识；无时传空列表",
+    )
+    logical_constraints: list[AlignedLogicalConstraint] = Field(
+        default_factory=list,
+        description="集合量化或数量业务约束；无时传空列表",
+    )
+    requested_outputs: list[str] = Field(
+        default_factory=list,
+        description="用户明确要求返回的业务信息；无时传空列表",
+    )
+    presentation_requirements: list[AlignedPresentationRequirement] = Field(
+        default_factory=list,
+        description="最终行粒度和布局要求；无明确要求时传空列表",
+    )
+    result_scope: Literal["complete", "bounded", "unspecified"] = Field(
+        default="unspecified",
+        description="完整导出传 complete，明确数量传 bounded，否则传 unspecified",
+    )
+    requested_limit: int | None = Field(
+        default=None,
+        ge=1,
+        description="用户明确要求的数量；未指定时传 null",
+    )
+
+    # 保证完整导出、明确数量和未指定范围使用互不矛盾的数量字段。
+    @model_validator(mode="after")
+    def validate_result_scope(self) -> "SubmittedAlignedQuery":
+        if self.result_scope == "bounded" and self.requested_limit is None:
+            raise ValueError("result_scope 为 bounded 时 requested_limit 不能为空")
+        if self.result_scope != "bounded" and self.requested_limit is not None:
+            raise ValueError(
+                "result_scope 为 complete 或 unspecified 时 requested_limit 必须为 null"
+            )
+        return self
 
 
 class SubmitAlignedQueryArguments(BaseModel):
@@ -424,6 +581,13 @@ class BusinessAlignmentSubgraph:
         self._database_identifier_pattern = _build_database_identifier_pattern(
             domain_profile
         )
+        self._allowed_business_rule_ids = frozenset(
+            str(record["rule"])
+            for record in parse_tagged_context_records(
+                domain_profile.core_rules_path.read_text(encoding="utf-8").strip()
+            )
+            if "rule" in record
+        )
         self._user_input_reader = user_input_reader
         self._trace_writer = trace_writer
         self._progress_reporter = AgentProgressReporter(
@@ -669,6 +833,35 @@ class BusinessAlignmentSubgraph:
                         [
                             aligned_request.aligned_question,
                             *aligned_request.business_constraints,
+                            *aligned_request.requested_outputs,
+                            *(
+                                constraint.subject
+                                for constraint in aligned_request.logical_constraints
+                            ),
+                            *(
+                                constraint.collection
+                                for constraint in aligned_request.logical_constraints
+                            ),
+                            *(
+                                constraint.predicate
+                                for constraint in aligned_request.logical_constraints
+                            ),
+                            *(
+                                requirement.result_row_granularity
+                                for requirement in aligned_request.presentation_requirements
+                            ),
+                            *(
+                                requirement.dynamic_column_subject or ""
+                                for requirement in aligned_request.presentation_requirements
+                            ),
+                            *(
+                                requirement.dynamic_value_subject or ""
+                                for requirement in aligned_request.presentation_requirements
+                            ),
+                            *(
+                                requirement.column_label_pattern or ""
+                                for requirement in aligned_request.presentation_requirements
+                            ),
                             *(
                                 concept.canonical_term
                                 for concept in aligned_request.resolved_concepts
@@ -680,6 +873,28 @@ class BusinessAlignmentSubgraph:
                         ],
                         "业务对齐输出",
                     )
+                    unknown_rule_ids = sorted(
+                        set(aligned_request.applied_business_rules)
+                        - self._allowed_business_rule_ids
+                    )
+                    if unknown_rule_ids:
+                        raise BusinessAlignmentPolicyError(
+                            (
+                                AlignmentPolicyIssue(
+                                    field_path=(
+                                        "aligned_request.applied_business_rules"
+                                    ),
+                                    message=(
+                                        "存在核心规则文件中未定义的 rule 标识："
+                                        + "、".join(unknown_rule_ids)
+                                    ),
+                                    repair_action=(
+                                        "删除上述未定义标识；只保留输入 rules 中"
+                                        "实际用于本次对齐的 rule 值。"
+                                    ),
+                                ),
+                            )
+                        )
                     alignment_issues = self._domain_profile.validate_alignment(
                         state["user_question"],
                         aligned_request.aligned_question,

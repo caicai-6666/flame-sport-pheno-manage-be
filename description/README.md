@@ -145,7 +145,7 @@ description/
 | [客户端立即初审集成](infrastructure/client-preliminary-review.md) | 结算遗留凭证立即初审的内部 HTTP 契约、失败语义和安全边界 |
 | [Python 运行依赖](infrastructure/python-dependencies.md) | Python 环境基线、依赖用途、安装、验证和安全要求 |
 | [管理端 Docker Compose 部署](infrastructure/docker-compose-deployment.md) | 管理端后端镜像、Compose 服务拓扑、根环境变量、启动顺序和生产入口 |
-| [查询智能体运行时与业务域扩展](infrastructure/query-agent-runtime.md) | 通用工作流、业务域配置、模型与只读 SQL 安全、SSE 和扩展方法 |
+| [查询智能体运行时与业务域扩展](infrastructure/query-agent-runtime.md) | 通用工作流、表概述契约、业务域配置、模型与只读 SQL 安全、SSE 和扩展方法 |
 
 ### 5.3 应用服务文档
 
@@ -153,7 +153,7 @@ description/
 | --- | --- |
 | [应用服务层设计](application/service-layer.md) | 路由、服务、仓储与客户端的职责边界，事务和异常编排规则 |
 | [赛季结算应用编排](application/season-settlement.md) | 状态初始化、遗留初审、资格、定分、发放及手动或自动收口的事务边界 |
-| [查询智能体应用编排](application/query-agent.md) | 五阶段查询流水线、会话、用户交互、SSE 进度、友好轨迹、表格结果、并发和失败处理 |
+| [查询智能体应用编排](application/query-agent.md) | 六子图查询流水线、双计划、用户交互、SSE 进度、确定性塑形、表格结果、并发和失败处理 |
 | [查询结果表项意图路由设计](application/query-result-intent-routing.md) | 以对齐问题和单条表项无状态选择详情工具、补查参数及处理歧义的设计草案 |
 | [积分与奖品查询业务域](application/rewards-query.md) | 积分余额、积分流水、赛季结算积分、商品目录和奖品履约查询口径 |
 

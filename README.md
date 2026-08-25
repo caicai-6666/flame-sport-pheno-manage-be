@@ -34,7 +34,7 @@
 | 图片资源 | 安全中转头像、项目图标、商品图、凭证图和活动海报，并支持替换固定海报 | [图片安全中转 API](description/api/image.md) |
 | 用户与意见 | 批量查询用户展示信息，查询并处理用户意见 | [用户信息 API](description/api/user.md)、[用户意见 API](description/api/suggestion.md) |
 | 业务通知 | 将终审、结算和礼品结果写入通知表，交由客户端后端投递钉钉工作通知 | [业务结果通知写入](description/application/result-notifications.md) |
-| 查询智能体 | 通过业务对齐、用户确认、查询规划、安全 SQL、状态翻译和结果审计回答运动及积分奖品业务数据问题，并使用 SSE 推送进度；创建查询时通过 `domain_key` 选择 `sports` 或 `rewards` | [可交互数据查询智能体](description/features/query-agent.md)、[积分与奖品查询业务域](description/application/rewards-query.md) |
+| 查询智能体 | 通过业务对齐、用户确认、SQL 数据获取与结果塑形双计划、安全 SQL、状态翻译、确定性行列塑形和结果审计回答运动及积分奖品业务数据问题，并使用 SSE 推送进度；创建查询时通过 `domain_key` 选择 `sports` 或 `rewards` | [可交互数据查询智能体](description/features/query-agent.md)、[积分与奖品查询业务域](description/application/rewards-query.md) |
 | 后台任务 | 按上海业务日期推进赛季状态、持续结算，并可按配置自动一键收口 | [赛季状态与结算定时任务](description/job/season-status-transition.md) |
 
 赛季主状态按以下方向流转：
@@ -318,7 +318,7 @@ docker build -t flame-sport-pheno-manage-be .
 | [应用服务层设计](description/application/service-layer.md) | 分层、依赖方向、事务和异常规则 |
 | [应用结构与基础连接](description/infrastructure/application-structure.md) | 目录、配置、数据库、客户端后端、启动和验证 |
 | [可交互数据查询智能体](description/features/query-agent.md) | 自然语言只读查询、用户交互、进度和安全边界 |
-| [查询智能体运行时](description/infrastructure/query-agent-runtime.md) | 通用引擎、业务域扩展、模型、SQL 和 SSE 运行约束 |
+| [查询智能体运行时](description/infrastructure/query-agent-runtime.md) | 通用引擎、表概述契约、业务域扩展、模型、SQL 和 SSE 运行约束 |
 | [赛季结算规则](description/domain/season-settlement.md) | 补传资格、定分、连续奖励和一键收口口径 |
 | [赛季结算应用编排](description/application/season-settlement.md) | 结算阶段、事务、幂等和外部失败恢复 |
 
