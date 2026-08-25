@@ -36,7 +36,7 @@ class AgentQueryNotFoundError(LookupError):
     """指定查询会话不存在或已经过期清理。"""
 
 
-# 裁剪会话长期保留结果中的模型原文、SQL、结构和候选轨迹，只保存结果接口实际需要的数据。
+# 裁剪会话中的模型原文、SQL、结构和数据行；失败时仅保留安全错误码与尝试次数供结果接口诊断。
 def _build_session_safe_result(
     result: AgentQueryPipelineResult,
 ) -> AgentQueryPipelineResult:
@@ -56,11 +56,26 @@ def _build_session_safe_result(
         if result.audit_result is not None
         else None
     )
+    safe_sql_result = (
+        result.sql_result.model_copy(
+            update={
+                "schema_results": [],
+                "draft": None,
+                "sql": None,
+                "analysis_sql": None,
+                "result_columns": [],
+                "rows": [],
+                "raw_model_response": None,
+            }
+        )
+        if result.status == "failure" and result.sql_result is not None
+        else None
+    )
     return result.model_copy(
         update={
             "alignment_result": safe_alignment_result,
             "planning_result": None,
-            "sql_result": None,
+            "sql_result": safe_sql_result,
             "translation_result": None,
             "shaping_result": None,
             "audit_result": safe_audit_result,

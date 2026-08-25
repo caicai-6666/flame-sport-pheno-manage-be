@@ -75,6 +75,11 @@ class AgentQueryResultResponse(BaseModel):
     headers: list[AgentQueryResultHeaderResponse] = Field(default_factory=list)
     rows: list[dict[str, Any]] = Field(default_factory=list)
     statistics: dict[str, Any] | None = None
+    failure_stage: str | None = None
+    failure_code: str | None = None
+    failure_retry_target: str | None = None
+    failure_attempt_count: int | None = None
+    failure_attempt_limit: int | None = None
 
 
 class AgentQueryTraceEntryResponse(BaseModel):

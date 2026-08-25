@@ -381,6 +381,42 @@ def build_sql_execution_error_message(
     }
 
 
+# 将没有形成合法工具调用的模型响应转换为下一轮普通上下文反馈，避免一次偶发协议失败直接终止查询。
+def build_sql_protocol_retry_message(
+    error_code: str,
+    message: str,
+    repair_action: str,
+    tool_call_id: str | None = None,
+) -> dict[str, str]:
+    content = json.dumps(
+        {
+            "status": "failure",
+            "error": {
+                "code": error_code,
+                "tool_name": SUBMIT_SQL_QUERY_TOOL_NAME,
+                "message": message,
+                "repair_action": repair_action,
+            },
+            "retryable": True,
+            "retry_target": "sql_generation",
+            "next_action": (
+                "按 repair_action 重新生成，并且只调用一次 submit_sql_query。"
+            ),
+        },
+        ensure_ascii=False,
+    )
+    if tool_call_id is not None:
+        return {
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": content,
+        }
+    return {
+        "role": "user",
+        "content": content,
+    }
+
+
 # 为 SQL 生成模型构造稳定系统提示词，约束其只将已确认的查询计划翻译为 SQL。
 def _build_sql_generation_system_prompt() -> str:
     """构造不擅自压缩完整查询结果的稳定 SQL 生成约束。"""
@@ -2080,15 +2116,117 @@ class SqlQuerySubgraph:
                 **build_non_thinking_completion_options(self._max_tokens),
             )
             raw_model_responses.append(_serialize_raw_response(response))
-            message = response.choices[0].message
+            choice = response.choices[0]
+            message = choice.message
+            finish_reason = getattr(choice, "finish_reason", None)
             tool_calls = getattr(message, "tool_calls", None) or []
             if len(tool_calls) != 1:
-                raise ValueError("SQL 生成模型必须且只能调用一次 submit_sql_query")
+                can_retry = generation_count < max_generation_count
+                output_truncated = finish_reason == "length"
+                error_code = (
+                    "sql_generation_output_truncated"
+                    if output_truncated
+                    else "sql_generation_protocol_failed"
+                )
+                error_message = (
+                    "SQL 生成输出达到长度上限，未形成完整工具调用"
+                    if output_truncated
+                    else "SQL 生成模型没有且仅调用一次 submit_sql_query"
+                )
+                repair_action = (
+                    "使用更短的表别名和等价紧凑写法，在当前输出预算内提交完整 SQL 工具参数。"
+                    if output_truncated
+                    else "不要输出普通文本，只调用一次 submit_sql_query 并提交全部必填参数。"
+                )
+                if can_retry:
+                    messages.append(
+                        build_sql_protocol_retry_message(
+                            error_code,
+                            error_message,
+                            repair_action,
+                        )
+                    )
+                self._write_trace(
+                    "\n================ SQL 子图：工具协议失败 ================\n"
+                    f"第 {generation_count}/{max_generation_count} 次生成\n"
+                    f"完成原因：{finish_reason or '未知'}\n"
+                    f"{error_message}\n"
+                    f"{'将反馈给模型修复。' if can_retry else '已用尽生成次数。'}"
+                )
+                return {
+                    "schema_results": schema_results,
+                    "messages": messages,
+                    "raw_model_responses": raw_model_responses,
+                    "generation_count": generation_count,
+                    "error": error_message,
+                    "error_code": error_code,
+                    "retry_target": "sql_generation",
+                    "next_action": "generate_sql" if can_retry else "end",
+                }
             tool_call = tool_calls[0]
             if tool_call.function.name != SUBMIT_SQL_QUERY_TOOL_NAME:
-                raise ValueError(
-                    f"SQL 生成模型调用了未注册工具：{tool_call.function.name}"
+                can_retry = generation_count < max_generation_count
+                error_message = (
+                    "SQL 生成模型调用了未注册工具："
+                    f"{tool_call.function.name}"
                 )
+                if can_retry:
+                    messages.append(
+                        build_sql_protocol_retry_message(
+                            "sql_generation_protocol_failed",
+                            error_message,
+                            "只调用 submit_sql_query，不得调用其他工具。",
+                        )
+                    )
+                self._write_trace(
+                    "\n================ SQL 子图：工具协议失败 ================\n"
+                    f"第 {generation_count}/{max_generation_count} 次生成\n"
+                    f"{error_message}\n"
+                    f"{'将反馈给模型修复。' if can_retry else '已用尽生成次数。'}"
+                )
+                return {
+                    "schema_results": schema_results,
+                    "messages": messages,
+                    "raw_model_responses": raw_model_responses,
+                    "generation_count": generation_count,
+                    "error": error_message,
+                    "error_code": "sql_generation_protocol_failed",
+                    "retry_target": "sql_generation",
+                    "next_action": "generate_sql" if can_retry else "end",
+                }
+            if finish_reason == "length":
+                can_retry = generation_count < max_generation_count
+                error_message = "SQL 生成输出达到长度上限，工具参数不完整"
+                messages.append(message)
+                if can_retry:
+                    messages.append(
+                        build_sql_protocol_retry_message(
+                            "sql_generation_output_truncated",
+                            error_message,
+                            (
+                                "使用更短的表别名和等价紧凑写法，在当前输出预算内"
+                                "重新提交完整 SQL、parameters 和 result_columns。"
+                            ),
+                            tool_call.id,
+                        )
+                    )
+                self._write_trace(
+                    "\n================ SQL 子图：工具参数截断 ================\n"
+                    f"第 {generation_count}/{max_generation_count} 次生成\n"
+                    f"{error_message}\n"
+                    f"{'将反馈给模型修复。' if can_retry else '已用尽生成次数。'}"
+                )
+                return {
+                    "schema_results": schema_results,
+                    "messages": messages,
+                    "raw_model_responses": raw_model_responses,
+                    "generation_count": generation_count,
+                    "current_tool_call_id": tool_call.id,
+                    "error": error_message,
+                    "error_code": "sql_generation_output_truncated",
+                    "retry_target": "sql_generation",
+                    "next_action": "generate_sql" if can_retry else "end",
+                }
             messages.append(message)
             try:
                 draft = SqlQueryDraft.model_validate_json(

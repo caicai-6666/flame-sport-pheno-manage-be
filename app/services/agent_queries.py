@@ -95,7 +95,7 @@ async def cancel_agent_query(
     return build_agent_query_session_response(session)
 
 
-# 将内部完整流水线结果转换为前端表格和审计摘要，明确排除 SQL 与模型原始轨迹。
+# 将内部结果转换为表格、摘要或安全失败元数据，明确排除 SQL、数据结构与模型原始轨迹。
 async def get_agent_query_result(
     manager: AgentQueryManager,
     query_id: str,
@@ -110,6 +110,12 @@ async def get_agent_query_result(
     )
     if result is None:
         return response
+    if result.status == "failure" and result.sql_result is not None:
+        response.failure_stage = "sql"
+        response.failure_code = result.sql_result.error_code
+        response.failure_retry_target = result.sql_result.retry_target
+        response.failure_attempt_count = result.sql_result.generation_count
+        response.failure_attempt_limit = result.sql_result.max_generation_count
     audit_result = result.audit_result
     if audit_result is None:
         return response

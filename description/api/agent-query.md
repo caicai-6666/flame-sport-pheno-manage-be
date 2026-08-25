@@ -287,6 +287,26 @@ Authorization: Bearer <admin-token>
 
 `rows` 是程序依据数据库字段注释映射后的完整 SQL 结果，不是模型重写的样本。只有可追溯到直接原始列的状态、类型或布尔编码会被转换；注释未定义的值以及翻译层失败时的全部值保持数据库原样。审计失败时仍可返回表头、结果行和统计，但相关性说明字段可能为空。
 
+SQL 阶段失败时，接口仍返回 `200` 和失败终态，并提供不含 SQL 或原始异常的安全诊断字段：
+
+```json
+{
+  "query_id": "b5316a1a8e504dd1bb7a9dc5e4df74f0",
+  "status": "failed",
+  "user_message": "查询生成或执行失败，请稍后重试。",
+  "failure_stage": "sql",
+  "failure_code": "sql_generation_output_truncated",
+  "failure_retry_target": "sql_generation",
+  "failure_attempt_count": 4,
+  "failure_attempt_limit": 4,
+  "headers": [],
+  "rows": [],
+  "issues": []
+}
+```
+
+`failure_code` 是供故障定位使用的稳定分类；它不会包含 SQL、字段值、数据库地址或供应商原始响应。非 SQL 失败以及仍在运行的查询可以返回 `null`。前端可以继续展示 `user_message`，并在运维诊断视图中附带这些字段。
+
 ---
 
 ## 9. 取消查询
