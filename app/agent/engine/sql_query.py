@@ -398,6 +398,7 @@ def _build_sql_generation_system_prompt() -> str:
 9. 对 all 和 none 量词，成员 predicate 不能先作为外层普通 WHERE 删除反例。必须按 quantified_conditions 的实现方式完成主体资格判断；EXISTS、NOT EXISTS 或相关子查询必须在同一个子查询内完整实现 correlation_condition、全部 collection_filters 和正确方向的成员 predicate/反条件。若最终还要返回集合成员行，应先确定合格主体，再在外层关联并返回成员。
 10. query_blocks 是不可跨越的条件作用域。每个非根查询块必须实现为与 block_id 同名的一个 CTE，且只能读取自身 source_tables 和 input_blocks；根查询块是最外层 SELECT。不得遗漏、增加或重命名计划查询块，也不得把某块的 JOIN、WHERE、GROUP BY、HAVING 或量词条件移动到其他块。
 11. 每个查询块的 SELECT 必须按该块 select_fields 顺序显式使用 AS result_field。后续块只能通过 `input_block.result_field` 引用前置块输出。最终 result_columns 只填写根查询块的 result_field。
+12. aliases 对查询块内的外层 SELECT 和嵌套子查询共同生效。必须精确使用计划已声明的角色别名，不得为 EXISTS/NOT EXISTS 成员表临时发明 `alias2`、`member_alias` 等新别名，也不得改回真实表名；量词成员表只在相关子查询使用时，不要把它额外加入外层 FROM 或 JOIN。
 
 输入是合法 YAML，字段含义固定如下：
 - `query_plan` 是 SQL 层唯一权威的数据获取计划；`query_goal` 是查询目标，`root_block_id` 标识最外层结果块，`query_blocks` 按依赖拓扑顺序排列。

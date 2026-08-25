@@ -112,7 +112,7 @@ class Settings(BaseSettings):
     # 分阶段限制正式查询智能体的模型轮次和工具调用，避免单次请求无限消耗资源。
     agent_query_alignment_max_generations: int = Field(default=10, ge=1, le=30)
     agent_query_planning_max_generations: int = Field(default=30, ge=1, le=60)
-    agent_query_planning_max_tool_calls: int = Field(default=30, ge=1, le=100)
+    agent_query_planning_max_tool_calls: int = Field(default=60, ge=1, le=100)
     agent_query_sql_max_generations: int = Field(default=4, ge=1, le=10)
     agent_query_translation_max_parallel_fields: int = Field(
         default=4,

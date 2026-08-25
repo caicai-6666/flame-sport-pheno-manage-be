@@ -74,7 +74,6 @@ from app.agent.tools.argument_feedback import (
 
 DEFAULT_MAX_GENERATION_COUNT = 6
 DEFAULT_MAX_TOOL_CALL_COUNT = 12
-MAX_TERMINAL_ARGUMENT_REPAIR_COUNT = 5
 PLAN_REVIEW_APPROVAL_ANSWERS = frozenset(
     {"确认并继续", "确认", "继续", "是", "没问题", "yes", "y"}
 )
@@ -260,6 +259,50 @@ def _validate_query_plan_contract(
                 repair_action=(
                     "将 result_shape_plan.shape_type 改为 pivot，并完整填写分组字段、"
                     "透传字段、动态列取值、组内排序和列标题模板。"
+                ),
+            )
+        )
+    if required_layouts == {"table"} and result_shape_plan.shape_type != "passthrough":
+        issues.append(
+            QueryPlanPolicyIssue(
+                field_path="result_shape_plan.shape_type",
+                message="用户确认的是逐行普通表格，塑形计划却擅自改成了动态转列。",
+                repair_action=(
+                    "将 result_shape_plan.shape_type 改为 passthrough；"
+                    "清空 group_fields 和 hidden_fields，把 pivot_value_field、"
+                    "pivot_order_field、column_key_prefix、column_label_pattern、"
+                    "expected_pivot_columns 全部改为 null。"
+                ),
+            )
+        )
+    selected_result_fields = [
+        select_field.result_field for select_field in query_plan.select_fields
+    ]
+    consumed_result_fields = set(result_shape_plan.passthrough_fields)
+    consumed_result_fields.update(result_shape_plan.group_fields)
+    consumed_result_fields.update(result_shape_plan.hidden_fields)
+    if result_shape_plan.pivot_value_field is not None:
+        consumed_result_fields.add(result_shape_plan.pivot_value_field)
+    if result_shape_plan.pivot_order_field is not None:
+        consumed_result_fields.add(result_shape_plan.pivot_order_field)
+    omitted_result_fields = [
+        field_name
+        for field_name in selected_result_fields
+        if field_name not in consumed_result_fields
+    ]
+    if omitted_result_fields:
+        issues.append(
+            QueryPlanPolicyIssue(
+                field_path="result_shape_plan.passthrough_fields",
+                message=(
+                    "塑形计划遗漏了根查询块已经返回的结果字段："
+                    + "、".join(omitted_result_fields)
+                ),
+                repair_action=(
+                    "按根查询块 select_fields 的原顺序，把以下字段加入 "
+                    "result_shape_plan.passthrough_fields："
+                    + "、".join(omitted_result_fields)
+                    + "。不得让塑形层静默丢弃 SQL 已返回的用户结果字段。"
                 ),
             )
         )
@@ -756,7 +799,6 @@ class DeepSeekQueryPlanningAgent:
         data_inspections: list[TableDataInspectionResponse] = []
         user_interactions: list[UserInteraction] = []
         raw_responses: list[str] = []
-        terminal_argument_repair_count = 0
         inspection_page_tool_call_ids_by_id: dict[str, dict[str, str]] = {}
         inspection_has_more_by_id: dict[str, bool] = {}
         cleared_inspection_tool_call_ids: set[str] = set()
@@ -1016,25 +1058,19 @@ class DeepSeekQueryPlanningAgent:
                             terminal_tool_call.function.arguments
                         )
                     except ValidationError as error:
-                        if terminal_argument_repair_count < MAX_TERMINAL_ARGUMENT_REPAIR_COUNT:
-                            terminal_argument_repair_count += 1
-                            error_message = build_tool_argument_error_message(
-                                terminal_tool_call.id,
-                                ABANDON_QUERY_PLANNING_TOOL_NAME,
-                                error,
-                            )
-                            messages.append(error_message)
-                            self._write_trace(
-                                "\n----- 查询规划终止工具参数校验结果 -----\n"
-                                f"tool_call_id: {terminal_tool_call.id}\n"
-                                f"tool_name: {ABANDON_QUERY_PLANNING_TOOL_NAME}\n"
-                                f"result: {error_message['content']}"
-                            )
-                            continue
-                        raise QueryPlanningExecutionError(
-                            "查询规划放弃工具参数不符合约束",
-                            raw_responses,
-                        ) from error
+                        error_message = build_tool_argument_error_message(
+                            terminal_tool_call.id,
+                            ABANDON_QUERY_PLANNING_TOOL_NAME,
+                            error,
+                        )
+                        messages.append(error_message)
+                        self._write_trace(
+                            "\n----- 查询规划终止工具参数校验结果 -----\n"
+                            f"tool_call_id: {terminal_tool_call.id}\n"
+                            f"tool_name: {ABANDON_QUERY_PLANNING_TOOL_NAME}\n"
+                            f"result: {error_message['content']}"
+                        )
+                        continue
                     return {
                         "result": QueryPlanningAgentResult(
                             status="abandoned",
@@ -1056,25 +1092,19 @@ class DeepSeekQueryPlanningAgent:
                         final_query_call.function.arguments
                     )
                 except ValidationError as error:
-                    if terminal_argument_repair_count < MAX_TERMINAL_ARGUMENT_REPAIR_COUNT:
-                        terminal_argument_repair_count += 1
-                        error_message = build_tool_argument_error_message(
-                            final_query_call.id,
-                            NATURAL_LANGUAGE_QUERY_TOOL_NAME,
-                            error,
-                        )
-                        messages.append(error_message)
-                        self._write_trace(
-                            "\n----- 查询规划终止工具参数校验结果 -----\n"
-                            f"tool_call_id: {final_query_call.id}\n"
-                            f"tool_name: {NATURAL_LANGUAGE_QUERY_TOOL_NAME}\n"
-                            f"result: {error_message['content']}"
-                        )
-                        continue
-                    raise QueryPlanningExecutionError(
-                        "查询规划最终工具参数不符合约束",
-                        raw_responses,
-                    ) from error
+                    error_message = build_tool_argument_error_message(
+                        final_query_call.id,
+                        NATURAL_LANGUAGE_QUERY_TOOL_NAME,
+                        error,
+                    )
+                    messages.append(error_message)
+                    self._write_trace(
+                        "\n----- 查询规划终止工具参数校验结果 -----\n"
+                        f"tool_call_id: {final_query_call.id}\n"
+                        f"tool_name: {NATURAL_LANGUAGE_QUERY_TOOL_NAME}\n"
+                        f"result: {error_message['content']}"
+                    )
+                    continue
                 policy_issues = (
                     _validate_query_plan_contract(
                         state["user_question"],
@@ -1087,25 +1117,19 @@ class DeepSeekQueryPlanningAgent:
                     )
                 )
                 if policy_issues:
-                    if terminal_argument_repair_count < MAX_TERMINAL_ARGUMENT_REPAIR_COUNT:
-                        terminal_argument_repair_count += 1
-                        error_message = build_tool_policy_error_message(
-                            final_query_call.id,
-                            NATURAL_LANGUAGE_QUERY_TOOL_NAME,
-                            policy_issues,
-                        )
-                        messages.append(error_message)
-                        self._write_trace(
-                            "\n----- 查询规划业务规则校验结果 -----\n"
-                            f"tool_call_id: {final_query_call.id}\n"
-                            f"tool_name: {NATURAL_LANGUAGE_QUERY_TOOL_NAME}\n"
-                            f"result: {error_message['content']}"
-                        )
-                        continue
-                    raise QueryPlanningExecutionError(
-                        "查询规划最终工具参数连续违反业务域规则",
-                        raw_responses,
+                    error_message = build_tool_policy_error_message(
+                        final_query_call.id,
+                        NATURAL_LANGUAGE_QUERY_TOOL_NAME,
+                        policy_issues,
                     )
+                    messages.append(error_message)
+                    self._write_trace(
+                        "\n----- 查询规划业务规则校验结果 -----\n"
+                        f"tool_call_id: {final_query_call.id}\n"
+                        f"tool_name: {NATURAL_LANGUAGE_QUERY_TOOL_NAME}\n"
+                        f"result: {error_message['content']}"
+                    )
+                    continue
                 review_question = _build_query_plan_review_question(
                     query_arguments.query_plan,
                     query_arguments.result_shape_plan,

@@ -126,6 +126,73 @@ def _normalize_sports_plan_expression(
     return re.sub(r"\s+", "", normalized)
 
 
+# 沿查询块显式输出字段反向追溯真实来源，使领域规则可以安全识别 CTE 暴露的赛季参与主键。
+def _resolve_sports_field_origin(
+    expression: str,
+    query_plan: NaturalLanguageQueryPlan,
+    visited_outputs: frozenset[tuple[str, str]] = frozenset(),
+) -> str | None:
+    normalized_expression = _normalize_sports_plan_expression(
+        expression,
+        query_plan,
+    )
+    matched_field = re.fullmatch(
+        r"([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)",
+        normalized_expression,
+    )
+    if matched_field is None:
+        return None
+    qualifier, field_name = matched_field.groups()
+    blocks_by_id = {
+        block.block_id.lower(): block for block in query_plan.query_blocks
+    }
+    source_block = blocks_by_id.get(qualifier)
+    if source_block is None:
+        return normalized_expression
+    output_key = (qualifier, field_name)
+    if output_key in visited_outputs:
+        return None
+    selected_field = next(
+        (
+            item
+            for item in source_block.select_fields
+            if item.result_field.lower() == field_name
+        ),
+        None,
+    )
+    if selected_field is None:
+        return None
+    return _resolve_sports_field_origin(
+        selected_field.field,
+        query_plan,
+        visited_outputs | {output_key},
+    )
+
+
+# 校验全部完成量词把项目成员关联到可追溯为 season_user.id 的当前主体，兼容真实表和前置 CTE 输出。
+def _is_valid_completion_correlation(
+    correlation_condition: str | None,
+    query_plan: NaturalLanguageQueryPlan,
+) -> bool:
+    if correlation_condition is None:
+        return False
+    equality_parts = re.split(
+        r"(?<![<>!])=(?!=)",
+        correlation_condition,
+        maxsplit=1,
+    )
+    if len(equality_parts) != 2:
+        return False
+    resolved_origins = [
+        _resolve_sports_field_origin(part, query_plan)
+        for part in equality_parts
+    ]
+    return set(resolved_origins) == {
+        "season_user_project.season_user_id",
+        "season_user.id",
+    }
+
+
 # 禁止暴露凭证内部图片路径；需要图片时强制返回可供安全中转接口使用的凭证主键。
 def validate_sports_query_plan(
     planning_input: str,
@@ -220,14 +287,6 @@ def validate_sports_query_plan(
             r"season_user_project\.completion_progress>=1(?:\.0+)?",
             normalized_predicate,
         ) is not None
-        normalized_correlation = (
-            _normalize_sports_plan_expression(
-                condition.correlation_condition,
-                query_plan,
-            )
-            if condition.correlation_condition is not None
-            else ""
-        )
         if (
             condition.quantifier == "all"
             and references_completion_progress
@@ -251,13 +310,12 @@ def validate_sports_query_plan(
             )
         if condition.quantifier != "all" or not references_completion_progress:
             continue
-        valid_correlations = {
-            "season_user_project.season_user_id=season_user.id",
-            "season_user.id=season_user_project.season_user_id",
-        }
         if (
             condition.implementation_hint in {"exists", "not_exists", "subquery"}
-            and normalized_correlation not in valid_correlations
+            and not _is_valid_completion_correlation(
+                condition.correlation_condition,
+                query_plan,
+            )
         ):
             issues.append(
                 QueryPlanPolicyIssue(
@@ -269,11 +327,76 @@ def validate_sports_query_plan(
                         "当前外层赛季参与记录。"
                     ),
                     repair_action=(
-                        "将 correlation_condition 精确改为 "
-                        "season_user_project.season_user_id = season_user.id。"
+                        "将 correlation_condition 的成员侧设为 "
+                        "season_user_project.season_user_id，主体侧使用当前查询块中"
+                        "可追溯到 season_user.id 的 subject_key。主体直接来自真实表时可写 "
+                        "season_user_project.season_user_id = season_user.id；"
+                        "主体来自前置查询块时应使用该块实际输出的 season_user_id，"
+                        "并保留对应 input_blocks 依赖。"
                     ),
                 )
             )
+        if condition.implementation_hint in {"exists", "not_exists", "subquery"}:
+            outer_member_join_indexes = [
+                join_index
+                for join_index, join in enumerate(block.joins)
+                if "season_user_project." in _normalize_sports_plan_expression(
+                    join.condition,
+                    query_plan,
+                )
+            ]
+            if outer_member_join_indexes:
+                issues.append(
+                    QueryPlanPolicyIssue(
+                        field_path=(
+                            f"query_plan.query_blocks[{block.block_id}].joins["
+                            + ",".join(
+                                str(index) for index in outer_member_join_indexes
+                            )
+                            + "]"
+                        ),
+                        message=(
+                            "全部项目完成已经由相关子查询量化判断，当前资格块又在外层"
+                            "关联 season_user_project，会把一名主体展开为多行并要求 SQL "
+                            "为同一张表发明第二个角色别名。"
+                        ),
+                        repair_action=(
+                            f"从查询块 {block.block_id} 的 joins 删除上述所有引用 "
+                            "season_user_project 的外层关联；保留 source_tables 中的 "
+                            "season_user_project，并只在 quantified_conditions 的相关子查询"
+                            "中通过 correlation_condition 关联项目集合。"
+                        ),
+                    )
+                )
+            outer_member_filter_indexes = [
+                filter_index
+                for filter_index, query_filter in enumerate(block.filters)
+                if "season_user_project." in _normalize_sports_plan_expression(
+                    query_filter.condition,
+                    query_plan,
+                )
+            ]
+            if outer_member_filter_indexes:
+                issues.append(
+                    QueryPlanPolicyIssue(
+                        field_path=(
+                            f"query_plan.query_blocks[{block.block_id}].filters["
+                            + ",".join(
+                                str(index) for index in outer_member_filter_indexes
+                            )
+                            + "]"
+                        ),
+                        message=(
+                            "全部项目完成的成员集合条件被重复写入资格块外层 filters，"
+                            "会先展开或裁剪成员行，破坏一名主体一行的资格粒度。"
+                        ),
+                        repair_action=(
+                            f"从查询块 {block.block_id} 的 filters 删除上述所有引用 "
+                            "season_user_project 的条件；有效锁定项目范围只保留在"
+                            "该量词的 collection_filters 中，完成条件只保留在 predicate 中。"
+                        ),
+                    )
+                )
         normalized_collection_filters = {
             _normalize_sports_plan_expression(item, query_plan)
             for item in condition.collection_filters

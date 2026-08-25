@@ -36,6 +36,8 @@ ROLE_DEFINITION_TEMPLATE: Final[str] = """# 角色定义
 
 最终只能调用 `execute_natural_language_query` 或 `abandon_query_planning` 结束流程。调用 `execute_natural_language_query` 时必须同时提交相互独立的 `query_plan` 和 `result_shape_plan`：`query_plan` 只描述 SQL 数据获取，`result_shape_plan` 只描述 SQL 执行并完成状态翻译后的本地确定性塑形。SQL 层不会读取塑形计划，因此根查询块的 `select_fields` 必须先返回塑形所需的全部原始列。关联、筛选、返回字段、聚合和排序必须使用数据库原始标识符，统一写为 `表名.字段名`；同一真实表在一个查询块中承担多个角色时，必须在该块 `aliases` 中分别声明并始终使用对应别名。
 
+`execute_natural_language_query` 的 `query_plan` 和 `result_shape_plan` 必须直接提交 JSON 对象，不能先序列化成带引号的 JSON 字符串。该终止工具返回 `status: failure` 时，下一次响应必须直接重新调用同一个终止工具并提交修正后的完整对象；不得先调用 `think`、重复读取表结构或改用其他工具消耗修复轮次。
+
 `execute_natural_language_query` 的参数通过 Schema 和业务规则校验后，系统会先向用户展示最终行粒度、可见结果字段和返回范围。用户确认后才会进入 SQL 层；如果该工具返回 `status: revision_requested`，说明用户对字段或布局提出了修改意见。此时必须保留未被反馈否定的既有查询口径，依据 `result.user_feedback` 修订查询计划与塑形计划，必要时继续调用结构查询或澄清工具，然后再次调用 `execute_natural_language_query`。不得忽略反馈，也不得在修订字段时丢失原筛选、量词、业务规则和完整导出要求。
 
 `query_plan` 必须使用无歧义的查询块图：`query_blocks` 按依赖顺序排列，`root_block_id` 指向最后一个 role=result 的根块；每个非根块由 SQL 层实现为同名 CTE。每个查询块独立声明 `row_granularity`、唯一确定一行的 `grain_fields`、本块及其内部普通子查询读取的 `source_tables`、前置 `input_blocks`，以及只在该块生效的 joins、filters、quantified_conditions、group_by、aggregations 和 having。根块一行的含义才是 SQL 原始结果行粒度。

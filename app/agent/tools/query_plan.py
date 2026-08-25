@@ -962,7 +962,7 @@ def build_abandon_query_planning_tool_definition(
     )
 
 
-# 将模型返回的函数参数 JSON 按 Pydantic 模型校验为后续 SQL 执行器可消费的查询计划。
+# 解开兼容接口偶发的嵌套 JSON 字符串后再做完整 Pydantic 校验，不放宽任何查询计划约束。
 def parse_natural_language_query_tool_arguments(
     arguments_json: str,
 ) -> NaturalLanguageQueryToolArguments:
@@ -970,6 +970,17 @@ def parse_natural_language_query_tool_arguments(
         arguments_payload = json.loads(arguments_json)
     except json.JSONDecodeError:
         return NaturalLanguageQueryToolArguments.model_validate_json(arguments_json)
+    if isinstance(arguments_payload, dict):
+        for field_name in ("query_plan", "result_shape_plan"):
+            encoded_value = arguments_payload.get(field_name)
+            if not isinstance(encoded_value, str):
+                continue
+            try:
+                decoded_value = json.loads(encoded_value)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(decoded_value, dict):
+                arguments_payload[field_name] = decoded_value
     if (
         isinstance(arguments_payload, dict)
         and "query_plan" in arguments_payload
