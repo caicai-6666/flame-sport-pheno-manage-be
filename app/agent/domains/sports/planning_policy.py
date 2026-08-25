@@ -116,14 +116,13 @@ def _normalize_sports_plan_expression(
     query_plan: NaturalLanguageQueryPlan,
 ) -> str:
     normalized = expression.replace("`", "").lower()
-    for alias in query_plan.aliases:
-        if alias.source_table is None:
-            continue
-        normalized = re.sub(
-            rf"\b{re.escape(alias.alias.lower())}\.",
-            f"{alias.source_table.lower()}.",
-            normalized,
-        )
+    for block in query_plan.query_blocks:
+        for alias in block.aliases:
+            normalized = re.sub(
+                rf"\b{re.escape(alias.alias.lower())}\.",
+                f"{alias.source_table.lower()}.",
+                normalized,
+            )
     return re.sub(r"\s+", "", normalized)
 
 
@@ -142,6 +141,9 @@ def validate_sports_query_plan(
         )
 
     issues: list[QueryPlanPolicyIssue] = []
+    root_select_field_path = (
+        f"query_plan.query_blocks[{query_plan.root_block_id}].select_fields"
+    )
     has_proof_record_id = any(
         _references_field(select_field.field, "proof_record", "id")
         for select_field in query_plan.select_fields
@@ -154,13 +156,13 @@ def validate_sports_query_plan(
     if has_proof_record_image_url:
         issues.append(
             QueryPlanPolicyIssue(
-                field_path="query_plan.select_fields",
+                field_path=root_select_field_path,
                 message=(
                     "proof_record.image_url 是凭证内部存储路径，"
                     "不得作为查询结果字段返回。"
                 ),
                 repair_action=(
-                    "从 query_plan.select_fields 删除引用 "
+                    f"从查询块 {query_plan.root_block_id} 的 select_fields 删除引用 "
                     "proof_record.image_url 的字段。"
                 ),
             )
@@ -169,13 +171,14 @@ def validate_sports_query_plan(
     if _requests_proof_record_image(planning_input) and not has_proof_record_id:
         issues.append(
             QueryPlanPolicyIssue(
-                field_path="query_plan.select_fields",
+                field_path=root_select_field_path,
                 message=(
                     "用户要求查看运动凭证图片，"
                     "但返回字段缺少 proof_record.id。"
                 ),
                 repair_action=(
-                    "在 query_plan.select_fields 中添加 field 为 proof_record.id "
+                    f"在查询块 {query_plan.root_block_id} 的 select_fields 中添加 "
+                    "field 为 proof_record.id "
                     "的返回字段，供前端调用凭证图片安全中转接口。"
                 ),
             )
@@ -188,7 +191,7 @@ def validate_sports_query_plan(
     ):
         issues.append(
             QueryPlanPolicyIssue(
-                field_path="query_plan.select_fields",
+                field_path=root_select_field_path,
                 message=(
                     "查询主体是逐条运动凭证明细，当前计划却只返回凭证 ID；"
                     "图片标识是附加信息，不能替代查询主体本身。"
@@ -201,9 +204,11 @@ def validate_sports_query_plan(
             )
         )
 
-    for condition_index, condition in enumerate(
-        query_plan.quantified_conditions
-    ):
+    for block, condition_index, condition in query_plan.iter_quantified_conditions():
+        condition_path = (
+            f"query_plan.query_blocks[{block.block_id}]."
+            f"quantified_conditions[{condition_index}]"
+        )
         normalized_predicate = _normalize_sports_plan_expression(
             condition.predicate,
             query_plan,
@@ -231,8 +236,7 @@ def validate_sports_query_plan(
             issues.append(
                 QueryPlanPolicyIssue(
                     field_path=(
-                        "query_plan.quantified_conditions"
-                        f"[{condition_index}].predicate"
+                        f"{condition_path}.predicate"
                     ),
                     message=(
                         "全部项目完成的成员谓词没有使用标准完成条件；predicate 表示"
@@ -251,12 +255,14 @@ def validate_sports_query_plan(
             "season_user_project.season_user_id=season_user.id",
             "season_user.id=season_user_project.season_user_id",
         }
-        if normalized_correlation not in valid_correlations:
+        if (
+            condition.implementation_hint in {"exists", "not_exists", "subquery"}
+            and normalized_correlation not in valid_correlations
+        ):
             issues.append(
                 QueryPlanPolicyIssue(
                     field_path=(
-                        "query_plan.quantified_conditions"
-                        f"[{condition_index}].correlation_condition"
+                        f"{condition_path}.correlation_condition"
                     ),
                     message=(
                         "全部项目完成的量词没有把内层项目集合直接关联到"
@@ -276,8 +282,7 @@ def validate_sports_query_plan(
             issues.append(
                 QueryPlanPolicyIssue(
                     field_path=(
-                        "query_plan.quantified_conditions"
-                        f"[{condition_index}].collection_filters"
+                        f"{condition_path}.collection_filters"
                     ),
                     message="全部项目完成的量词集合没有限定为有效锁定项目。",
                     repair_action=(
@@ -294,8 +299,7 @@ def validate_sports_query_plan(
             issues.append(
                 QueryPlanPolicyIssue(
                     field_path=(
-                        "query_plan.quantified_conditions"
-                        f"[{condition_index}].collection_filters"
+                        f"{condition_path}.collection_filters"
                     ),
                     message=(
                         "全部项目完成的成员集合混入了不属于有效锁定项目范围的条件："
@@ -304,7 +308,7 @@ def validate_sports_query_plan(
                     repair_action=(
                         "从 collection_filters 删除上述额外条件，只保留 "
                         "season_user_project.status = 1；"
-                        "赛季范围和外层关联继续由 query_plan.filters、joins 与 "
+                        "赛季范围和外层关联继续由对应 query_block 的 filters、joins 与 "
                         "correlation_condition 承载。"
                     ),
                 )

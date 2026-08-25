@@ -48,7 +48,7 @@ flowchart LR
 | 会话与编排层 | 管理查询生命周期、用户交互、阶段切换、事件和终态 | 业务域 Profile、各子图结果 | 会话状态、SSE 事件、轨迹和最终结果 | 业务语义判断、SQL 拼接 |
 | 业务对齐层 | 将用户表达转换为标准业务需求，处理词汇映射、集合量词、输出要求和关键歧义 | `table-overview.txt`、`business-vocabulary.txt`、核心规则 | 自然语言需求、结构化逻辑与布局要求，或放弃理由 | 表选择、字段选择、表关系、SQL、数据库查询 |
 | 用户确认层 | 让操作员确认对齐后的业务需求，并复核规划后的最终行粒度、可见字段与返回范围 | 对齐结果或已校验双计划 | 确认继续、字段修改意见或取消 | 修改数据库、绕过计划校验 |
-| 查询规划层 | 确定查询主体、SQL 原始行粒度、集合量词、表集合、筛选、聚合、返回列及最终布局 | `table-context/*.txt`、核心规则、实体候选、`get_table_schema` 结果 | 相互独立的 SQL 数据获取计划和结果塑形计划，或放弃理由 | 执行 SQL、编造数据 |
+| 查询规划层 | 确定查询主体、分块行粒度、查询块依赖、集合量词、筛选、聚合、返回列及最终布局 | `table-context/*.txt`、核心规则、实体候选、`get_table_schema` 结果 | 相互独立的分块 SQL 数据获取计划和结果塑形计划，或放弃理由 | 执行 SQL、编造数据 |
 | SQL 子图 | 只根据 SQL 数据获取计划生成、静态校验并执行单条只读 SQL | SQL 数据获取计划、真实表结构、表白名单 | 使用稳定结果列别名的 SQL 原始结果或明确错误 | 读取塑形计划、修改数据、翻译状态值 |
 | 结果翻译子图 | 根据字段 `comment` 识别并翻译可追溯的状态、类型或布尔值 | SQL、相关表结构、前五行样本、字段注释 | 字段翻译映射 | 自行推断未定义枚举、改变行数或查询口径 |
 | 结果塑形子图 | 按独立计划执行透传、分组和动态转列 | 翻译后完整结果、结果塑形计划 | 最终列定义和完整结果行 | 新增筛选、聚合、业务计算或调用模型 |
@@ -90,11 +90,13 @@ flowchart LR
 
 ### 2.3 查询规划
 
-规划层按需读取白名单表结构，必要时用单表候选检索确认用户提到的实际实体值。规划结果分为两份：`query_plan` 是 SQL 数据获取计划，明确原始行粒度、表、别名、关联、普通筛选、量化条件、稳定结果列、分组、聚合、`HAVING`、排序和 `limit`；`result_shape_plan` 是翻译后本地程序使用的透传或动态转列计划。两份计划由规划终止工具同时提交，但分开消费。
+规划层按需读取白名单表结构，必要时用单表候选检索确认用户提到的实际实体值。规划结果分为两份：`query_plan` 是由 `query_blocks` 组成的 SQL 数据获取计划，`root_block_id` 指向最终结果块；`result_shape_plan` 是翻译后本地程序使用的透传或动态转列计划。每个查询块独立声明行粒度 `row_granularity`、粒度键 `grain_fields`、本块及其内部普通子查询读取的真实表 `source_tables`、前置块 `input_blocks`，以及只在本块生效的关联、筛选、量词、分组、聚合、`HAVING`、输出字段和排序。两份计划由规划终止工具同时提交，但分开消费。
 
-对齐层确认的每个集合量词都必须在 `query_plan.quantified_conditions` 中落实，每个 `applied_business_rules` 标识也必须在 `implemented_business_rules` 中通过 `plan_references` 指向实际承载规则的筛选、关联、量化或聚合组件，不能维护第二份伪 SQL。每条量词计划分别声明成员正向条件 `predicate`、成员集合范围 `collection_filters` 和相关子查询的内外层主体关联 `correlation_condition`。规划使用 `HAVING`、`EXISTS`、`NOT EXISTS`、子查询或 CTE 表达“全部、任一、没有、数量”等集合语义，不能把“全部完成”退化为单行普通筛选。`all` 或 `none` 的成员谓词不得同时作为普通 `filters` 提前删除反例；动态转列需要保留成员行时，这两类量词统一使用可由 SQL 层校验的 `NOT EXISTS` 资格判断。完整导出要求强制 `pagination.limit = null`。塑形计划引用的字段必须全部由 `query_plan.select_fields[].result_field` 返回；`pivot` 必须额外返回最终行主体的真实 ID 作为分组键，不能仅按可能重复的名称合并。用户没有明确要求该 ID 时，它只存在于 `hidden_fields`，不会污染最终表格；用户明确要求 ID 时才可作为可见透传列。依赖不闭合或布局不一致会作为原规划工具失败结果反馈模型。
+对齐层确认的每个集合量词都必须落实到某个查询块。量词通过 `subject_key` 声明被筛选主体键，数量型量词还通过 `member_key` 声明去重计数的集合成员键；`predicate`、`collection_filters` 和相关子查询的 `correlation_condition` 分别表示成员条件、集合范围和内外层关联。使用 `HAVING` 时，量词主体键必须与所在块的 `grain_fields` 完全一致。每个 `applied_business_rules` 标识也必须通过带块作用域的引用定位实际组件，例如 `query_blocks[qualified_users].filters[0]`，不能维护第二份伪 SQL。
 
-运动业务域把“项目进度达到 100%”统一规划为 `season_user_project.completion_progress >= 1`，同时要求 `correlation_condition` 直接通过 `season_user_project.season_user_id = season_user.id` 关联当前参与记录，并要求 `collection_filters` 只包含 `season_user_project.status = 1`。赛季范围等外层条件不能混入成员集合范围。`all` 的 `NOT EXISTS` 子查询据此只在当前用户的有效锁定项目中排除 `< 1` 的反例。规划层若把反例误写为成员谓词、遗漏或污染集合范围、错误关联其他赛季，或使用不稳定的等号口径，会在进入 SQL 前收到精确修复反馈。
+当资格判断粒度与最终明细粒度不一致时，规划必须先建立 `qualification` 或 `aggregation` 块，在主体粒度输出合格主体键，再由根 `result` 块读取该前置块并返回明细。禁止在同一块按主体分组或执行 `HAVING`，同时选择下级明细字段；分组块的输出只能是分组键或已声明聚合表达式。备注字段只描述业务含义，不能修复这种结构冲突。完整导出要求 `pagination.limit = null`。塑形计划只能引用根块 `select_fields[].result_field`；`pivot` 必须使用最终行主体真实 ID 作为稳定分组键，用户未要求的技术 ID 放入 `hidden_fields`。
+
+运动业务域把“项目进度达到 100%”统一规划为 `season_user_project.completion_progress >= 1`，并要求 `collection_filters` 只包含 `season_user_project.status = 1`。相关子查询实现还必须通过 `season_user_project.season_user_id = season_user.id` 关联当前参与记录；主体粒度资格块使用 `HAVING` 时则由 `subject_key` 与 `grain_fields` 直接保证作用域。赛季范围等外层条件不能混入成员集合范围。规划层若把反例误写为成员谓词、遗漏或污染集合范围、错误关联其他赛季，或使用不稳定的等号口径，会在进入 SQL 前收到精确修复反馈。
 
 运动业务域不向查询结果暴露 `proof_record.image_url` 内部存储路径。用户要求查看或返回运动凭证图片时，查询计划必须返回 `proof_record.id`，前端再使用[图片安全中转 API](../api/image.md) 按凭证主键读取图片。该规则由业务域终止计划校验器强制执行：违规字段会作为原工具调用的可重试失败结果返回模型，在有限修复次数内重新生成计划。
 
@@ -119,13 +121,13 @@ flowchart LR
 
 ### 2.5 SQL 查询
 
-SQL 子图按“生成、校验、执行”三步运行，只接收 `query_plan` 和真实表结构，不接收 `result_shape_plan`。每个 SELECT 输出必须按规划声明的 `result_field` 显式设置稳定别名。SQL 成功后才进入翻译层；SQL 失败不会调用翻译、塑形或审计子图。
+SQL 子图按“生成、校验、执行”三步运行，只接收 `query_plan` 和真实表结构，不接收 `result_shape_plan`。每个非根查询块必须生成一个与 `block_id` 同名的 CTE，根查询块对应最外层 SELECT；每块输出必须按本块 `select_fields` 顺序显式设置 `result_field`，后续块只能引用前置块已输出的字段。SQL 成功后才进入翻译层；SQL 失败不会调用翻译、塑形或审计子图。
 
 SQL 子图在校验通过后同时保留两种等价形态：数据库执行形态将命名占位符编译为 asyncmy 使用的 `%s`；来源分析形态保留 `:parameter_name`，供后续 SQLGlot 重新解析字段与来源表。翻译层不得将 `%s` 执行 SQL 作为 AST 分析输入。
 
 SQL 静态校验还会验证同一个 `EXISTS` 或 `NOT EXISTS` 是否同时包含规划要求的成员条件或反条件、全部集合范围，以及跨越子查询作用域的主体关联。仅在两个内层表之间建立同字段关联不能冒充外层主体关联。数值比较按十进制等值归一化，规划别名和 SQL 别名均还原到真实表名，避免 `1.0000` 与 `1.0`、不同合法别名造成误判。WHERE、HAVING、JOIN 和嵌套量词子查询中的筛选字面量必须参数化；错误反馈会指出具体谓词和值，并在有限生成预算内交给同一 SQL 工具调用修复。
 
-规划声明的每条 `joins` 关联也必须在 SQL 中完整出现。校验器会归一化表别名和等值比较方向；当关联两侧的表共同提供某个结果 SELECT 的字段时，关联条件必须约束同一个 SELECT，不能藏在与最终结果无关的 CTE 或子查询中。缺失关联或关联作用域错误会以原 `submit_sql_query` 的 `tool_call_id` 写入同一消息上下文，反馈包含缺失条件和唯一修复动作；模型在剩余生成预算内修复，只有重新通过全部静态校验的 SQL 才会执行。
+SQL AST 校验会逐块核对 CTE 集合、真实表、前置块、输出表达式、`GROUP BY`、`JOIN`、`WHERE` 和 `HAVING`。条件即使在整条 SQL 中出现，只要位于错误查询块或错误子句也会被拒绝；SQL 也不能增加无关 CTE 或省略计划块。同一真实表承担多个角色时必须使用计划声明的角色别名，避免不同角色被归一化后误判为等价。错误会以原 `submit_sql_query` 的 `tool_call_id` 写入同一消息上下文，模型在剩余预算内修复，只有重新通过全部静态校验的 SQL 才会执行。
 
 ### 2.6 结果翻译
 

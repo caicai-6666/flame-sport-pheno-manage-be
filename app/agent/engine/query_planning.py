@@ -123,7 +123,7 @@ def _validate_query_plan_contract(
         )
         planned_quantifiers = Counter(
             (condition.quantifier, condition.count)
-            for condition in query_plan.quantified_conditions
+            for _, _, condition in query_plan.iter_quantified_conditions()
         )
         missing_quantifiers = required_quantifiers - planned_quantifiers
         if missing_quantifiers:
@@ -138,13 +138,14 @@ def _validate_query_plan_contract(
             ]
             issues.append(
                 QueryPlanPolicyIssue(
-                    field_path="query_plan.quantified_conditions",
+                    field_path="query_plan.query_blocks[].quantified_conditions",
                     message=(
                         "查询计划遗漏业务对齐层确认的集合量化条件："
                         + "、".join(missing_descriptions)
                     ),
                     repair_action=(
-                        "为上述每个量词新增一条 quantified_conditions 项，"
+                        "在主体粒度正确的 query_block 中为上述每个量词新增一条 "
+                        "quantified_conditions 项，"
                         "使用已读取的真实字段表达 predicate，并选择明确的实现方式。"
                     ),
                 )
@@ -170,8 +171,8 @@ def _validate_query_plan_contract(
                     ),
                     repair_action=(
                         "为每个缺失规则新增 implemented_business_rules 项，"
-                        "用 plan_references 指向实际落实该规则的 filters、joins、"
-                        "quantified_conditions、having 或其他已有计划组件。"
+                        "用带 query_block 作用域的 plan_references 指向实际落实该规则的 "
+                        "filters、joins、quantified_conditions、having 或其他已有计划组件。"
                     ),
                 )
             )
@@ -191,7 +192,11 @@ def _validate_query_plan_contract(
             )
         )
 
-    for index, condition in enumerate(query_plan.quantified_conditions):
+    for block, index, condition in query_plan.iter_quantified_conditions():
+        condition_path = (
+            f"query_plan.query_blocks[{block.block_id}]."
+            f"quantified_conditions[{index}]"
+        )
         normalized_predicate = re.sub(
             r"\s+",
             "",
@@ -199,7 +204,7 @@ def _validate_query_plan_contract(
         )
         matching_filter_indexes = [
             filter_index
-            for filter_index, query_filter in enumerate(query_plan.filters)
+            for filter_index, query_filter in enumerate(block.filters)
             if re.sub(
                 r"\s+",
                 "",
@@ -211,7 +216,7 @@ def _validate_query_plan_contract(
             issues.append(
                 QueryPlanPolicyIssue(
                     field_path=(
-                        "query_plan.filters["
+                        f"query_plan.query_blocks[{block.block_id}].filters["
                         + ",".join(str(item) for item in matching_filter_indexes)
                         + "]"
                     ),
@@ -220,40 +225,22 @@ def _validate_query_plan_contract(
                         "这会在量化判断前删除反例，使全部或没有条件失真。"
                     ),
                     repair_action=(
-                        "从 query_plan.filters 删除与该 quantified_conditions.predicate "
+                        f"从查询块 {block.block_id} 的 filters 删除与该量词 predicate "
                         "相同的普通筛选；filters 只保留集合范围条件，成员谓词仅在 "
                         "NOT EXISTS、条件聚合、子查询或 CTE 的资格判断中计算。"
                     ),
                 )
             )
-        if (
-            result_shape_plan.shape_type == "pivot"
-            and condition.quantifier in {"all", "none"}
-            and condition.implementation_hint != "not_exists"
-        ):
+        if condition.implementation_hint == "having" and not block.having:
             issues.append(
                 QueryPlanPolicyIssue(
-                    field_path=(
-                        f"query_plan.quantified_conditions[{index}].implementation_hint"
-                    ),
+                    field_path=condition_path,
                     message=(
-                        "最终结果需要保留集合成员逐行供 pivot 展开；当前全称或否定"
-                        "量词没有使用可在外层保留成员行的 NOT EXISTS 资格判断。"
+                        f"该量化条件声明使用 having，但查询块 {block.block_id} 的 having 为空。"
                     ),
                     repair_action=(
-                        "把 implementation_hint 精确改为 not_exists：all 在相关子查询中"
-                        "排除不满足 predicate 的反例成员，none 在相关子查询中排除满足"
-                        " predicate 的成员；外层继续返回合格主体的全部集合成员供塑形。"
-                    ),
-                )
-            )
-        if condition.implementation_hint == "having" and not query_plan.having:
-            issues.append(
-                QueryPlanPolicyIssue(
-                    field_path=f"query_plan.quantified_conditions[{index}]",
-                    message="该量化条件声明使用 having，但 query_plan.having 为空。",
-                    repair_action=(
-                        "在 query_plan.having 中加入落实该量化条件的聚合后筛选表达式；"
+                        f"在查询块 {block.block_id} 的 having 中加入落实该量化条件的"
+                        "聚合后筛选表达式；"
                         "如果实际不用 HAVING，则把 implementation_hint 改为真实实现方式。"
                     ),
                 )
@@ -299,7 +286,8 @@ def _validate_query_plan_contract(
                         "仅按名称分组可能把同名主体合并为一行。"
                     ),
                     repair_action=(
-                        "在 query_plan.select_fields 中加入最终行主体真实表的 id 字段，"
+                        f"在根查询块 {query_plan.root_block_id} 的 select_fields 中加入"
+                        "最终行主体真实表的 id 字段，"
                         "为其声明稳定 result_field；把该 result_field 加入 "
                         "result_shape_plan.group_fields 和 hidden_fields。"
                         "名称等展示字段继续放在 passthrough_fields。"
@@ -329,7 +317,8 @@ def _validate_query_plan_contract(
                     ),
                     repair_action=(
                         "从 passthrough_fields 删除上述 ID，并将其加入 hidden_fields；"
-                        "这些字段继续保留在 group_fields 和 query_plan.select_fields 中。"
+                        f"这些字段继续保留在 group_fields 和根查询块 "
+                        f"{query_plan.root_block_id} 的 select_fields 中。"
                     ),
                 )
             )

@@ -136,7 +136,7 @@ Profile 加载时会检查允许表非空且不重复、表标签完整、每张
 
 - `tables.table` 表示真实表名，`row_grain` 表示一行的业务含义；
 - `columns.field_name`、`data_type`、`foreign_key` 和 `comment` 分别表示字段名、数据库类型、外键目标和数据库字段注释；
-- `query_plan` 表示只供 SQL 层读取的数据获取计划，包含量化条件、核心规则到正式计划组件的引用和稳定结果列；`result_shape_plan` 表示翻译后本地程序使用的塑形计划；SQL 模型的动态上下文只包含前者和 `allowed_table_schemas`；
+- `query_plan` 表示只供 SQL 层读取的查询块图，包含根块标识、拓扑有序查询块、块内量化条件、带作用域的核心规则引用和稳定输出列；`result_shape_plan` 表示翻译后本地程序使用的塑形计划；SQL 模型的动态上下文只包含前者和 `allowed_table_schemas`；
 - `rows_preview` 只是受限样本，`statistics` 才是基于完整结果计算的统计事实。
 
 中文说明位于固定系统前缀，不在每次动态 YAML 中重复插入 `#` 行内注释。这样既保证字段语义明确，也避免注释与事实值混杂，并保持可复用的前缀缓存。动态内容仍必须能被 `yaml.safe_load` 解析；读取后还要由对应 Pydantic 模型或本地业务校验确认具体结构。
@@ -184,13 +184,14 @@ columns:
 2. 基础表集合与规划层声明完全一致，且全部属于业务域白名单。
 3. 禁止注释、分号、多语句、通配字段、锁、`SELECT INTO`、数据库限定名和高风险函数。
 4. WHERE、HAVING、JOIN 和嵌套量词子查询条件中的筛选标量必须使用命名占位符；只有 `EXISTS` 投影的 `SELECT 1` 与规划允许的分页整数例外，参数集合必须精确匹配。
-5. 规划声明的每条 `joins` 关联必须由 SQL 实现；别名和等值比较方向允许不同，但共同提供结果字段的表必须在同一个结果 SELECT 中受该关联约束，不能由无关 CTE 或子查询冒充。
-6. 每个规划返回字段必须声明稳定 `result_field`；SQL 必须使用同名 `AS` 别名，输出列名必须唯一，并与 `result_columns` 及规划顺序一致。
-7. `LIMIT` 和 `OFFSET` 必须精确服从规划结果；系统不会私自追加隐藏上限。
+5. 每个非根 `query_block` 必须对应一个同名 CTE，根块必须对应最外层 SELECT；不得增删或重命名块。
+6. 每块实际读取的真实表和前置 CTE、输出表达式与别名、`GROUP BY`、`JOIN`、`WHERE` 和 `HAVING` 必须与该块计划一致，不能把条件移动到其他块。
+7. 每个规划返回字段必须声明稳定 `result_field`；SQL 必须使用同名 `AS` 别名，输出列名必须唯一，并与 `result_columns` 及规划顺序一致。
+8. `LIMIT` 和 `OFFSET` 必须精确服从规划结果；系统不会私自追加隐藏上限。
 
-规划终态在 SQL 生成前还会校验：业务对齐采用的核心规则均引用了实际存在的计划组件；完整导出的 `limit` 为 `null`；`all`、`none` 的成员谓词没有被普通筛选提前删除；需要保留集合成员供动态转列时，`all` 与 `none` 使用 `NOT EXISTS` 独立确定主体资格；`pivot` 使用最终行主体的真实 ID 作为分组键，未被用户要求的技术 ID 必须隐藏。
+规划终态在 SQL 生成前还会校验查询块图是无环且拓扑有序的，根块位于最后，所有非根块均能从根块到达，块内字段只引用自身真实表、别名或前置块已输出字段。分组键必须与块粒度键一致；分组块不能直接选择未聚合明细字段；`HAVING` 量词的 `subject_key` 必须等于块粒度键。业务对齐采用的核心规则必须引用带查询块作用域的实际组件；完整导出的 `limit` 为 `null`；`all`、`none` 的成员谓词不能被同块普通筛选提前删除；`pivot` 使用最终行主体真实 ID 作为分组键。
 
-SQL AST 会对普通跨表关联和 `EXISTS`、`NOT EXISTS` 中的量词契约执行语义核对。普通关联先逐条对照规划，再检查共同产出结果字段的表是否在同一个 SELECT 作用域内受到关联约束，防止凭证、项目等一对多数据因漏写关联键产生错误组合。量词校验要求成员条件或反条件、`collection_filters` 的全部集合范围、`correlation_condition` 的内外层主体关联同时出现在同一个正确极性的子查询中；两个内层别名之间的关联不能冒充与外层主体的相关条件。核对前将规划别名和 SQL 自选别名还原为真实表名，并把十进制数值归一化，因此 `1`、`1.0` 和 `1.0000` 被视为相同阈值；比较运算符方向错误仍会被拒绝。运动业务域进一步把全部项目完成固定为正向成员条件 `season_user_project.completion_progress >= 1`、唯一集合范围 `season_user_project.status = 1` 和关联条件 `season_user_project.season_user_id = season_user.id`，对应反例为 `< 1`。
+SQL AST 先建立 `block_id -> SELECT` 映射，再在所属块内核对真实表、前置块、输出字段、分组和条件作用域。普通相关子查询仍归属于包围它的命名查询块；其他 CTE 中出现相同条件不能冒充本块实现。`EXISTS`、`NOT EXISTS` 量词还要求成员条件或反条件、全部 `collection_filters` 和跨越子查询作用域的 `correlation_condition` 同时位于正确极性的子查询中。未声明角色别名时允许 SQL 使用无歧义的自选别名；计划显式声明角色别名后则按原别名核对，避免同一真实表的多个角色被错误折叠。十进制数值比较会归一化，比较运算符方向错误仍会被拒绝。
 
 静态校验或数据库执行发现可修复错误时，运行时会使用原 `submit_sql_query` 的 `tool_call_id` 把错误类型、准确原因和唯一修复动作作为正常工具结果追加到当前 SQL 消息上下文。后续生成因此保留本次查询的短期修复记忆，并在 SQL 生成预算内重试；校验通过后，命名参数才编译为 asyncmy 参数绑定，在 `START TRANSACTION READ ONLY` 中执行，超时为 `10` 秒，最终始终回滚并关闭连接。连接、权限和超时错误直接交由系统处理，不要求模型改写 SQL。
 
@@ -215,7 +216,7 @@ SQL 成功后先运行独立 `ResultTranslationSubgraph`：
 - `passthrough` 按 `passthrough_fields` 顺序保留稳定结果列；
 - `pivot` 按包含主体真实 ID 的 `group_fields` 聚合同一主体，使用 `pivot_order_field` 稳定排序，并把 `pivot_value_field` 依次写入由 `column_key_prefix` 和 `column_label_pattern` 生成的动态列；
 - `hidden_fields` 只参与分组或排序，不进入最终表格；
-- 塑形所需字段必须全部来自 `query_plan.select_fields[].result_field`，塑形层不能增加筛选、聚合或业务计算。
+- 塑形所需字段必须全部来自根查询块 `select_fields[].result_field`，塑形层不能增加筛选、聚合或业务计算。
 
 同组透传字段冲突、引用列缺失或动态列超过已声明数量时，塑形子图明确失败，不返回部分表格。
 

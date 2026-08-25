@@ -467,7 +467,7 @@ def _build_audit_system_prompt(domain_display_name: str) -> str:
 
 输入是合法 YAML，字段含义固定如下：
 - `original_question` 是用户原始问题，`aligned_question` 是已完成业务对齐的查询需求。
-- `query_plan` 是查询口径摘要；`query_goal` 是目标，`row_granularity` 是每行含义。`filters` 中 `condition` 是筛选条件、`reason` 是业务原因；`select_fields` 中 `field` 是返回字段、`purpose` 是展示用途；`business_caliber` 是业务口径。
+- `query_plan` 是查询口径摘要；`query_goal` 是目标，`root_block_id` 是最终结果块。`query_blocks` 按依赖顺序列出每块的行粒度、筛选、量词、聚合后筛选和输出字段；非根块负责资格或聚合，根块决定最终每行含义。`business_caliber` 是业务口径。
 - `executed_sql` 是已通过安全校验并实际执行的只读 SQL，只用于核对查询实现。
 - `result_table.headers` 是表头列表；`key` 是实际结果字段，`label` 是中文展示名；`rows_preview` 只包含前 5 行样本，状态类值可能已经按字段注释翻译。
 - `result_table.statistics.row_count` 是完整结果行数，`planned_limit` 是规划上限或 null，`limit_reached` 表示结果是否达到该上限。
@@ -494,10 +494,22 @@ def _build_audit_messages(
         "aligned_question": alignment_result.aligned_request.aligned_question,
         "query_plan": {
             "query_goal": planning_result.query_plan.query_goal,
-            "row_granularity": planning_result.query_plan.row_granularity,
-            "filters": [item.model_dump() for item in planning_result.query_plan.filters],
-            "select_fields": [
-                item.model_dump() for item in planning_result.query_plan.select_fields
+            "root_block_id": planning_result.query_plan.root_block_id,
+            "query_blocks": [
+                {
+                    "block_id": block.block_id,
+                    "role": block.role,
+                    "row_granularity": block.row_granularity,
+                    "filters": [item.model_dump() for item in block.filters],
+                    "quantified_conditions": [
+                        item.model_dump() for item in block.quantified_conditions
+                    ],
+                    "having": [item.model_dump() for item in block.having],
+                    "select_fields": [
+                        item.model_dump() for item in block.select_fields
+                    ],
+                }
+                for block in planning_result.query_plan.query_blocks
             ],
             "business_caliber": planning_result.query_plan.business_caliber,
         },

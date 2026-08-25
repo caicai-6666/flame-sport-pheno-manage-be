@@ -107,12 +107,14 @@ def _has_record_identifier(query_plan: NaturalLanguageQueryPlan) -> bool:
 
 # 判断查询计划是否包含聚合；汇总结果不强制返回单条明细记录的主键。
 def _has_aggregation(query_plan: NaturalLanguageQueryPlan) -> bool:
-    return bool(query_plan.aggregations or query_plan.group_by)
+    return any(block.aggregations or block.group_by for block in query_plan.query_blocks)
 
 
 # 判断过滤条件是否已经限定为有效的商品兑换流水。
 def _has_exchange_filter(query_plan: NaturalLanguageQueryPlan) -> bool:
-    filter_text = "\n".join(query_filter.condition for query_filter in query_plan.filters)
+    filter_text = "\n".join(
+        query_filter.condition for _, _, query_filter in query_plan.iter_filters()
+    )
     normalized = filter_text.lower()
     return "change_type" in normalized and "exchange" in normalized
 
@@ -160,9 +162,14 @@ def validate_rewards_query_plan(
         )
 
     issues: list[QueryPlanPolicyIssue] = []
+    root_select_field_path = (
+        f"query_plan.query_blocks[{query_plan.root_block_id}].select_fields"
+    )
     selected_fields = [field.field for field in query_plan.select_fields]
     selected_text = "\n".join(selected_fields)
-    filter_text = "\n".join(query_filter.condition for query_filter in query_plan.filters)
+    filter_text = "\n".join(
+        query_filter.condition for _, _, query_filter in query_plan.iter_filters()
+    )
     full_plan_text = "\n".join(
         (
             query_plan.query_goal,
@@ -178,7 +185,7 @@ def validate_rewards_query_plan(
     ):
         issues.append(
             QueryPlanPolicyIssue(
-                field_path="query_plan.select_fields",
+                field_path=root_select_field_path,
                 message=(
                     "用户查询的是当前积分余额，但返回字段没有包含能够表示当前余额的"
                     " point_record.points_after。"
@@ -196,7 +203,7 @@ def validate_rewards_query_plan(
     ):
         issues.append(
             QueryPlanPolicyIssue(
-                field_path="query_plan.select_fields",
+                field_path=root_select_field_path,
                 message=(
                     "用户查询的是赛季结算积分或发放状态，但返回字段没有包含"
                     " season_user.final_points 或 season_user.points_issued。"
@@ -235,7 +242,7 @@ def validate_rewards_query_plan(
     if "gift_distribution_status" in full_plan_text and not _has_exchange_filter(query_plan):
         issues.append(
             QueryPlanPolicyIssue(
-                field_path="query_plan.filters",
+                field_path="query_plan.query_blocks[].filters",
                 message=(
                     "计划使用了奖品履约状态，但没有限定为商品兑换流水；"
                     "该状态对赛季奖励和人工积分调整没有业务意义。"
@@ -250,7 +257,7 @@ def validate_rewards_query_plan(
     if _requests_product_catalog(planning_input) and "gift_distribution_status" in full_plan_text:
         issues.append(
             QueryPlanPolicyIssue(
-                field_path="query_plan.filters",
+                field_path="query_plan.query_blocks[].filters",
                 message="用户查询的是商品目录，但计划使用了兑换记录的奖品履约状态。",
                 repair_action=(
                     "删除 gift_distribution_status 相关条件，改为根据 product 的商品状态和兑换积分查询。"
@@ -262,7 +269,7 @@ def validate_rewards_query_plan(
         if not _has_record_identifier(query_plan):
             issues.append(
                 QueryPlanPolicyIssue(
-                    field_path="query_plan.select_fields",
+                    field_path=root_select_field_path,
                     message=(
                         "查询主体是逐条积分、兑换或奖品记录，但计划没有返回能够定位该记录的主键。"
                     ),
