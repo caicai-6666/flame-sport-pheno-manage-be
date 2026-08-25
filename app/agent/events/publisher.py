@@ -68,3 +68,15 @@ class AgentProgressReporter:
                 message=message,
             )
         )
+
+    # 用户提出字段修改意见后发布重新规划状态，但不把可能敏感的自由文本反馈写入 SSE。
+    def plan_revision_started(self) -> None:
+        self.emit(
+            AgentProgressUpdate(
+                stage="planning",
+                event_type="progress_updated",
+                status="running",
+                title="正在调整查询方案",
+                message="正在根据您对结果字段的意见调整查询方案。",
+            )
+        )

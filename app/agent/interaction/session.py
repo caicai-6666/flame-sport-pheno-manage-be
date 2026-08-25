@@ -31,6 +31,7 @@ TERMINAL_QUERY_STATUSES = frozenset(
     {"completed", "abandoned", "failed", "cancelled"}
 )
 INTERACTION_TIMEOUT_SECONDS = 5 * 60
+PLAN_REVIEW_OPTIONS = ("确认并继续", "修正查询")
 
 
 class AgentQueryCancelled(RuntimeError):
@@ -189,6 +190,7 @@ class AgentQuerySession:
                 options=options,
                 allow_free_text=interaction_type == "clarification",
             )
+            is_plan_review = options == PLAN_REVIEW_OPTIONS
             self._pending_interaction = interaction
             self._status = (
                 "waiting_for_confirmation"
@@ -200,16 +202,24 @@ class AgentQuerySession:
             self.publish(
                 AgentProgressUpdate(
                     stage=(
-                        "confirmation"
-                        if interaction_type == "confirmation"
-                        else "planning"
+                        "planning"
+                        if is_plan_review
+                        else (
+                            "confirmation"
+                            if interaction_type == "confirmation"
+                            else "planning"
+                        )
                     ),
                     event_type="interaction_required",
                     status="waiting",
                     title=(
-                        "请确认查询需求"
-                        if interaction_type == "confirmation"
-                        else "需要补充一项信息"
+                        "请确认结果字段"
+                        if is_plan_review
+                        else (
+                            "请确认查询需求"
+                            if interaction_type == "confirmation"
+                            else "需要补充一项信息"
+                        )
                     ),
                     message=question,
                     payload={
@@ -257,18 +267,27 @@ class AgentQuerySession:
             interaction.status = "answered"
             interaction.answer = normalized_answer
             interaction.answered_at = now_in_shanghai()
+            is_plan_review = interaction.options == PLAN_REVIEW_OPTIONS
             self._append_trace_locked(
                 entry_type="interaction_answered",
                 stage=(
-                    "confirmation"
-                    if interaction.interaction_type == "confirmation"
-                    else "planning"
+                    "planning"
+                    if is_plan_review
+                    else (
+                        "confirmation"
+                        if interaction.interaction_type == "confirmation"
+                        else "planning"
+                    )
                 ),
                 status="success",
                 title=(
-                    "已提交查询确认"
-                    if interaction.interaction_type == "confirmation"
-                    else "已补充查询信息"
+                    "已提交查询方案选择"
+                    if is_plan_review
+                    else (
+                        "已提交查询确认"
+                        if interaction.interaction_type == "confirmation"
+                        else "已补充查询信息"
+                    )
                 ),
                 message=(
                     f"操作员选择：{normalized_answer}"

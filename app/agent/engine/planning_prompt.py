@@ -36,6 +36,8 @@ ROLE_DEFINITION_TEMPLATE: Final[str] = """# 角色定义
 
 最终只能调用 `execute_natural_language_query` 或 `abandon_query_planning` 结束流程。调用 `execute_natural_language_query` 时必须同时提交相互独立的 `query_plan` 和 `result_shape_plan`：`query_plan` 只描述 SQL 数据获取，`result_shape_plan` 只描述 SQL 执行并完成状态翻译后的本地确定性塑形。SQL 层不会读取塑形计划，因此 `query_plan.select_fields` 必须先返回塑形所需的全部原始列。关联、筛选、返回字段、聚合和排序必须使用数据库原始标识符，统一写为 `表名.字段名`；确需别名时先在 `aliases` 中声明再引用。可以在标识符后补充中文业务说明，但中文名称不得替代原始表名或字段名。
 
+`execute_natural_language_query` 的参数通过 Schema 和业务规则校验后，系统会先向用户展示最终行粒度、可见结果字段和返回范围。用户确认后才会进入 SQL 层；如果该工具返回 `status: revision_requested`，说明用户对字段或布局提出了修改意见。此时必须保留未被反馈否定的既有查询口径，依据 `result.user_feedback` 修订查询计划与塑形计划，必要时继续调用结构查询或澄清工具，然后再次调用 `execute_natural_language_query`。不得忽略反馈，也不得在修订字段时丢失原筛选、量词、业务规则和完整导出要求。
+
 `query_plan.row_granularity` 表示 SQL 原始结果一行的含义，不是最终展示行粒度。每个 `select_fields` 项必须提供唯一、稳定、仅含英文数字下划线的 `result_field`，SQL 层会把它作为强制输出别名，塑形计划也只能引用这些 result_field。聚合后的条件必须写入 `having`，不得混入普通 `filters`。上游 `logical_constraints` 中 all、any、none、exactly、at_least、at_most 等量词必须逐项落实到 `quantified_conditions`，并选择 HAVING、EXISTS、NOT EXISTS、子查询或 CTE 等可验证实现；不得把 all 降级为任一行满足普通 WHERE。每个量词的 `predicate` 表示成员应满足的正向条件；`collection_filters` 只定义被量化集合自身的有效范围；使用 EXISTS、NOT EXISTS 或相关子查询时，`correlation_condition` 必须明确连接内层成员和外层主体，不能只写两个内层表之间的关联。
 
 对于 `all` 和 `none`，`quantified_conditions.predicate` 绝不能同时作为相同的普通 `filters` 条件，否则会先删除不满足谓词的集合成员，使后续量化判断失真。普通 filters 只限定外层返回范围；成员集合范围必须同时写入该量词自己的 `collection_filters`。最终需要保留集合成员逐行供 pivot 展开时，all 和 none 必须使用 `implementation_hint=not_exists`：all 排除不满足成员谓词的反例，none 排除满足成员谓词的成员；同一个 NOT EXISTS 内必须同时实现 `correlation_condition`、全部 `collection_filters` 和成员反例条件，外层继续返回合格主体的全部成员行。不能直接在同一外层按主体 HAVING 后又返回成员粒度。`implementation_hint` 只能精确选择一个枚举值，禁止写 `cte/subquery` 等组合值：使用 WITH 命名集合选 cte，使用括号内 SELECT 选 subquery。

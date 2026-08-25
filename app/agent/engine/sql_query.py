@@ -814,6 +814,239 @@ def _expression_contains_condition(
     )
 
 
+# 解析规划中的跨表关联条件；无效条件必须回到规划层修正，不能要求 SQL 模型猜测真实关系。
+def _parse_planned_join_condition(
+    condition_text: str,
+    condition_index: int,
+) -> exp.Expression:
+    try:
+        condition_select = parse_one(
+            f"SELECT 1 WHERE {condition_text}",
+            read="mysql",
+        )
+    except ParseError as error:
+        raise SqlValidationError(
+            code="invalid_planned_join_condition",
+            message=f"查询计划中的关联条件 joins[{condition_index}].condition 不是有效 MySQL 表达式",
+            repair_action=(
+                "返回查询规划阶段，把 "
+                f"joins[{condition_index}].condition 改为真实字段组成的单一关联条件。"
+            ),
+            retry_target="query_planning",
+            details={
+                "join_index": condition_index,
+                "condition": condition_text,
+            },
+        ) from error
+    condition_where = condition_select.args.get("where")
+    if condition_where is None:
+        raise SqlValidationError(
+            code="invalid_planned_join_condition",
+            message=f"查询计划中的关联条件 joins[{condition_index}].condition 为空",
+            repair_action=(
+                "返回查询规划阶段，为 "
+                f"joins[{condition_index}].condition 提供真实字段关联条件。"
+            ),
+            retry_target="query_planning",
+            details={
+                "join_index": condition_index,
+                "condition": condition_text,
+            },
+        )
+    return condition_where.this
+
+
+# 只遍历当前 SELECT 自己的表达式，遇到嵌套 SELECT 即停止，避免无关子查询冒充外层关联。
+def _walk_without_nested_selects(
+    expression: exp.Expression,
+) -> list[exp.Expression]:
+    scoped_expressions: list[exp.Expression] = [expression]
+    for child in expression.iter_expressions():
+        if isinstance(child, exp.Select):
+            continue
+        scoped_expressions.extend(_walk_without_nested_selects(child))
+    return scoped_expressions
+
+
+# 收集一个 SELECT 直接投影字段的真实来源表，用于判断哪些关联会共同组成最终业务行。
+def _get_select_projection_tables(
+    select_expression: exp.Select,
+    sql_aliases: dict[str, str],
+) -> set[str]:
+    projection_tables: set[str] = set()
+    for projection in select_expression.expressions:
+        for candidate in _walk_without_nested_selects(projection):
+            if not isinstance(candidate, exp.Column) or not candidate.table:
+                continue
+            projection_tables.add(
+                sql_aliases.get(candidate.table, candidate.table)
+            )
+    return projection_tables
+
+
+# 判断关联条件是否位于当前 SELECT 的 JOIN、WHERE 或 HAVING 中，嵌套查询中的同名条件不计入。
+def _select_scope_contains_condition(
+    select_expression: exp.Select,
+    expected_condition: exp.Expression,
+    sql_aliases: dict[str, str],
+) -> bool:
+    condition_roots: list[exp.Expression] = []
+    for join_expression in select_expression.args.get("joins") or []:
+        on_expression = join_expression.args.get("on")
+        if on_expression is not None:
+            condition_roots.append(on_expression)
+    for clause_name in ("where", "having"):
+        clause = select_expression.args.get(clause_name)
+        if clause is not None and clause.this is not None:
+            condition_roots.append(clause.this)
+    return any(
+        _expressions_are_equivalent(
+            _normalize_column_table_aliases(candidate, sql_aliases),
+            expected_condition,
+        )
+        for condition_root in condition_roots
+        for candidate in _walk_without_nested_selects(condition_root)
+    )
+
+
+# 从规划返回表达式提取直接来源表；解析失败由既有结果列校验处理，不在关联审计中猜测。
+def _get_plan_selected_source_tables(
+    query_plan: NaturalLanguageQueryPlan,
+    plan_aliases: dict[str, str],
+) -> set[str]:
+    selected_tables: set[str] = set()
+    for select_field in query_plan.select_fields:
+        try:
+            select_expression = parse_one(
+                f"SELECT {select_field.field}",
+                read="mysql",
+            )
+        except ParseError:
+            continue
+        normalized_expression = _normalize_column_table_aliases(
+            select_expression,
+            plan_aliases,
+        )
+        selected_tables.update(
+            column.table
+            for column in normalized_expression.find_all(exp.Column)
+            if column.table
+        )
+    return selected_tables
+
+
+# 逐项审计 SQL 是否落实规划关联，并要求共同产出结果字段的表在同一 SELECT 作用域内正确连接。
+def _validate_planned_join_implementation(
+    expression: exp.Expression,
+    query_plan: NaturalLanguageQueryPlan,
+) -> None:
+    if not query_plan.joins:
+        return
+    plan_aliases = {
+        alias.alias: alias.source_table
+        for alias in query_plan.aliases
+        if alias.source_table is not None
+    }
+    sql_aliases = _build_sql_alias_mapping(expression)
+    selected_source_tables = _get_plan_selected_source_tables(
+        query_plan,
+        plan_aliases,
+    )
+    normalized_joins: list[tuple[int, str, exp.Expression, set[str]]] = []
+    missing_joins: list[dict[str, Any]] = []
+    for join_index, planned_join in enumerate(query_plan.joins):
+        expected_condition = _normalize_column_table_aliases(
+            _parse_planned_join_condition(
+                planned_join.condition,
+                join_index,
+            ),
+            plan_aliases,
+        )
+        condition_tables = {
+            column.table
+            for column in expected_condition.find_all(exp.Column)
+            if column.table
+        }
+        normalized_joins.append(
+            (
+                join_index,
+                planned_join.condition,
+                expected_condition,
+                condition_tables,
+            )
+        )
+        if not _expression_contains_condition(
+            expression,
+            expected_condition,
+            sql_aliases,
+        ):
+            missing_joins.append(
+                {
+                    "join_index": join_index,
+                    "condition": planned_join.condition,
+                    "reason": planned_join.reason,
+                }
+            )
+    if missing_joins:
+        missing_conditions = [item["condition"] for item in missing_joins]
+        raise SqlValidationError(
+            code="planned_join_missing",
+            message="SQL 没有完整实现查询计划声明的跨表关联条件",
+            repair_action=(
+                "逐一补充以下缺失关联条件："
+                + "；".join(f"`{condition}`" for condition in missing_conditions)
+                + "。只补充这些字段关联，保留现有筛选、返回字段、分组、排序和分页不变。"
+            ),
+            details={"missing_joins": missing_joins},
+        )
+
+    wrong_scope_joins: list[dict[str, Any]] = []
+    select_expressions = list(expression.find_all(exp.Select))
+    for join_index, condition_text, expected_condition, condition_tables in normalized_joins:
+        if len(condition_tables) < 2 or not condition_tables.issubset(
+            selected_source_tables
+        ):
+            continue
+        result_scopes = [
+            select_expression
+            for select_expression in select_expressions
+            if condition_tables.issubset(
+                _get_select_projection_tables(
+                    select_expression,
+                    sql_aliases,
+                )
+            )
+        ]
+        if result_scopes and all(
+            _select_scope_contains_condition(
+                select_expression,
+                expected_condition,
+                sql_aliases,
+            )
+            for select_expression in result_scopes
+        ):
+            continue
+        wrong_scope_joins.append(
+            {
+                "join_index": join_index,
+                "condition": condition_text,
+                "source_tables": sorted(condition_tables),
+            }
+        )
+    if wrong_scope_joins:
+        scoped_conditions = [item["condition"] for item in wrong_scope_joins]
+        raise SqlValidationError(
+            code="planned_join_wrong_scope",
+            message="SQL 的关联条件没有约束实际共同产出结果字段的 SELECT",
+            repair_action=(
+                "在直接组合对应结果字段的同一 SELECT 中逐一落实以下关联条件："
+                + "；".join(f"`{condition}`" for condition in scoped_conditions)
+                + "。不能只把条件放在无关 CTE 或嵌套子查询中。"
+            ),
+            details={"wrong_scope_joins": wrong_scope_joins},
+        )
+
+
 # 校验相关子查询中的主体关联确实跨越内外层作用域，拒绝只关联两个内层表的伪相关条件。
 def _exists_contains_outer_correlation(
     exists_expression: exp.Exists,
@@ -1205,6 +1438,7 @@ def validate_sql_draft(
         expression,
         set(_get_plan_table_names(query_plan, allowed_table_names)),
     )
+    _validate_planned_join_implementation(expression, query_plan)
     _validate_quantified_condition_implementation(expression, draft, query_plan)
     _validate_external_filter_values_parameterized(expression)
     _validate_result_columns(expression, draft.result_columns, query_plan)

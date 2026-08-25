@@ -184,14 +184,15 @@ columns:
 2. 基础表集合与规划层声明完全一致，且全部属于业务域白名单。
 3. 禁止注释、分号、多语句、通配字段、锁、`SELECT INTO`、数据库限定名和高风险函数。
 4. WHERE、HAVING、JOIN 和嵌套量词子查询条件中的筛选标量必须使用命名占位符；只有 `EXISTS` 投影的 `SELECT 1` 与规划允许的分页整数例外，参数集合必须精确匹配。
-5. 每个规划返回字段必须声明稳定 `result_field`；SQL 必须使用同名 `AS` 别名，输出列名必须唯一，并与 `result_columns` 及规划顺序一致。
-6. `LIMIT` 和 `OFFSET` 必须精确服从规划结果；系统不会私自追加隐藏上限。
+5. 规划声明的每条 `joins` 关联必须由 SQL 实现；别名和等值比较方向允许不同，但共同提供结果字段的表必须在同一个结果 SELECT 中受该关联约束，不能由无关 CTE 或子查询冒充。
+6. 每个规划返回字段必须声明稳定 `result_field`；SQL 必须使用同名 `AS` 别名，输出列名必须唯一，并与 `result_columns` 及规划顺序一致。
+7. `LIMIT` 和 `OFFSET` 必须精确服从规划结果；系统不会私自追加隐藏上限。
 
 规划终态在 SQL 生成前还会校验：业务对齐采用的核心规则均引用了实际存在的计划组件；完整导出的 `limit` 为 `null`；`all`、`none` 的成员谓词没有被普通筛选提前删除；需要保留集合成员供动态转列时，`all` 与 `none` 使用 `NOT EXISTS` 独立确定主体资格；`pivot` 使用最终行主体的真实 ID 作为分组键，未被用户要求的技术 ID 必须隐藏。
 
-SQL AST 会对 `EXISTS`、`NOT EXISTS` 中的量词契约执行语义核对：成员条件或反条件、`collection_filters` 的全部集合范围、`correlation_condition` 的内外层主体关联必须同时出现在同一个正确极性的子查询中。关联校验会检查列限定符的作用域，两个内层别名之间的关联不能冒充与外层主体的相关条件。核对前将规划别名和 SQL 自选别名还原为真实表名，并把十进制数值归一化，因此 `1`、`1.0` 和 `1.0000` 被视为相同阈值；比较运算符方向错误仍会被拒绝。运动业务域进一步把全部项目完成固定为正向成员条件 `season_user_project.completion_progress >= 1`、唯一集合范围 `season_user_project.status = 1` 和关联条件 `season_user_project.season_user_id = season_user.id`，对应反例为 `< 1`。
+SQL AST 会对普通跨表关联和 `EXISTS`、`NOT EXISTS` 中的量词契约执行语义核对。普通关联先逐条对照规划，再检查共同产出结果字段的表是否在同一个 SELECT 作用域内受到关联约束，防止凭证、项目等一对多数据因漏写关联键产生错误组合。量词校验要求成员条件或反条件、`collection_filters` 的全部集合范围、`correlation_condition` 的内外层主体关联同时出现在同一个正确极性的子查询中；两个内层别名之间的关联不能冒充与外层主体的相关条件。核对前将规划别名和 SQL 自选别名还原为真实表名，并把十进制数值归一化，因此 `1`、`1.0` 和 `1.0000` 被视为相同阈值；比较运算符方向错误仍会被拒绝。运动业务域进一步把全部项目完成固定为正向成员条件 `season_user_project.completion_progress >= 1`、唯一集合范围 `season_user_project.status = 1` 和关联条件 `season_user_project.season_user_id = season_user.id`，对应反例为 `< 1`。
 
-校验通过后，命名参数编译为 asyncmy 参数绑定，在 `START TRANSACTION READ ONLY` 中执行，超时为 `10` 秒，最终始终回滚并关闭连接。数据库返回可修复的语法、未知或歧义字段、分组和子查询错误时，运行时会使用原 `submit_sql_query` 的 `tool_call_id` 返回脱敏失败结果，并在 SQL 生成预算内重试；连接、权限和超时错误直接交由系统处理，不要求模型改写 SQL。
+静态校验或数据库执行发现可修复错误时，运行时会使用原 `submit_sql_query` 的 `tool_call_id` 把错误类型、准确原因和唯一修复动作作为正常工具结果追加到当前 SQL 消息上下文。后续生成因此保留本次查询的短期修复记忆，并在 SQL 生成预算内重试；校验通过后，命名参数才编译为 asyncmy 参数绑定，在 `START TRANSACTION READ ONLY` 中执行，超时为 `10` 秒，最终始终回滚并关闭连接。连接、权限和超时错误直接交由系统处理，不要求模型改写 SQL。
 
 运行时会同时保留两份语义等价的已校验 SQL：一份将命名参数编译为 `%s` 并仅供 asyncmy 绑定执行；另一份保留 `:parameter_name` 并仅供后续 AST 来源分析。两者均来自同一份通过表白名单、只读、字段、参数和分页校验的 SQL 草稿，不会执行第二条查询。
 

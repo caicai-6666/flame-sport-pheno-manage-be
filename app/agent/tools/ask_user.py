@@ -20,9 +20,9 @@ class AskUserToolArguments(BaseModel):
 
 
 class UserInteraction(BaseModel):
-    """一次由模型发起、并由当前查询用户完成的澄清问答。"""
+    """一次由规划流程发起、并由当前查询用户完成的澄清或复核问答。"""
 
-    question: str = Field(description="模型提出的澄清问题")
+    question: str = Field(description="规划流程提出的澄清或复核问题")
     answer: str = Field(description="用户通过交互接口提交的回答")
 
 

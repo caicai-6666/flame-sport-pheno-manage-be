@@ -603,7 +603,10 @@ class QueryPlanningAbandonment(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reason_type: Literal[
-        "entity_not_found", "insufficient_information", "unsupported_scope"
+        "entity_not_found",
+        "insufficient_information",
+        "unsupported_scope",
+        "user_cancelled",
     ] = Field(description="规划放弃原因分类")
     user_message: str = Field(description="向用户展示的简洁原因与下一步建议")
     confirmed_facts: list[str] = Field(

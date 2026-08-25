@@ -116,6 +116,14 @@ class AgentQueryPipeline:
     def _request_clarification(self, question: str) -> str:
         return self._interaction_requester("clarification", question, ())
 
+    # 复核查询计划时只提供确认或修正选择，具体修正内容由后续独立澄清交互收集。
+    def _request_plan_review(self, question: str) -> str:
+        return self._interaction_requester(
+            "confirmation",
+            question,
+            ("确认并继续", "修正查询"),
+        )
+
     # 在对齐结果进入规划前强制请求用户确认，拒绝或修改不会消耗后续模型和数据库资源。
     def _confirm_alignment(self, aligned_question: str) -> bool:
         answer = self._interaction_requester(
@@ -203,6 +211,7 @@ class AgentQueryPipeline:
             settings=self._settings,
             schema_reader=schema_reader,
             user_input_reader=self._request_clarification,
+            plan_review_reader=self._request_plan_review,
             trace_writer=self._trace_writer,
             progress_emitter=self._progress_emitter,
         )

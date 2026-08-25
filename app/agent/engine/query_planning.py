@@ -75,6 +75,19 @@ from app.agent.tools.argument_feedback import (
 DEFAULT_MAX_GENERATION_COUNT = 6
 DEFAULT_MAX_TOOL_CALL_COUNT = 12
 MAX_TERMINAL_ARGUMENT_REPAIR_COUNT = 5
+PLAN_REVIEW_APPROVAL_ANSWERS = frozenset(
+    {"确认并继续", "确认", "继续", "是", "没问题", "yes", "y"}
+)
+PLAN_REVIEW_CANCELLATION_ANSWERS = frozenset(
+    {"取消查询", "取消", "停止查询", "不用了", "no", "n"}
+)
+PLAN_REVIEW_REVISION_ANSWERS = frozenset(
+    {"修正查询", "修正", "调整查询", "修改查询"}
+)
+PLAN_REVISION_QUESTION = (
+    "请说明需要怎样修正查询。您可以说明需要增加、删除或改名的字段，"
+    "也可以调整结果布局或返回范围。"
+)
 SchemaReader = Callable[[str], TableSchemaToolResponse]
 UserInputReader = Callable[[str], str]
 TraceWriter = Callable[[str], None]
@@ -93,6 +106,8 @@ def _validate_query_plan_contract(
     try:
         planning_payload = parse_yaml_context(planning_input)
     except ValueError:
+        return ()
+    if not isinstance(planning_payload, dict):
         return ()
     aligned_query = planning_payload.get("aligned_query")
     if not isinstance(aligned_query, dict):
@@ -337,7 +352,9 @@ class QueryPlanningAgentResult(BaseModel):
     data_inspections: list[TableDataInspectionResponse] = Field(
         description="按需读取的单表实际数据结果"
     )
-    user_interactions: list[UserInteraction] = Field(description="模型通过交互出口发起的澄清问答")
+    user_interactions: list[UserInteraction] = Field(
+        description="规划阶段通过交互出口完成的事实澄清和结果字段复核"
+    )
     query_plan: NaturalLanguageQueryPlan | None = Field(
         default=None, description="成功时只供 SQL 查询执行层消费的数据获取计划"
     )
@@ -511,6 +528,125 @@ def _build_planning_tool_choice(generation_count: int) -> str | dict[str, object
     return "required"
 
 
+# 按塑形计划解析最终可见表头，隐藏技术字段并把动态转列标题转换为用户可理解的范围。
+def _build_visible_result_labels(
+    query_plan: NaturalLanguageQueryPlan,
+    result_shape_plan: ResultShapePlan,
+) -> list[str]:
+    labels_by_result_field = {
+        field.result_field: field.purpose for field in query_plan.select_fields
+    }
+    visible_labels = [
+        labels_by_result_field.get(field_name, field_name)
+        for field_name in result_shape_plan.passthrough_fields
+    ]
+    if result_shape_plan.shape_type == "pivot":
+        assert result_shape_plan.column_label_pattern is not None
+        expected_columns = result_shape_plan.expected_pivot_columns
+        if expected_columns is not None and expected_columns <= 6:
+            visible_labels.extend(
+                result_shape_plan.column_label_pattern.replace("{index}", str(index))
+                for index in range(1, expected_columns + 1)
+            )
+        elif expected_columns is not None:
+            visible_labels.append(
+                result_shape_plan.column_label_pattern.replace(
+                    "{index}", f"1～{expected_columns}"
+                )
+            )
+        else:
+            visible_labels.append(
+                result_shape_plan.column_label_pattern.replace("{index}", "1、2、3……")
+            )
+    return visible_labels
+
+
+# 在 SSE 消息长度边界内尽量展示全部表头，字段过多时明确给出尚未展开的数量。
+def _render_bounded_result_labels(visible_labels: list[str]) -> str:
+    field_text = "、".join(visible_labels) or "无可见字段"
+    if len(field_text) <= 260:
+        return field_text
+
+    retained_labels: list[str] = []
+    retained_length = 0
+    for label in visible_labels:
+        additional_length = len(label) + (1 if retained_labels else 0)
+        if retained_length + additional_length > 220:
+            break
+        retained_labels.append(label)
+        retained_length += additional_length
+    omitted_count = len(visible_labels) - len(retained_labels)
+    return "、".join(retained_labels) + f"……（另有 {omitted_count} 个字段）"
+
+
+# 将已通过校验的双计划转换为短小的用户复核说明，只展示最终行粒度、可见字段和返回范围。
+def _build_query_plan_review_question(
+    query_plan: NaturalLanguageQueryPlan,
+    result_shape_plan: ResultShapePlan,
+) -> str:
+    field_text = _render_bounded_result_labels(
+        _build_visible_result_labels(query_plan, result_shape_plan)
+    )
+
+    row_granularity = result_shape_plan.result_row_granularity.strip()
+    if len(row_granularity) > 80:
+        row_granularity = row_granularity[:77] + "……"
+    result_scope = (
+        f"最多返回 {query_plan.pagination.limit} 行"
+        if query_plan.pagination.limit is not None
+        else "返回全部符合条件的数据"
+    )
+    return (
+        "查询方案已准备好。\n"
+        f"每行代表：{row_granularity}\n"
+        f"结果字段：{field_text}\n"
+        f"返回范围：{result_scope}\n"
+        "请选择‘确认并继续’或‘修正查询’。"
+    )
+
+
+# 判断规划复核答案是否为受支持的肯定表达，避免把快捷确认再次交给模型消耗生成次数。
+def _is_query_plan_review_approved(answer: str) -> bool:
+    return answer.strip().lower() in PLAN_REVIEW_APPROVAL_ANSWERS
+
+
+# 判断规划复核答案是否明确要求停止，其他自由文本统一作为计划修订意见处理。
+def _is_query_plan_review_cancelled(answer: str) -> bool:
+    return answer.strip().lower() in PLAN_REVIEW_CANCELLATION_ANSWERS
+
+
+# 判断用户是否选择进入独立修正说明步骤，使固定选项和自由文本不会混在同一次交互中。
+def _is_query_plan_revision_requested(answer: str) -> bool:
+    return answer.strip().lower() in PLAN_REVIEW_REVISION_ANSWERS
+
+
+# 把用户的字段修改意见作为原终止工具的正常结果回传，使模型在完整原上下文中修订双计划。
+def _build_query_plan_revision_message(
+    tool_call_id: str,
+    review_question: str,
+    user_feedback: str,
+) -> dict[str, str]:
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call_id,
+        "content": render_yaml_context(
+            {
+                "status": "revision_requested",
+                "result": {
+                    "message": "用户尚未确认当前查询方案，需要根据反馈修订后重新提交。",
+                    "previous_result_preview": review_question,
+                    "user_feedback": user_feedback,
+                    "next_action": (
+                        "保留未被反馈否定的既有查询口径，根据用户反馈修订 query_plan "
+                        "和 result_shape_plan；必要时继续读取表结构或澄清事实，"
+                        "然后重新调用 execute_natural_language_query。"
+                    ),
+                },
+            }
+        ),
+    }
+
+
 class DeepSeekQueryPlanningAgent:
     """在工具循环中按需读取表结构，直到生成最终联合查询自然语言。"""
 
@@ -522,6 +658,7 @@ class DeepSeekQueryPlanningAgent:
         domain_profile: QueryDomainProfile,
         schema_reader: SchemaReader,
         user_input_reader: UserInputReader = _raise_missing_user_interaction,
+        plan_review_reader: UserInputReader | None = None,
         trace_writer: TraceWriter | None = None,
         data_inspector: DataInspector | None = None,
         inspection_page_reader: InspectionPageReader | None = None,
@@ -534,6 +671,7 @@ class DeepSeekQueryPlanningAgent:
         self._allowed_tables = frozenset(domain_profile.allowed_tables)
         self._schema_reader = schema_reader
         self._user_input_reader = user_input_reader
+        self._plan_review_reader = plan_review_reader or user_input_reader
         self._trace_writer = trace_writer
         self._data_inspector = data_inspector
         self._inspection_page_reader = inspection_page_reader
@@ -558,6 +696,7 @@ class DeepSeekQueryPlanningAgent:
         settings: Settings | None = None,
         schema_reader: SchemaReader | None = None,
         user_input_reader: UserInputReader = _raise_missing_user_interaction,
+        plan_review_reader: UserInputReader | None = None,
         trace_writer: TraceWriter | None = None,
         progress_emitter: ProgressEmitter | None = None,
     ) -> "DeepSeekQueryPlanningAgent":
@@ -590,6 +729,7 @@ class DeepSeekQueryPlanningAgent:
             domain_profile=domain_profile,
             schema_reader=schema_reader,
             user_input_reader=user_input_reader,
+            plan_review_reader=plan_review_reader,
             trace_writer=trace_writer,
             data_inspector=data_inspector.inspect,
             inspection_page_reader=data_inspector.get_next_page,
@@ -977,6 +1117,57 @@ class DeepSeekQueryPlanningAgent:
                         "查询规划最终工具参数连续违反业务域规则",
                         raw_responses,
                     )
+                review_question = _build_query_plan_review_question(
+                    query_arguments.query_plan,
+                    query_arguments.result_shape_plan,
+                )
+                review_interaction = UserInteraction(
+                    question=review_question,
+                    answer=self._plan_review_reader(review_question),
+                )
+                user_interactions.append(review_interaction)
+                if _is_query_plan_review_cancelled(review_interaction.answer):
+                    return {
+                        "result": QueryPlanningAgentResult(
+                            status="abandoned",
+                            abandonment=QueryPlanningAbandonment(
+                                reason_type="user_cancelled",
+                                user_message="用户取消了本次查询。",
+                                confirmed_facts=[],
+                            ),
+                            thoughts=thoughts,
+                            schema_results=schema_results,
+                            data_inspections=data_inspections,
+                            user_interactions=user_interactions,
+                            raw_responses=raw_responses,
+                            generation_count=generation_count,
+                            max_generation_count=max_generation_count,
+                            tool_call_count=tool_call_count,
+                            max_tool_call_count=max_tool_call_count,
+                        )
+                    }
+                if not _is_query_plan_review_approved(review_interaction.answer):
+                    revision_feedback = review_interaction.answer
+                    if _is_query_plan_revision_requested(review_interaction.answer):
+                        revision_interaction = UserInteraction(
+                            question=PLAN_REVISION_QUESTION,
+                            answer=self._user_input_reader(PLAN_REVISION_QUESTION),
+                        )
+                        user_interactions.append(revision_interaction)
+                        revision_feedback = revision_interaction.answer
+                    revision_message = _build_query_plan_revision_message(
+                        final_query_call.id,
+                        review_question,
+                        revision_feedback,
+                    )
+                    messages.append(revision_message)
+                    self._progress_reporter.plan_revision_started()
+                    self._write_trace(
+                        "\n----- 查询规划用户复核结果 -----\n"
+                        f"tool_call_id: {final_query_call.id}\n"
+                        "result: 用户要求修订已通过校验的查询方案"
+                    )
+                    continue
                 return {
                     "result": QueryPlanningAgentResult(
                         status="success",
