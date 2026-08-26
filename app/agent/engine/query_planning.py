@@ -1114,6 +1114,7 @@ class DeepSeekQueryPlanningAgent:
                     + self._domain_profile.validate_query_plan(
                         state["user_question"],
                         query_arguments.query_plan,
+                        query_arguments.result_shape_plan,
                     )
                 )
                 if policy_issues:

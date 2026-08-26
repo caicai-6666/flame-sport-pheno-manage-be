@@ -25,7 +25,7 @@ class AlignmentPolicyIssue:
 
 
 QueryPlanValidator = Callable[
-    [str, object],
+    [str, object, object | None],
     tuple[QueryPlanPolicyIssue, ...],
 ]
 AlignmentValidator = Callable[
@@ -110,15 +110,20 @@ class QueryDomainProfile:
                 f"业务域 {self.key} 缺少配置文件：" + "、".join(missing_files)
             )
 
-    # 在终止工具成功解析后执行业务域约束，无自定义校验器时直接通过。
+    # 在终止工具成功解析后联合校验数据获取与结果塑形契约，无自定义校验器时直接通过。
     def validate_query_plan(
         self,
         planning_input: str,
         query_plan: object,
+        result_shape_plan: object | None = None,
     ) -> tuple[QueryPlanPolicyIssue, ...]:
         if self.query_plan_validator is None:
             return ()
-        return self.query_plan_validator(planning_input, query_plan)
+        return self.query_plan_validator(
+            planning_input,
+            query_plan,
+            result_shape_plan,
+        )
 
     # 在业务对齐终止工具成功解析后检查领域交付约束，避免语义完整但无法落地的需求进入规划层。
     def validate_alignment(

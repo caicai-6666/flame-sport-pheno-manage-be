@@ -151,6 +151,7 @@ def validate_rewards_alignment(
 def validate_rewards_query_plan(
     planning_input: str,
     query_plan: object,
+    result_shape_plan: object | None = None,
 ) -> tuple[QueryPlanPolicyIssue, ...]:
     if not isinstance(query_plan, NaturalLanguageQueryPlan):
         return (

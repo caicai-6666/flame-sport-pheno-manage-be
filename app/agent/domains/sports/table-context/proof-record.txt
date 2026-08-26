@@ -7,7 +7,7 @@ QUERY_INVARIANTS:
 - `proof_record.status = 1` 表示当前正常有效凭证；查询用户当前凭证明细、初审或终审结果、拒绝原因、有效打卡或进度贡献时默认必须筛选此条件。
 - `status = 0` 表示已作废、删除或被重传替换的旧凭证；只有用户明确要求审核历史、作废记录或重传前记录时才可包含。
 - `review_status` 描述审核生命周期，不能替代 `status`：`pending` 待初审，`preliminary_approved` 初审通过，`preliminary_rejected` 初审失败，`approved` 终审通过，`rejected` 终审失败。
-- 查询结果需要查看或返回凭证图片时，`select_fields` 必须包含 `proof_record.id`，供前端调用图片安全中转接口；图片要求只是对用户原有返回内容的附加要求，不得替代用户已经要求的凭证明细；不得返回内部存储路径 `proof_record.image_url`。
+- 只要查询结果一行代表一条凭证，`select_fields` 就必须包含 `proof_record.id`，并固定使用 `result_field=proof_record_id`、`purpose=凭证记录 ID`；普通透传表格必须把该字段作为可见列，供前端定位凭证及按需调用图片安全中转接口。图片要求只是对用户原有返回内容的附加要求，不得替代用户已经要求的凭证明细；不得返回内部存储路径 `proof_record.image_url`。
 RELATIONSHIPS:
 - season_user: many-to-one。多条运动凭证可以属于同一条赛季参与记录；每条凭证属于一个赛季参与用户。
 - project: many-to-one。多条运动凭证可以对应同一个运动项目；每条凭证对应一个项目。

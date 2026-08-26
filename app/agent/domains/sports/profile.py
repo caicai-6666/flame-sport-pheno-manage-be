@@ -93,6 +93,11 @@ SPORTS_QUERY_PROFILE = QueryDomainProfile(
         "只有用户明确表示只需要凭证标识时，才将查询主体对齐为凭证标识。"
     ),
     planning_prompt_instructions=(
+        "只要根查询块的一行代表一条运动凭证，即 grain_fields 可追溯到 "
+        "`proof_record.id`，无论用户是否明确要求图片，都必须在根块 select_fields "
+        "中返回 `proof_record.id`，并固定使用 `result_field=proof_record_id`、"
+        "`purpose=凭证记录 ID`；passthrough 结果还必须把 proof_record_id 作为可见列，"
+        "不能放入 hidden_fields。该稳定键供前端定位凭证和按需读取图片。\n\n"
         "当对齐需求包含查看凭证关联图片时，凭证唯一标识是对原有返回内容的附加要求，"
         "不是替代项。必须保留用户原问题和对齐需求中已经要求的其他返回内容；"
         "只有对齐需求明确只要求凭证标识时，才可以生成只返回标识的查询计划。\n\n"

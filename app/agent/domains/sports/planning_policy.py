@@ -4,7 +4,7 @@ import re
 from typing import Final
 
 from app.agent.domains.base import AlignmentPolicyIssue, QueryPlanPolicyIssue
-from app.agent.tools.query_plan import NaturalLanguageQueryPlan
+from app.agent.tools.query_plan import NaturalLanguageQueryPlan, ResultShapePlan
 
 
 PROOF_IMAGE_TERMS: Final[tuple[str, ...]] = ("图片", "图像", "影像", "照片", "截图")
@@ -42,6 +42,8 @@ PROOF_IMAGE_IDENTIFIER_TERMS: Final[tuple[str, ...]] = (
     "记录唯一标识",
     "记录标识",
 )
+PROOF_RECORD_RESULT_FIELD: Final[str] = "proof_record_id"
+PROOF_RECORD_DISPLAY_LABEL: Final[str] = "凭证记录 ID"
 
 
 # 判断对齐后的需求是否要查看运动凭证图片，同时避免把头像或项目图标误判为凭证图片。
@@ -64,7 +66,8 @@ def _requests_proof_record_detail(planning_input: str) -> bool:
 # 判断规划是否只返回凭证主键；该判断不限制主体应返回哪些具体明细字段。
 def _returns_only_proof_record_id(query_plan: NaturalLanguageQueryPlan) -> bool:
     return bool(query_plan.select_fields) and all(
-        _references_field(select_field.field, "proof_record", "id")
+        _resolve_sports_field_origin(select_field.field, query_plan)
+        == "proof_record.id"
         for select_field in query_plan.select_fields
     )
 
@@ -193,10 +196,20 @@ def _is_valid_completion_correlation(
     }
 
 
-# 禁止暴露凭证内部图片路径；需要图片时强制返回可供安全中转接口使用的凭证主键。
+# 根据根查询块的粒度字段识别逐条凭证明细，避免依赖用户是否额外说出“图片”。
+def _returns_proof_record_rows(query_plan: NaturalLanguageQueryPlan) -> bool:
+    return any(
+        _resolve_sports_field_origin(grain_field, query_plan)
+        == "proof_record.id"
+        for grain_field in query_plan.root_block.grain_fields
+    )
+
+
+# 禁止暴露凭证内部图片路径；逐条凭证明细始终返回前端可识别的稳定凭证主键。
 def validate_sports_query_plan(
     planning_input: str,
     query_plan: object,
+    result_shape_plan: object | None = None,
 ) -> tuple[QueryPlanPolicyIssue, ...]:
     if not isinstance(query_plan, NaturalLanguageQueryPlan):
         return (
@@ -212,11 +225,20 @@ def validate_sports_query_plan(
         f"query_plan.query_blocks[{query_plan.root_block_id}].select_fields"
     )
     has_proof_record_id = any(
-        _references_field(select_field.field, "proof_record", "id")
+        _resolve_sports_field_origin(select_field.field, query_plan)
+        == "proof_record.id"
         for select_field in query_plan.select_fields
     )
+    proof_record_id_fields = [
+        (field_index, select_field)
+        for field_index, select_field in enumerate(query_plan.select_fields)
+        if _resolve_sports_field_origin(select_field.field, query_plan)
+        == "proof_record.id"
+    ]
+    returns_proof_record_rows = _returns_proof_record_rows(query_plan)
     has_proof_record_image_url = any(
-        _references_field(select_field.field, "proof_record", "image_url")
+        _resolve_sports_field_origin(select_field.field, query_plan)
+        == "proof_record.image_url"
         for select_field in query_plan.select_fields
     )
 
@@ -235,18 +257,80 @@ def validate_sports_query_plan(
             )
         )
 
-    if _requests_proof_record_image(planning_input) and not has_proof_record_id:
+    if returns_proof_record_rows and not has_proof_record_id:
         issues.append(
             QueryPlanPolicyIssue(
                 field_path=root_select_field_path,
                 message=(
-                    "用户要求查看运动凭证图片，"
+                    "根查询块以 proof_record.id 作为逐条凭证明细粒度，"
                     "但返回字段缺少 proof_record.id。"
                 ),
                 repair_action=(
+                    "从读取 proof_record 的查询块开始输出 proof_record.id，并沿 "
+                    "input_blocks 逐级透传到根查询块；根块字段固定使用 "
+                    "result_field=proof_record_id、purpose=凭证记录 ID。逐条凭证查询"
+                    "无论用户是否明确要求图片都必须返回该字段。"
+                ),
+            )
+        )
+    elif _requests_proof_record_image(planning_input) and not has_proof_record_id:
+        issues.append(
+            QueryPlanPolicyIssue(
+                field_path=root_select_field_path,
+                message=(
+                    "用户要求查看运动凭证图片，但返回字段缺少 proof_record.id。"
+                ),
+                repair_action=(
                     f"在查询块 {query_plan.root_block_id} 的 select_fields 中添加 "
-                    "field 为 proof_record.id "
-                    "的返回字段，供前端调用凭证图片安全中转接口。"
+                    "field=proof_record.id、result_field=proof_record_id、"
+                    "purpose=凭证记录 ID 的返回字段。"
+                ),
+            )
+        )
+
+    for field_index, select_field in proof_record_id_fields:
+        select_field_path = f"{root_select_field_path}[{field_index}]"
+        if select_field.result_field != PROOF_RECORD_RESULT_FIELD:
+            issues.append(
+                QueryPlanPolicyIssue(
+                    field_path=f"{select_field_path}.result_field",
+                    message=(
+                        "proof_record.id 的稳定结果键必须为 proof_record_id，"
+                        f"当前为 {select_field.result_field}。"
+                    ),
+                    repair_action=(
+                        "将该字段的 result_field 精确改为 proof_record_id，并同步替换 "
+                        "result_shape_plan 中对旧结果键的全部引用。"
+                    ),
+                )
+            )
+        if select_field.purpose != PROOF_RECORD_DISPLAY_LABEL:
+            issues.append(
+                QueryPlanPolicyIssue(
+                    field_path=f"{select_field_path}.purpose",
+                    message=(
+                        "proof_record.id 的展示表头必须为“凭证记录 ID”，"
+                        f"当前为“{select_field.purpose}”。"
+                    ),
+                    repair_action="将该字段的 purpose 精确改为“凭证记录 ID”。",
+                )
+            )
+
+    if (
+        returns_proof_record_rows
+        and isinstance(result_shape_plan, ResultShapePlan)
+        and result_shape_plan.shape_type == "passthrough"
+        and PROOF_RECORD_RESULT_FIELD not in result_shape_plan.passthrough_fields
+    ):
+        issues.append(
+            QueryPlanPolicyIssue(
+                field_path="result_shape_plan.passthrough_fields",
+                message=(
+                    "逐条凭证明细的凭证记录 ID 没有进入最终可见结果列。"
+                ),
+                repair_action=(
+                    "将 proof_record_id 加入 result_shape_plan.passthrough_fields，"
+                    "并从 hidden_fields 中删除该字段。"
                 ),
             )
         )
