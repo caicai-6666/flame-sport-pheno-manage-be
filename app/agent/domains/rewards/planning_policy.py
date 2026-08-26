@@ -3,7 +3,11 @@
 import re
 from typing import Final
 
-from app.agent.domains.base import AlignmentPolicyIssue, QueryPlanPolicyIssue
+from app.agent.domains.base import (
+    AlignmentLogicalConstraintView,
+    AlignmentPolicyIssue,
+    QueryPlanPolicyIssue,
+)
 from app.agent.tools.query_plan import NaturalLanguageQueryPlan
 
 
@@ -124,7 +128,10 @@ def validate_rewards_alignment(
     original_question: str,
     aligned_question: str,
     business_constraints: tuple[str, ...],
+    applied_business_rules: tuple[str, ...] = (),
+    logical_constraints: tuple[AlignmentLogicalConstraintView, ...] = (),
 ) -> tuple[AlignmentPolicyIssue, ...]:
+    del applied_business_rules, logical_constraints
     if not _has_ambiguous_point_scope(original_question):
         return ()
 

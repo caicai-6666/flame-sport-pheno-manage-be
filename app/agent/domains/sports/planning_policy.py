@@ -3,7 +3,11 @@
 import re
 from typing import Final
 
-from app.agent.domains.base import AlignmentPolicyIssue, QueryPlanPolicyIssue
+from app.agent.domains.base import (
+    AlignmentLogicalConstraintView,
+    AlignmentPolicyIssue,
+    QueryPlanPolicyIssue,
+)
 from app.agent.tools.query_plan import NaturalLanguageQueryPlan, ResultShapePlan
 
 
@@ -44,6 +48,8 @@ PROOF_IMAGE_IDENTIFIER_TERMS: Final[tuple[str, ...]] = (
 )
 PROOF_RECORD_RESULT_FIELD: Final[str] = "proof_record_id"
 PROOF_RECORD_DISPLAY_LABEL: Final[str] = "凭证记录 ID"
+FORMAL_PARTICIPATION_RULE: Final[str] = "formal_participation"
+COMPLETE_CHALLENGE_RULE: Final[str] = "complete_challenge"
 
 
 # 判断对齐后的需求是否要查看运动凭证图片，同时避免把头像或项目图标误判为凭证图片。
@@ -72,33 +78,85 @@ def _returns_only_proof_record_id(query_plan: NaturalLanguageQueryPlan) -> bool:
     )
 
 
-# 校验业务对齐是否保留凭证图片需求的可执行交付方式，避免只保留“查看图片”而丢失凭证定位信息。
+# 判断业务约束是否描述用户的锁定项目集合，避免把凭证数量等其他 exactly 约束误判为赛季配置数量。
+def _is_locked_project_constraint(
+    constraint: AlignmentLogicalConstraintView,
+) -> bool:
+    collection = constraint.collection
+    return "项目" in collection and any(term in collection for term in ("锁定", "有效"))
+
+
+# 找出在“正式参与且全部完成”语义下重复表达赛季要求数量的 exactly 约束。
+def _find_redundant_locked_project_counts(
+    applied_business_rules: tuple[str, ...],
+    logical_constraints: tuple[AlignmentLogicalConstraintView, ...],
+) -> list[tuple[int, int]]:
+    required_rules = {FORMAL_PARTICIPATION_RULE, COMPLETE_CHALLENGE_RULE}
+    if not required_rules.issubset(applied_business_rules):
+        return []
+    redundant_constraints: list[tuple[int, int]] = []
+    for index, constraint in enumerate(logical_constraints):
+        constraint_count = constraint.count
+        if (
+            constraint.quantifier == "exactly"
+            and isinstance(constraint_count, int)
+            and _is_locked_project_constraint(constraint)
+        ):
+            redundant_constraints.append((index, constraint_count))
+    return redundant_constraints
+
+
+# 校验业务对齐既保留凭证图片交付标识，也把固定锁定数量与全部完成量词规范为互不重复的语义。
 def validate_sports_alignment(
     original_question: str,
     aligned_question: str,
     business_constraints: tuple[str, ...],
+    applied_business_rules: tuple[str, ...] = (),
+    logical_constraints: tuple[AlignmentLogicalConstraintView, ...] = (),
 ) -> tuple[AlignmentPolicyIssue, ...]:
-    if not _requests_proof_record_image(original_question):
-        return ()
-
+    issues: list[AlignmentPolicyIssue] = []
     aligned_text = "\n".join((aligned_question, *business_constraints))
-    if any(term in aligned_text for term in PROOF_IMAGE_IDENTIFIER_TERMS):
-        return ()
+    if _requests_proof_record_image(original_question) and not any(
+        term in aligned_text for term in PROOF_IMAGE_IDENTIFIER_TERMS
+    ):
+        issues.append(
+            AlignmentPolicyIssue(
+                field_path="aligned_request.aligned_question",
+                message=(
+                    "用户要求查看运动凭证关联图片，但对齐结果没有明确保留"
+                    "每条凭证的唯一标识。"
+                ),
+                repair_action=(
+                    "在 aligned_question 或 business_constraints 中明确写入："
+                    "保留每条凭证的唯一标识，后续根据该标识查看图片；"
+                    "不得写成返回图片内容或图片地址。"
+                ),
+            )
+        )
 
-    return (
-        AlignmentPolicyIssue(
-            field_path="aligned_request.aligned_question",
-            message=(
-                "用户要求查看运动凭证关联图片，但对齐结果没有明确保留"
-                "每条凭证的唯一标识。"
-            ),
-            repair_action=(
-                "在 aligned_question 或 business_constraints 中明确写入："
-                "保留每条凭证的唯一标识，后续根据该标识查看图片；"
-                "不得写成返回图片内容或图片地址。"
-            ),
-        ),
-    )
+    for constraint_index, required_count in _find_redundant_locked_project_counts(
+        applied_business_rules,
+        logical_constraints,
+    ):
+        issues.append(
+            AlignmentPolicyIssue(
+                field_path=(
+                    f"aligned_request.logical_constraints[{constraint_index}]"
+                ),
+                message=(
+                    "正式参与且完全完成挑战时，锁定项目数量由赛季要求决定；"
+                    f"当前 exactly(count={required_count}) 与正式参与和全部完成语义重复。"
+                ),
+                repair_action=(
+                    f"删除 logical_constraints[{constraint_index}] 这条 exactly 约束；"
+                    "针对项目完成语义，只保留或新增一条 quantifier=all、count=null 的"
+                    "全部有效锁定项目完成约束，其他无关约束保持不变；"
+                    "在 business_constraints 中新增"
+                    f"‘赛季要求锁定项目数量为 {required_count} 项’。"
+                ),
+            )
+        )
+    return tuple(issues)
 
 
 # 识别返回字段表达式是否引用指定原始字段，兼容后续 SQL 生成所需的别名描述。
@@ -394,12 +452,23 @@ def validate_sports_query_plan(
             )
         if condition.quantifier != "all" or not references_completion_progress:
             continue
-        if (
-            condition.implementation_hint in {"exists", "not_exists", "subquery"}
-            and not _is_valid_completion_correlation(
+        if condition.implementation_hint != "not_exists":
+            issues.append(
+                QueryPlanPolicyIssue(
+                    field_path=f"{condition_path}.implementation_hint",
+                    message=(
+                        "全部项目完成必须通过排除未完成反例实现，当前实现方式不是 not_exists。"
+                    ),
+                    repair_action=(
+                        "将 implementation_hint 精确改为 not_exists；"
+                        "将 correlation_condition 设为 season_user_project.season_user_id "
+                        "与当前查询块 subject_key 对应的 season_user.id 来源字段相等。"
+                    ),
+                )
+            )
+        elif not _is_valid_completion_correlation(
                 condition.correlation_condition,
                 query_plan,
-            )
         ):
             issues.append(
                 QueryPlanPolicyIssue(
@@ -420,7 +489,22 @@ def validate_sports_query_plan(
                     ),
                 )
             )
-        if condition.implementation_hint in {"exists", "not_exists", "subquery"}:
+        if block.group_by or block.aggregations or block.having:
+            issues.append(
+                QueryPlanPolicyIssue(
+                    field_path=f"query_plan.query_blocks[{block.block_id}]",
+                    message=(
+                        "承载全部项目完成资格的查询块又声明了 GROUP BY、聚合或 HAVING，"
+                        "与 NOT EXISTS 反例排除形成重复资格口径。"
+                    ),
+                    repair_action=(
+                        f"清空查询块 {block.block_id} 的 group_by、aggregations 和 having；"
+                        "该块只使用 not_exists 判定全部完成。若最终结果还需要聚合，"
+                        "新增一个读取该资格块的后续 aggregation 或 result 查询块。"
+                    ),
+                )
+            )
+        if condition.implementation_hint == "not_exists":
             outer_member_join_indexes = [
                 join_index
                 for join_index, join in enumerate(block.joins)

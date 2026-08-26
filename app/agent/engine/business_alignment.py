@@ -899,6 +899,8 @@ class BusinessAlignmentSubgraph:
                         state["user_question"],
                         aligned_request.aligned_question,
                         tuple(aligned_request.business_constraints),
+                        tuple(aligned_request.applied_business_rules),
+                        tuple(aligned_request.logical_constraints),
                     )
                     if alignment_issues:
                         raise BusinessAlignmentPolicyError(alignment_issues)

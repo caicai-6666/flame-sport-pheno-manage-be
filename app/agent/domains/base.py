@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Callable, Mapping
+from typing import Callable, Mapping, Protocol
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,12 +24,26 @@ class AlignmentPolicyIssue:
     repair_action: str
 
 
+class AlignmentLogicalConstraintView(Protocol):
+    """声明领域对齐校验实际读取的集合约束字段，避免反向依赖对齐引擎模型。"""
+
+    collection: str
+    quantifier: str
+    count: int | None
+
+
 QueryPlanValidator = Callable[
     [str, object, object | None],
     tuple[QueryPlanPolicyIssue, ...],
 ]
 AlignmentValidator = Callable[
-    [str, str, tuple[str, ...]],
+    [
+        str,
+        str,
+        tuple[str, ...],
+        tuple[str, ...],
+        tuple[AlignmentLogicalConstraintView, ...],
+    ],
     tuple[AlignmentPolicyIssue, ...],
 ]
 
@@ -131,6 +145,8 @@ class QueryDomainProfile:
         original_question: str,
         aligned_question: str,
         business_constraints: tuple[str, ...],
+        applied_business_rules: tuple[str, ...] = (),
+        logical_constraints: tuple[AlignmentLogicalConstraintView, ...] = (),
     ) -> tuple[AlignmentPolicyIssue, ...]:
         if self.alignment_validator is None:
             return ()
@@ -138,6 +154,8 @@ class QueryDomainProfile:
             original_question,
             aligned_question,
             business_constraints,
+            applied_business_rules,
+            logical_constraints,
         )
 
 
