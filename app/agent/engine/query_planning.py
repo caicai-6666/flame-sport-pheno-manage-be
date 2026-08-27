@@ -230,21 +230,6 @@ def _validate_query_plan_contract(
                     ),
                 )
             )
-        if condition.implementation_hint == "having" and not block.having:
-            issues.append(
-                QueryPlanPolicyIssue(
-                    field_path=condition_path,
-                    message=(
-                        f"该量化条件声明使用 having，但查询块 {block.block_id} 的 having 为空。"
-                    ),
-                    repair_action=(
-                        f"在查询块 {block.block_id} 的 having 中加入落实该量化条件的"
-                        "聚合后筛选表达式；"
-                        "如果实际不用 HAVING，则把 implementation_hint 改为真实实现方式。"
-                    ),
-                )
-            )
-
     presentation_requirements = aligned_query.get("presentation_requirements")
     required_layouts = {
         item.get("layout")

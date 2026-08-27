@@ -65,6 +65,7 @@ class SettlementPendingFinalReviewProof:
     created_at: datetime
     proof_date: date
     note: str | None
+    preliminary_review_comment: str | None
     review_comment: str | None
 
 
@@ -476,6 +477,7 @@ async def fetch_settlement_pending_final_review_proofs(
                 proof_record.created_at,
                 proof_record.proof_date,
                 proof_record.note,
+                proof_record.preliminary_review_comment,
                 proof_record.review_comment
             FROM proof_record
             INNER JOIN season_user
@@ -505,6 +507,11 @@ async def fetch_settlement_pending_final_review_proofs(
             created_at=row["created_at"],
             proof_date=row["proof_date"],
             note=str(row["note"]) if row["note"] is not None else None,
+            preliminary_review_comment=(
+                str(row["preliminary_review_comment"])
+                if row["preliminary_review_comment"] is not None
+                else None
+            ),
             review_comment=(
                 str(row["review_comment"])
                 if row["review_comment"] is not None

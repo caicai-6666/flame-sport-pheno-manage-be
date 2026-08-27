@@ -209,7 +209,7 @@ Authorization: Bearer <access-token>
 | 客户端后端 | `CLIENT_BACKEND_BASE_URL`、`CLIENT_BACKEND_TIMEOUT_SECONDS` | 内部管理接口基础地址和超时 |
 | 图片缓存 | `IMAGE_CACHE_SECONDS` | 可缓存图片中转响应的私有缓存秒数 |
 | DeepSeek | `DEEPSEEK_*` | OpenAI 兼容模型连接及查询各阶段单次输出预算；仅创建查询后调用 |
-| 查询智能体 | `AGENT_QUERY_*` | 生成与工具预算、活动会话、事件历史、会话保留和 SSE 心跳 |
+| 查询智能体 | `AGENT_QUERY_*` | 生成与工具预算、活动会话、事件历史、会话保留、SSE 心跳和脱敏诊断日志 |
 
 业务日期统一使用 `Asia/Shanghai`。容器时区也固定为该值，但日期边界相关代码仍显式指定时区，不依赖宿主机默认配置。
 

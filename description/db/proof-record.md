@@ -9,8 +9,7 @@
 
 当前设计中，一次上传只对应一张图片，因此图片路径直接存储在本表中，不单独设计图片文件表。
 
-本表不单独存储 BMI。  
-减重挑战中，BMI 应根据用户表中的身高和体重凭证中的体重信息计算得到，不作为通用凭证字段存储。
+本表不单独存储 BMI。需要 BMI 或其他派生指标的阶段型挑战，由用户在月初凭证备注中提供对应指标或完整原始数据；初审依据项目规则生成可供月末审核复用的基线意见。
 
 ---
 
@@ -26,7 +25,8 @@
 | note           | VARCHAR(255)     |       否 |        NULL | 用户备注                               |
 | proof_date     | DATE             |       是 |          无 | 凭证对应的实际运动日期                 |
 | review_status  | VARCHAR(32)      |       是 |     pending | 初审与终审状态                         |
-| review_comment | VARCHAR(500)     |       否 |        NULL | 初审或终审的审核说明，终审时可覆盖初审意见 |
+| review_comment | VARCHAR(500)     |       否 |        NULL | 管理员终审意见，初审不得写入 |
+| preliminary_review_comment | VARCHAR(500) | 否 | NULL | 大模型初审意见，终审不得覆盖；月末审核可作为同项目月初基线 |
 | progress_delta | DECIMAL(5,4) | 是 | 0.0000 | 大模型初审给出的原始项目进度增量 |
 | increase       | DECIMAL(5,4) | 是 | 0.0000 | 当前凭证实际分配到项目进度条的贡献 |
 | status         | TINYINT UNSIGNED |       是 |           1 | 记录状态：`1` 正常，`0` 无效/删除      |
@@ -247,9 +247,9 @@ completion_progress <= 1.0000
 
 ### review_comment
 
-审核评论。
+管理员终审意见。
 
-该字段用于保存模型初审或管理员终审的审核说明、判断依据或拒绝原因。管理员终审时可以覆盖初审意见。
+该字段仅由管理员终审流程写入，初审不得写入。客户端响应中的 `reviewComment` 不是该列的直接映射：初审状态返回 `preliminary_review_comment`，终审状态才返回本字段，因此数据库职责拆分不会破坏既有接口字段名。
 
 示例：
 ```text
@@ -260,7 +260,17 @@ completion_progress <= 1.0000
 
 该字段允许为空。
 
-原因是待初审记录通常还没有审核评论；初审或终审通过时也可能不需要额外说明。
+待初审和仅完成初审的记录必须保持该字段为空；终审流程允许不填写额外说明，因此终审状态下也可以为空。
+
+---
+
+### preliminary_review_comment
+
+大模型初审意见。
+
+初审完成时只写入该字段；终审不得修改它。所有使用月初、月末凭证类型的阶段型项目都共用该字段：月末初审读取同赛季、同项目有效月初记录的初审意见，避免终审流程影响阶段基线上下文。
+
+重传会将该字段与 `review_comment` 一并清空，确保新版本不会复用旧初审结论。字段允许为空，兼容待初审记录和上线前已终审的历史记录；后者不自动从可能被覆盖的 `review_comment` 推断月初基线。
 
 ---
 
@@ -308,7 +318,8 @@ CREATE TABLE proof_record (
   note VARCHAR(255) DEFAULT NULL COMMENT '用户备注',
   proof_date DATE NOT NULL COMMENT '凭证对应的实际运动日期',
   review_status VARCHAR(32) NOT NULL DEFAULT 'pending' COMMENT '审核状态：pending待初审，preliminary_approved初审通过，preliminary_rejected初审失败，approved终审通过，rejected终审失败',
-  review_comment VARCHAR(500) DEFAULT NULL COMMENT '初审或终审的审核说明，终审时可覆盖初审意见',
+  review_comment VARCHAR(500) DEFAULT NULL COMMENT '管理员终审意见；初审不得写入',
+  preliminary_review_comment VARCHAR(500) DEFAULT NULL COMMENT '大模型初审意见；终审不得覆盖；月末审核可作为同项目月初基线',
   progress_delta DECIMAL(5,4) NOT NULL DEFAULT 0.0000 COMMENT '大模型初审给出的原始项目进度增量',
   `increase` DECIMAL(5,4) NOT NULL DEFAULT 0.0000 COMMENT '当前凭证实际分配到项目进度条的贡献',
   status TINYINT UNSIGNED NOT NULL DEFAULT 1 COMMENT '状态：1正常，0无效/删除',
@@ -332,4 +343,46 @@ CREATE TABLE proof_record (
   CONSTRAINT fk_proof_record_project_upload_config
     FOREIGN KEY (project_upload_config_id) REFERENCES project_upload_config(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='凭证记录表';
+```
+
+## 现有数据库迁移 SQL
+
+```sql
+SET @add_preliminary_review_comment_sql = (
+  SELECT IF(
+    COUNT(*) = 0,
+    'ALTER TABLE proof_record ADD COLUMN preliminary_review_comment VARCHAR(500) DEFAULT NULL COMMENT ''大模型初审意见；终审不得覆盖；月末审核可作为同项目月初基线'' AFTER review_comment',
+    'SELECT 1'
+  )
+  FROM information_schema.columns
+  WHERE table_schema = DATABASE()
+    AND table_name = 'proof_record'
+    AND column_name = 'preliminary_review_comment'
+);
+
+PREPARE add_preliminary_review_comment FROM @add_preliminary_review_comment_sql;
+EXECUTE add_preliminary_review_comment;
+DEALLOCATE PREPARE add_preliminary_review_comment;
+
+ALTER TABLE proof_record
+MODIFY COLUMN review_comment VARCHAR(500) DEFAULT NULL
+COMMENT '管理员终审意见；初审不得写入';
+
+ALTER TABLE proof_record
+MODIFY COLUMN preliminary_review_comment VARCHAR(500) DEFAULT NULL
+COMMENT '大模型初审意见；终审不得覆盖；月末审核可作为同项目月初基线';
+
+UPDATE proof_record
+SET preliminary_review_comment = review_comment
+WHERE preliminary_review_comment IS NULL
+  AND review_comment IS NOT NULL
+  AND review_status IN ('preliminary_approved', 'preliminary_rejected');
+
+UPDATE proof_record
+SET review_comment = NULL
+WHERE review_status IN (
+  'pending',
+  'preliminary_approved',
+  'preliminary_rejected'
+);
 ```

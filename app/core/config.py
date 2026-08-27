@@ -124,6 +124,9 @@ class Settings(BaseSettings):
     agent_query_event_history_size: int = Field(default=200, ge=20, le=2000)
     agent_query_session_ttl_seconds: int = Field(default=3600, ge=60, le=86400)
     agent_query_sse_heartbeat_seconds: int = Field(default=15, ge=5, le=60)
+    # 诊断日志默认关闭；启用后只向 Docker 标准输出写入脱敏结构化事件。
+    agent_query_diagnostic_log_enabled: bool = False
+    agent_query_diagnostic_log_level: Literal["basic", "detailed"] = "basic"
 
     # 使用 SQLAlchemy URL 安全拼装异步 MySQL 地址，避免密码中的特殊字符破坏连接串。
     @property

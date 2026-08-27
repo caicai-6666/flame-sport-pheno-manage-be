@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
 
+from app.agent.diagnostics import AgentQueryDiagnosticLogger
 from app.agent.domains.registry import get_query_domain_profile
 from app.agent.engine.pipeline import AgentQueryPipeline, AgentQueryPipelineResult
 from app.agent.events.models import AgentProgressEvent, AgentProgressUpdate
@@ -111,6 +112,7 @@ class AgentQueryManager:
         )
         self._sessions: dict[str, AgentQuerySession] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._diagnostics: dict[str, AgentQueryDiagnosticLogger] = {}
         self._schema_caches: dict[str, CachingTableSchemaReader] = {}
         self._lock = asyncio.Lock()
         self._executor = ThreadPoolExecutor(
@@ -128,6 +130,7 @@ class AgentQueryManager:
         for query_id in expired_query_ids:
             self._sessions.pop(query_id, None)
             self._tasks.pop(query_id, None)
+            self._diagnostics.pop(query_id, None)
 
     # 根据当前快照统计占用工作资源的查询，终态历史不计入并发容量。
     def _active_session_count(self) -> int:
@@ -180,18 +183,28 @@ class AgentQueryManager:
                 event_loop=event_loop,
             )
             schema_cache = self._get_or_create_schema_cache(profile.key)
+            diagnostics = AgentQueryDiagnosticLogger(
+                query_id=query_id,
+                domain_key=profile.key,
+                enabled=self._settings.agent_query_diagnostic_log_enabled,
+                level=self._settings.agent_query_diagnostic_log_level,
+            )
             self._sessions[query_id] = session
-            session.publish(
+            self._diagnostics[query_id] = diagnostics
+            diagnostics.query_started(len(normalized_question))
+            self._publish_progress(
+                session,
+                diagnostics,
                 AgentProgressUpdate(
                     stage="accepted",
                     event_type="query_started",
                     status="running",
                     title="查询任务已创建",
                     message=f"已开始处理{profile.display_name}查询。",
-                )
+                ),
             )
             task = asyncio.create_task(
-                self._run_query(session, schema_cache),
+                self._run_query(session, schema_cache, diagnostics),
                 name=f"agent-query-{query_id}",
             )
             self._tasks[query_id] = task
@@ -202,12 +215,18 @@ class AgentQueryManager:
         self,
         session: AgentQuerySession,
         schema_cache: CachingTableSchemaReader,
+        diagnostics: AgentQueryDiagnosticLogger,
     ) -> None:
         profile = get_query_domain_profile(session.domain_key)
+
+        # 将子图进度同时送入脱敏诊断日志与现有 SSE 会话，不改变子图回调协议。
+        def publish_progress(update: AgentProgressUpdate) -> None:
+            self._publish_progress(session, diagnostics, update)
+
         pipeline = AgentQueryPipeline(
             domain_profile=profile,
             interaction_requester=session.request_interaction,
-            progress_emitter=session.publish,
+            progress_emitter=publish_progress,
             settings=self._settings,
             trace_writer=None,
             schema_reader=schema_cache.read,
@@ -220,9 +239,12 @@ class AgentQueryManager:
             )
             if session.snapshot().status == "cancelled":
                 return
+            diagnostics.pipeline_finished(result)
             if result.status == "success":
                 user_message = result.user_message or "查询已经完成。"
-                session.publish(
+                self._publish_progress(
+                    session,
+                    diagnostics,
                     AgentProgressUpdate(
                         stage="result",
                         event_type="query_completed",
@@ -230,7 +252,7 @@ class AgentQueryManager:
                         title="查询完成",
                         message=user_message,
                         payload={"result_available": True},
-                    )
+                    ),
                 )
                 session.finish(
                     "completed",
@@ -239,14 +261,16 @@ class AgentQueryManager:
                 )
             elif result.status == "abandoned":
                 user_message = result.user_message or "本次查询已停止。"
-                session.publish(
+                self._publish_progress(
+                    session,
+                    diagnostics,
                     AgentProgressUpdate(
                         stage="result",
                         event_type="query_abandoned",
                         status="abandoned",
                         title="查询已停止",
                         message=user_message,
-                    )
+                    ),
                 )
                 session.finish(
                     "abandoned",
@@ -256,12 +280,15 @@ class AgentQueryManager:
             else:
                 self._finish_failed_query(
                     session,
+                    diagnostics,
                     result,
                     "查询生成或执行失败，请稍后重试。",
                 )
         except AgentQueryInteractionTimeout:
+            diagnostics.query_terminated("failure", "interaction_timeout")
             self._finish_failed_query(
                 session,
+                diagnostics,
                 None,
                 "等待您的回答超过 5 分钟，查询已失败。",
             )
@@ -272,20 +299,29 @@ class AgentQueryManager:
             if cancelled_snapshot.status != "cancelled":
                 session.cancel()
             user_message = "本次查询已取消。"
-            session.publish(
+            diagnostics.query_terminated("cancelled", "user_cancelled")
+            self._publish_progress(
+                session,
+                diagnostics,
                 AgentProgressUpdate(
                     stage="result",
                     event_type="query_cancelled",
                     status="cancelled",
                     title="查询已取消",
                     message=user_message,
-                )
+                ),
             )
             session.finish("cancelled", None, user_message)
-        except Exception:
-            logger.exception("查询智能体后台任务执行失败：query_id=%s", session.query_id)
+        except Exception as error:
+            diagnostics.query_failed_with_exception(error)
+            logger.error(
+                "查询智能体后台任务执行失败：query_id=%s exception_type=%s",
+                session.query_id,
+                type(error).__name__,
+            )
             self._finish_failed_query(
                 session,
+                diagnostics,
                 None,
                 "查询处理失败，请稍后重试。",
             )
@@ -294,23 +330,36 @@ class AgentQueryManager:
     def _finish_failed_query(
         self,
         session: AgentQuerySession,
+        diagnostics: AgentQueryDiagnosticLogger,
         result: AgentQueryPipelineResult | None,
         user_message: str,
     ) -> None:
-        session.publish(
+        self._publish_progress(
+            session,
+            diagnostics,
             AgentProgressUpdate(
                 stage="result",
                 event_type="query_failed",
                 status="failure",
                 title="查询未能完成",
                 message=user_message,
-            )
+            ),
         )
         session.finish(
             "failed",
             _build_session_safe_result(result) if result is not None else None,
             user_message,
         )
+
+    # 同时写入脱敏诊断事件和现有会话队列，保证日志与 SSE 阶段顺序一致。
+    def _publish_progress(
+        self,
+        session: AgentQuerySession,
+        diagnostics: AgentQueryDiagnosticLogger,
+        update: AgentProgressUpdate,
+    ) -> None:
+        diagnostics.progress(update)
+        session.publish(update)
 
     # 获取现有会话并顺带清理已过期终态；不存在时使用稳定业务异常。
     async def get_session(self, query_id: str) -> AgentQuerySession:
@@ -340,7 +389,15 @@ class AgentQueryManager:
         answer: str,
     ) -> AgentQuerySession:
         session = await self.get_session(query_id)
+        pending_interaction = session.snapshot().pending_interaction
         session.answer_interaction(interaction_id, answer)
+        diagnostics = self._diagnostics.get(query_id)
+        if diagnostics is not None:
+            diagnostics.interaction_answered(
+                pending_interaction.interaction_type
+                if pending_interaction is not None
+                else "unknown"
+            )
         return session
 
     # 取消指定查询并通知可能等待交互的后台线程，重复取消保持幂等。
@@ -349,15 +406,30 @@ class AgentQueryManager:
         if session.snapshot().status not in TERMINAL_QUERY_STATUSES:
             session.cancel()
             user_message = "用户取消了本次查询。"
-            session.publish(
-                AgentProgressUpdate(
-                    stage="result",
-                    event_type="query_cancelled",
-                    status="cancelled",
-                    title="查询已取消",
-                    message=user_message,
+            diagnostics = self._diagnostics.get(query_id)
+            if diagnostics is not None:
+                diagnostics.query_terminated("cancelled", "user_cancelled")
+                self._publish_progress(
+                    session,
+                    diagnostics,
+                    AgentProgressUpdate(
+                        stage="result",
+                        event_type="query_cancelled",
+                        status="cancelled",
+                        title="查询已取消",
+                        message=user_message,
+                    ),
                 )
-            )
+            else:
+                session.publish(
+                    AgentProgressUpdate(
+                        stage="result",
+                        event_type="query_cancelled",
+                        status="cancelled",
+                        title="查询已取消",
+                        message=user_message,
+                    )
+                )
             session.finish("cancelled", None, user_message)
         return session
 

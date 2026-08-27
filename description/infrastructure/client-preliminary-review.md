@@ -27,6 +27,8 @@ preliminary_approved
 preliminary_rejected
 ```
 
+该内部接口响应中的 `review_comment` 表示本次初审意见。客户端后端应将其写入 `proof_record.preliminary_review_comment`，不得写入或覆盖管理员终审使用的 `proof_record.review_comment`；管理端这里只校验调用结果，不重复写库。
+
 ---
 
 ## 3. 调用边界

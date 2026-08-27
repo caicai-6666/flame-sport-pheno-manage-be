@@ -26,7 +26,6 @@
 | name          | VARCHAR(64)      |       是 |     无 | 用户名称，用于页面展示                    |
 | department_id | VARCHAR(64)      |       是 |     无 | 用户所属部门 ID，关联 `department.id`     |
 | avatar_url    | VARCHAR(255)     |       否 |   NULL | 用户头像地址                              |
-| height_cm     | DECIMAL(5,2)     |       否 |   NULL | 用户身高，单位厘米，用于 BMI 计算         |
 | status        | TINYINT UNSIGNED |       是 |      1 | 用户状态：`1` 表示启用，`0` 表示停用      |
 
 ---
@@ -110,30 +109,6 @@ department 1 : N user
 
 ---
 
-### height_cm
-
-用户身高，单位为厘米。
-
-该字段用于减重挑战中的 BMI 计算。  
-用户首次登录时，可以由前端询问用户身高并写入该字段。
-
-示例：
-
-```text
-172.50
-168.00
-180.00
-```
-
-该字段允许为空。  
-如果用户未填写身高，则系统无法自动计算 BMI，减重挑战相关功能需要提示用户先补充身高信息。
-
-BMI 可根据用户身高和体重计算：
-
-```text
-BMI = 体重 kg / (身高 m * 身高 m)
-```
-
 ### status
 
 用户状态。
@@ -155,7 +130,6 @@ CREATE TABLE `user` (
   name VARCHAR(64) NOT NULL COMMENT '用户名称',
   department_id VARCHAR(64) NOT NULL COMMENT '所属部门ID',
   avatar_url VARCHAR(255) DEFAULT NULL COMMENT '头像地址',
-  height_cm DECIMAL(5,2) DEFAULT NULL COMMENT '用户身高，单位厘米，用于BMI计算',
   status TINYINT UNSIGNED NOT NULL DEFAULT 1 COMMENT '状态：1启用，0停用',
   PRIMARY KEY (id),
   KEY idx_user_department_id (department_id),
@@ -163,4 +137,30 @@ CREATE TABLE `user` (
   CONSTRAINT fk_user_department
     FOREIGN KEY (department_id) REFERENCES department(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户表';
+```
+
+---
+
+## 迁移语句
+
+从保存用户健康资料的旧版本升级时，使用可重复执行的迁移删除已停用的身高字段：
+
+```sql
+SET @drop_user_height_cm_sql = (
+  SELECT IF(
+    EXISTS(
+      SELECT 1
+      FROM information_schema.columns
+      WHERE table_schema = DATABASE()
+        AND table_name = 'user'
+        AND column_name = 'height_cm'
+    ),
+    'ALTER TABLE `user` DROP COLUMN `height_cm`',
+    'SELECT 1'
+  )
+);
+
+PREPARE drop_user_height_cm FROM @drop_user_height_cm_sql;
+EXECUTE drop_user_height_cm;
+DEALLOCATE PREPARE drop_user_height_cm;
 ```

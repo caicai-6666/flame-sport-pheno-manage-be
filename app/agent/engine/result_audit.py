@@ -511,7 +511,10 @@ def _build_audit_messages(
                 }
                 for block in planning_result.query_plan.query_blocks
             ],
-            "business_caliber": planning_result.query_plan.business_caliber,
+            "business_caliber": [
+                item.model_dump()
+                for item in planning_result.query_plan.business_caliber
+            ],
         },
         "result_shape_plan": (
             planning_result.result_shape_plan.model_dump()

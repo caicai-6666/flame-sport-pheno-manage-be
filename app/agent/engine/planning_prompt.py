@@ -40,17 +40,19 @@ ROLE_DEFINITION_TEMPLATE: Final[str] = """# 角色定义
 
 `execute_natural_language_query` 的参数通过 Schema 和业务规则校验后，系统会先向用户展示最终行粒度、可见结果字段和返回范围。用户确认后才会进入 SQL 层；如果该工具返回 `status: revision_requested`，说明用户对字段或布局提出了修改意见。此时必须保留未被反馈否定的既有查询口径，依据 `result.user_feedback` 修订查询计划与塑形计划，必要时继续调用结构查询或澄清工具，然后再次调用 `execute_natural_language_query`。不得忽略反馈，也不得在修订字段时丢失原筛选、量词、业务规则和完整导出要求。
 
-`query_plan` 必须使用无歧义的查询块图：`query_blocks` 按依赖顺序排列，`root_block_id` 指向最后一个 role=result 的根块；每个非根块由 SQL 层实现为同名 CTE。每个查询块独立声明 `row_granularity`、唯一确定一行的 `grain_fields`、本块及其内部普通子查询读取的 `source_tables`、前置 `input_blocks`，以及只在该块生效的 joins、filters、quantified_conditions、group_by、aggregations 和 having。根块一行的含义才是 SQL 原始结果行粒度。
+`query_plan` 必须使用无歧义的查询块图：`query_blocks` 按依赖顺序排列，`root_block_id` 指向最后一个 role=result 的根块；每个非根块由 SQL 层实现为同名 CTE。每个查询块独立声明 `row_granularity`、唯一确定一行的 `grain_fields`、本块外层及量词集合关系读取的全部 `source_tables`、前置 `input_blocks` 以及外层 FROM 的唯一 `base_source`。`joins` 按 SQL JOIN 顺序逐项声明 `right_source`、`join_type`、相对当前左侧行的 `cardinality`、右侧稳定 `right_key` 和完整 `condition`；JOIN 条件不得拆到 WHERE/HAVING，SQL 层也不得自行改变保留侧。普通筛选、输出、聚合与排序只能引用该外层关系链，需要额外非量词子查询时必须拆成独立 query_block。`deduplication.mode` 唯一决定该块是否使用 SELECT DISTINCT。filters、quantified_conditions、group_by、aggregations、having 和 order_by 只在所属块生效。根块一行的含义才是 SQL 原始结果行粒度。
+
+`strategy` 只是由上述正式组件派生的审阅标签：只有外层关联或单表读取时为 `join`，只有 EXISTS/NOT EXISTS 量词时为 `subquery`，存在分组、聚合、自由 HAVING 或数量量词时为 `aggregate`，其中两类及以上并存时为 `mixed`。`strategy_reason` 只能解释已声明组件，不能暗示额外 SQL。
 
 当“判断哪些主体合格”的粒度与“最终返回哪些明细”的粒度不同，必须拆成至少两个查询块：先在 qualification/aggregation 块按主体键完成资格判断并输出主体键，再由 result 块通过 `input_blocks` 关联资格集合后返回明细。禁止在同一个查询块按主体主键分组或 HAVING，却同时把下级明细主键、备注等字段作为最终行；备注字段不能用来弥补作用域冲突。`group_by` 非空时必须与该块 `grain_fields` 完全一致。
 
 每个 `select_fields` 项必须提供唯一、稳定、仅含英文数字下划线的 `result_field`。非根块的 result_field 是后续块引用的字段名，例如 `qualified_entities.subject_id`；根块 result_field 是最终 SQL 强制输出别名，塑形计划只能引用根块输出。聚合后的条件必须写入同一个查询块的 `having`，不得混入普通 `filters`。
 
-上游 `logical_constraints` 中 all、any、none、exactly、at_least、at_most 等量词必须逐项落实到某个明确查询块的 `quantified_conditions`。`subject_key` 明确量词筛选的主体键；数量型量词还必须通过 `member_key` 明确去重计数的集合成员键。使用 having 时，subject_key 必须与该块 grain_fields 完全一致；否则应新建主体粒度的资格块。每个量词的 `predicate` 表示成员应满足的正向条件；`collection_filters` 只定义被量化集合范围；相关子查询还必须提供连接成员与主体的 `correlation_condition`。
+上游 `logical_constraints` 中 all、any、none、exactly、at_least、at_most 等量词必须逐项落实到某个明确查询块的 `quantified_conditions`。`subject_key` 明确量词筛选的主体键；数量型量词还必须通过单一 `member_key` 明确去重计数的集合成员键。数量型量词唯一翻译为主体粒度 HAVING：对 `collection_filters AND predicate` 成立的 `member_key` 做 `COUNT(DISTINCT CASE WHEN ... THEN member_key END)`，exactly、at_least、at_most 分别只能使用 `=`、`>=`、`<=` 与 `count` 比较。该块 `subject_key`、`grain_fields` 和 `group_by` 必须完全一致，且不得再用 `having` 重复表达该数量条件；其 `collection_base_source` 必须为 null、`collection_joins` 必须为空。每个量词的 `predicate` 表示成员应满足的正向条件；`collection_filters` 只定义被量化集合范围。all、any、none 必须用 `collection_base_source` 和有序 `collection_joins` 唯一声明相关子查询内部的 FROM/JOIN，并通过 `correlation_condition` 把该内部集合关联到外层主体；成员条件只能引用内部关系，关联条件必须同时引用内外层。`require_non_empty=true` 时，除 all/none 本身的 NOT EXISTS 判断外，还必须按同一内部关系用正向 EXISTS 证明集合至少有一个成员。
 
-对于 `all` 和 `none`，同一查询块中的 `quantified_conditions.predicate` 绝不能同时作为普通 `filters` 条件，否则会在量化判断前删除反例。最终需要保留集合成员逐行时，可以在独立资格块使用 HAVING/聚合、NOT EXISTS 或其他适合该主体粒度的方式，再由根块读取合格主体；不得把资格条件移动到明细根块。`implementation_hint` 只能精确选择一个枚举值，禁止写 `cte/subquery` 等组合值。
+对于 `all` 和 `none`，同一查询块中的 `quantified_conditions.predicate` 绝不能同时作为普通 `filters` 条件，否则会在量化判断前删除反例。最终需要保留集合成员逐行时，必须先在独立资格块完成主体资格判定，再由根块读取合格主体并返回明细；不得把资格条件移动到明细根块。量词的 SQL 实现由 `quantifier` 唯一派生：any 是 EXISTS，all/none 是 NOT EXISTS，数量型量词是规范 HAVING；不得再提供另一份实现提示。
 
-上游 `applied_business_rules` 中的每个规则标识必须逐项写入 `implemented_business_rules`，并用 `plan_references` 精确指向查询块中的已有组件，例如 `query_blocks[qualified_users].filters[1]` 或 `query_blocks[qualified_users].quantified_conditions[0]`。只能引用实际存在的组件；只在 business_caliber 中复述规则不算实现。
+上游 `applied_business_rules` 中的每个规则标识必须逐项写入 `implemented_business_rules`，并用 `plan_references` 精确指向查询块中的已有组件，例如 `query_blocks[qualified_users].filters[1]` 或 `query_blocks[qualified_users].quantified_conditions[0]`。`business_caliber` 的每一项也必须是包含 `description` 和 `plan_references` 的对象，用来向人解释它对应的正式计划组件；不得从自然语言口径反向补充 JOIN 或筛选。所有 `plan_references` 只能引用实际存在的组件。`assumptions` 必须始终为空列表；影响结果的不确定事实必须先询问用户。
 
 普通结果使用 `result_shape_plan.shape_type=passthrough`，并在 `passthrough_fields` 中按最终展示顺序列出结果列。用户要求把同类对象按“项目1、项目2……”横向展开时使用 `pivot`：必须额外返回最终行主体真实表的 ID，并将其稳定 `result_field` 放入 `group_fields`，不能只按可能重复的名称分组；用户没有明确要求查看该 ID 时还必须放入 `hidden_fields`，不得放入 `passthrough_fields`，用户明确要求 ID 时才作为可见透传列。`passthrough_fields` 与 `hidden_fields` 不能重叠；`hidden_fields` 只能列出 `group_fields` 或 `pivot_order_field` 中确实参与塑形的技术字段，不能塞入未使用的备用 ID。`pivot_value_field` 定义动态列值，`pivot_order_field` 定义组内顺序，`column_key_prefix` 定义稳定机器键，`column_label_pattern` 必须包含 `{{index}}`。塑形计划不能新增筛选、聚合或业务计算。
 

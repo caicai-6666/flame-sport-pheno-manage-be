@@ -452,23 +452,9 @@ def validate_sports_query_plan(
             )
         if condition.quantifier != "all" or not references_completion_progress:
             continue
-        if condition.implementation_hint != "not_exists":
-            issues.append(
-                QueryPlanPolicyIssue(
-                    field_path=f"{condition_path}.implementation_hint",
-                    message=(
-                        "全部项目完成必须通过排除未完成反例实现，当前实现方式不是 not_exists。"
-                    ),
-                    repair_action=(
-                        "将 implementation_hint 精确改为 not_exists；"
-                        "将 correlation_condition 设为 season_user_project.season_user_id "
-                        "与当前查询块 subject_key 对应的 season_user.id 来源字段相等。"
-                    ),
-                )
-            )
-        elif not _is_valid_completion_correlation(
-                condition.correlation_condition,
-                query_plan,
+        if not _is_valid_completion_correlation(
+            condition.correlation_condition,
+            query_plan,
         ):
             issues.append(
                 QueryPlanPolicyIssue(
@@ -504,7 +490,7 @@ def validate_sports_query_plan(
                     ),
                 )
             )
-        if condition.implementation_hint == "not_exists":
+        if condition.implementation == "not_exists":
             outer_member_join_indexes = [
                 join_index
                 for join_index, join in enumerate(block.joins)

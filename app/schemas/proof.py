@@ -13,6 +13,7 @@ class PendingFinalReviewProofResponse(BaseModel):
     created_at: datetime
     proof_date: date
     note: str | None
+    preliminary_review_comment: str | None
     review_comment: str | None
 
 

@@ -184,7 +184,10 @@ def validate_rewards_query_plan(
             query_plan.row_granularity,
             selected_text,
             filter_text,
-            "\n".join(query_plan.business_caliber),
+            "\n".join(
+                business_caliber.description
+                for business_caliber in query_plan.business_caliber
+            ),
         )
     )
 

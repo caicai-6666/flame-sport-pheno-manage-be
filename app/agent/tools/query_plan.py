@@ -23,14 +23,59 @@ class QueryPlanTable(BaseModel):
 
 
 class QueryPlanJoin(BaseModel):
-    """查询计划中一条跨表关联的原始字段表达式。"""
+    """查询计划中一条方向、保留语义和基数均明确的跨数据源关联。"""
 
     model_config = ConfigDict(extra="forbid")
 
+    right_source: str = Field(
+        pattern=r"^[A-Za-z_][A-Za-z0-9_]*$",
+        description=(
+            "按声明顺序关联到当前左侧结果集的数据源；"
+            "必须是本查询块的真实表、前置块或显式角色别名"
+        ),
+    )
+    join_type: Literal["inner", "left"] = Field(
+        description=(
+            "inner 只保留匹配行；left 保留加入该数据源前的全部左侧行。"
+            "不得让 SQL 层根据 reason 猜测"
+        )
+    )
+    cardinality: Literal[
+        "one_to_one", "many_to_one", "one_to_many", "many_to_many"
+    ] = Field(
+        description=(
+            "相对于加入 right_source 前每一条左侧结果行的关联基数；"
+            "one_to_many 和 many_to_many 可能放大左侧行数"
+        )
+    )
+    right_key: list[str] = Field(
+        min_length=1,
+        description=(
+            "唯一标识 right_source 一行的原始字段键；每项必须使用 "
+            "right_source.字段名，用于校验一对多关联后的最终行粒度"
+        ),
+    )
     condition: str = Field(
-        description="关联条件，必须使用表名.原始字段名，例如 detail.parent_id = parent.id"
+        description=(
+            "完整 JOIN ON 条件，必须同时引用 right_source 和已经进入左侧结果集的数据源；"
+            "必须使用原始字段名，不得拆到 WHERE 或 HAVING"
+        )
     )
     reason: str = Field(description="采用该关联条件的业务原因")
+
+
+class QueryPlanDeduplication(BaseModel):
+    """声明查询块是否通过 SELECT DISTINCT 消除一对多关联产生的重复主体行。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["none", "distinct"] = Field(
+        description=(
+            "none 表示不执行结果去重；distinct 表示本查询块必须使用 SELECT DISTINCT。"
+            "按 grain_fields 分组的查询块必须使用 none"
+        )
+    )
+    reason: str = Field(description="选择该去重方式的业务原因")
 
 
 class QueryPlanAlias(BaseModel):
@@ -143,6 +188,19 @@ class QueryPlanQuantifiedCondition(BaseModel):
         ),
     )
     collection: str = Field(description="需要量化判断的关联集合，例如全部有效锁定项目")
+    collection_base_source: str | None = Field(
+        pattern=r"^[A-Za-z_][A-Za-z0-9_]*$",
+        description=(
+            "all、any、none 对应相关子查询内部 FROM 的唯一起始数据源；"
+            "数量型量词固定使用 HAVING，必须传 null"
+        ),
+    )
+    collection_joins: list[QueryPlanJoin] = Field(
+        description=(
+            "all、any、none 对应相关子查询内部按顺序执行的完整 JOIN；"
+            "数量型量词固定使用 HAVING，必须传空列表"
+        )
+    )
     quantifier: Literal[
         "all", "any", "none", "exactly", "at_least", "at_most"
     ] = Field(description="集合约束：全部、任一、没有、恰好、至少或至多")
@@ -151,8 +209,10 @@ class QueryPlanQuantifiedCondition(BaseModel):
     )
     member_key: list[str] = Field(
         default_factory=list,
+        max_length=1,
         description=(
-            "数量型量词用于去重计数的集合成员稳定键，例如 season_user_project.id；"
+            "数量型量词用于 COUNT(DISTINCT ...) 的单一集合成员稳定键，"
+            "例如 season_user_project.id；"
             "all、any、none 时传空列表"
         ),
     )
@@ -175,22 +235,13 @@ class QueryPlanQuantifiedCondition(BaseModel):
         ge=0,
         description="数量型约束的目标数量；all、any、none 时传 null",
     )
-    implementation_hint: Literal[
-        "having", "exists", "not_exists", "subquery", "cte"
-    ] = Field(description="SQL 层实现该量化约束的建议方式")
+    require_non_empty: bool = Field(
+        description=(
+            "仅 all 或 none 使用：true 表示成员集合为空时主体不匹配，false 表示按"
+            "标准空集语义判断；any 和数量型量词必须传 false"
+        )
+    )
     reason: str = Field(description="该量化条件对应的业务规则")
-
-    # 拒绝把多个实现方式拼成一个枚举值，并给出选择单一值的明确判据。
-    @field_validator("implementation_hint", mode="before")
-    @classmethod
-    def validate_single_implementation_hint(cls, value: object) -> object:
-        if isinstance(value, str) and any(separator in value for separator in ("/", "、", ",")):
-            raise ValueError(
-                "implementation_hint 只能精确填写一个值：使用 WITH 命名资格集合时填 cte；"
-                "使用括号内 SELECT 时填 subquery；使用相关反例排除时填 not_exists；"
-                "不得提交 cte/subquery 等组合值"
-            )
-        return value
 
     # 保证数量型量词携带数量，集合型量词不混入无意义数字。
     @model_validator(mode="after")
@@ -204,23 +255,58 @@ class QueryPlanQuantifiedCondition(BaseModel):
             raise ValueError(f"量词 {self.quantifier} 的 count 必须为 null")
         if self.quantifier not in count_quantifiers and self.member_key:
             raise ValueError(f"量词 {self.quantifier} 的 member_key 必须为空列表")
-        if (
-            self.implementation_hint in {"exists", "not_exists"}
-            and not self.correlation_condition
-        ):
+        if self.quantifier in {"all", "any", "none"} and not self.correlation_condition:
             raise ValueError(
-                "implementation_hint 为 exists 或 not_exists 时 "
-                "correlation_condition 不能为空"
+                f"量词 {self.quantifier} 使用相关集合判断，correlation_condition 不能为空"
             )
-        if (
-            self.implementation_hint not in {"exists", "not_exists", "subquery"}
-            and self.correlation_condition is not None
-        ):
+        if self.quantifier in {"all", "any", "none"}:
+            correlation_qualifiers = {
+                qualifier
+                for qualifier, _ in re.findall(
+                    r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b",
+                    self.correlation_condition or "",
+                )
+            }
+            if len(correlation_qualifiers) < 2:
+                raise ValueError(
+                    f"量词 {self.quantifier} 的 correlation_condition 必须显式关联"
+                    "成员侧与外层主体侧两个不同数据源；"
+                    "同一真实表承担两个角色时必须先在 aliases 声明不同别名"
+                )
+        if self.quantifier in {"all", "any", "none"} and not self.collection_base_source:
             raise ValueError(
-                "只有 exists、not_exists 或相关 subquery 可以提供 "
-                "correlation_condition"
+                f"量词 {self.quantifier} 必须提供 collection_base_source，"
+                "用于唯一确定相关子查询内部 FROM"
+            )
+        if self.quantifier in count_quantifiers and self.collection_base_source is not None:
+            raise ValueError(
+                "数量型量词固定在主体粒度查询块中按 HAVING 计算，"
+                "collection_base_source 必须为 null"
+            )
+        if self.quantifier in count_quantifiers and self.collection_joins:
+            raise ValueError(
+                "数量型量词固定在主体粒度查询块中按 HAVING 计算，"
+                "collection_joins 必须为空列表"
+            )
+        if self.quantifier in count_quantifiers and self.correlation_condition is not None:
+            raise ValueError(
+                "数量型量词固定在主体粒度查询块中按 HAVING 计算，"
+                "correlation_condition 必须为 null"
+            )
+        if self.quantifier not in {"all", "none"} and self.require_non_empty:
+            raise ValueError(
+                "require_non_empty 只适用于 all 或 none；any 和数量型量词必须传 false"
             )
         return self
+
+    # 根据量词唯一确定 SQL 关系运算，禁止规划模型同时维护一份可能冲突的实现提示。
+    @property
+    def implementation(self) -> Literal["having", "exists", "not_exists"]:
+        if self.quantifier in {"exactly", "at_least", "at_most"}:
+            return "having"
+        if self.quantifier == "any":
+            return "exists"
+        return "not_exists"
 
 
 class QueryPlanBusinessRuleImplementation(BaseModel):
@@ -237,6 +323,21 @@ class QueryPlanBusinessRuleImplementation(BaseModel):
         ),
     )
     reason: str = Field(description="这些计划组件如何共同实现该业务规则")
+
+
+class QueryPlanBusinessCaliber(BaseModel):
+    """把一条面向人的业务口径绑定到唯一的正式查询计划组件。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    description: str = Field(description="有效状态、时间范围、空值或去重等业务口径")
+    plan_references: list[str] = Field(
+        min_length=1,
+        description=(
+            "实际落实该口径的带查询块作用域组件路径；"
+            "不能只写自然语言而不引用正式筛选、关联、量词、聚合或去重组件"
+        ),
+    )
 
 
 class QueryPlanOrderBy(BaseModel):
@@ -392,16 +493,29 @@ class QueryPlanBlock(BaseModel):
         )
     )
     source_tables: list[str] = Field(
-        description="该查询块及其内部普通子查询读取的真实表名；不读真实表时传空列表"
+        description=(
+            "该查询块外层关系和 quantified_conditions 集合关系读取的全部真实表名；"
+            "不读真实表时传空列表，其他子查询应拆成独立 query_block"
+        )
     )
     input_blocks: list[str] = Field(
         description="该查询块直接读取的前置查询块 block_id；无时传空列表"
+    )
+    base_source: str = Field(
+        pattern=r"^[A-Za-z_][A-Za-z0-9_]*$",
+        description=(
+            "该查询块外层 FROM 的唯一起始数据源；必须是 source_tables、input_blocks "
+            "或 aliases 中可直接引用的一个名称"
+        ),
     )
     aliases: list[QueryPlanAlias] = Field(
         default_factory=list,
         description="仅在本查询块内生效的真实表别名；不使用时传空列表",
     )
     joins: list[QueryPlanJoin] = Field(description="仅在本查询块内执行的关联")
+    deduplication: QueryPlanDeduplication = Field(
+        description="本查询块唯一的 SELECT DISTINCT 语义来源"
+    )
     filters: list[QueryPlanFilter] = Field(description="仅在本查询块内执行的行筛选")
     quantified_conditions: list[QueryPlanQuantifiedCondition] = Field(
         default_factory=list,
@@ -423,9 +537,15 @@ class QueryPlanBlock(BaseModel):
         description="本查询块内部的排序；不排序时传空列表"
     )
     strategy: Literal["join", "subquery", "aggregate", "mixed"] = Field(
-        description="该查询块内部的主要实现策略"
+        description=(
+            "由正式计划组件派生的人工审阅标签：只有外层关联为 join，"
+            "只有 EXISTS/NOT EXISTS 量词为 subquery，分组、聚合或数量量词为 "
+            "aggregate，两类及以上并存为 mixed；不作为第二份 SQL 指令"
+        )
     )
-    strategy_reason: str = Field(description="选择该查询块策略的业务原因")
+    strategy_reason: str = Field(
+        description="面向人说明已声明组件的组合，不得增加未在正式组件中出现的查询口径"
+    )
 
     # 为每个查询块补齐稳定输出名，并拒绝同一查询块内重复的机器列名。
     @model_validator(mode="after")
@@ -459,8 +579,24 @@ class QueryPlanBlock(BaseModel):
             raise ValueError(
                 "只有全局单行聚合 query_block 可以把 grain_fields 设为空列表"
             )
+        count_quantifiers = {"exactly", "at_least", "at_most"}
+        numeric_conditions = [
+            condition
+            for condition in self.quantified_conditions
+            if condition.quantifier in count_quantifiers
+        ]
         if self.having and not self.aggregations:
             raise ValueError("query_block.having 非空时 aggregations 不能为空")
+        if numeric_conditions and set(self.group_by) != set(self.grain_fields):
+            raise ValueError(
+                "数量型 quantified_conditions 必须在主体 grain_fields 粒度分组；"
+                "query_block.group_by 必须与 grain_fields 完全一致"
+            )
+        if numeric_conditions and self.having:
+            raise ValueError(
+                "数量型 quantified_conditions 已唯一声明计数键、比较方式和数量，"
+                "同一查询块不得再用 having 重复表达；其他聚合后筛选请拆到后续查询块"
+            )
         if self.group_by and set(self.grain_fields) != set(self.group_by):
             raise ValueError(
                 "query_block.group_by 必须与 grain_fields 完全一致；"
@@ -511,13 +647,91 @@ class QueryPlanBlock(BaseModel):
                 )
         for index, condition in enumerate(self.quantified_conditions):
             if (
-                condition.implementation_hint == "having"
+                condition.implementation == "having"
                 and set(condition.subject_key) != set(self.grain_fields)
             ):
                 raise ValueError(
                     f"quantified_conditions[{index}] 的 subject_key 必须与当前查询块 "
                     "grain_fields 完全一致；请把该量词放入主体粒度的独立资格查询块"
                 )
+        if self.group_by and self.deduplication.mode != "none":
+            raise ValueError(
+                "已经按 grain_fields 分组的 query_block 不得再声明 DISTINCT；"
+                "将 deduplication.mode 改为 none"
+            )
+        normalized_grain_fields = {
+            re.sub(r"\s+", "", field.replace("`", "").lower())
+            for field in self.grain_fields
+        }
+        multiplying_joins = [
+            query_join
+            for query_join in self.joins
+            if query_join.cardinality in {"one_to_many", "many_to_many"}
+            and not {
+                re.sub(r"\s+", "", key.replace("`", "").lower())
+                for key in query_join.right_key
+            }.issubset(normalized_grain_fields)
+        ]
+        if multiplying_joins and not self.group_by:
+            if self.deduplication.mode != "distinct":
+                raise ValueError(
+                    "一对多或多对多关联会放大当前主体行，且 grain_fields 未包含右侧稳定键；"
+                    "必须使用 deduplication.mode=distinct，或把明细右侧键加入 grain_fields"
+                )
+            multiplying_sources = {
+                query_join.right_source for query_join in multiplying_joins
+            }
+            ambiguous_detail_fields = [
+                select_field.field
+                for select_field in self.select_fields
+                if any(
+                    re.search(
+                        rf"\b{re.escape(source)}\.",
+                        select_field.field,
+                        flags=re.IGNORECASE,
+                    )
+                    for source in multiplying_sources
+                )
+            ]
+            if ambiguous_detail_fields:
+                raise ValueError(
+                    "DISTINCT 只能消除仅返回左侧主体字段的重复行；"
+                    "当前查询同时返回一对多右侧明细字段，无法保证声明的主体粒度："
+                    + ", ".join(ambiguous_detail_fields)
+                    + "。请把右侧稳定键加入 grain_fields，或先在独立查询块聚合"
+                )
+        strategy_component_count = sum(
+            (
+                bool(self.joins),
+                any(
+                    condition.implementation in {"exists", "not_exists"}
+                    for condition in self.quantified_conditions
+                ),
+                bool(
+                    self.group_by
+                    or self.aggregations
+                    or self.having
+                    or numeric_conditions
+                ),
+            )
+        )
+        if strategy_component_count >= 2:
+            expected_strategy = "mixed"
+        elif self.group_by or self.aggregations or self.having or numeric_conditions:
+            expected_strategy = "aggregate"
+        elif any(
+            condition.implementation in {"exists", "not_exists"}
+            for condition in self.quantified_conditions
+        ):
+            expected_strategy = "subquery"
+        else:
+            expected_strategy = "join"
+        if self.strategy != expected_strategy:
+            raise ValueError(
+                f"query_block.strategy 必须由正式计划组件派生为 "
+                f"{expected_strategy}，当前为 {self.strategy}；"
+                "不得用 strategy 表达未声明的 SQL 实现"
+            )
         return self
 
 
@@ -541,11 +755,17 @@ class NaturalLanguageQueryPlan(BaseModel):
         description="本次计划落实的 core rule 及其带查询块作用域的组件引用",
     )
     pagination: QueryPlanPagination = Field(description="仅应用于根查询块的结果范围")
-    business_caliber: list[str] = Field(
-        description="有效状态、去重、时间范围和空值等业务口径；无时传空列表"
+    business_caliber: list[QueryPlanBusinessCaliber] = Field(
+        description=(
+            "有效状态、去重、时间范围和空值等业务口径及其正式计划引用；"
+            "无时传空列表"
+        )
     )
     assumptions: list[str] = Field(
-        description="无法确认但影响查询的假设；无假设时传空列表"
+        description=(
+            "必须始终传空列表；影响结果的不确定事实必须先询问用户，"
+            "确认后写入正式计划组件和 business_caliber"
+        )
     )
 
     # 校验查询块拓扑、字段作用域和业务规则引用，使计划本身不存在跨粒度歧义。
@@ -596,6 +816,11 @@ class NaturalLanguageQueryPlan(BaseModel):
         if unreachable_blocks:
             raise ValueError(
                 "存在未被根查询块引用的 query_blocks：" + ", ".join(unreachable_blocks)
+            )
+        if self.assumptions:
+            raise ValueError(
+                "query_plan.assumptions 必须为空；影响结果的事实不能作为隐藏假设，"
+                "请先调用 ask_user 确认，再把结论写入正式计划组件和 business_caliber"
             )
         self._validate_business_rule_references(blocks_by_id)
         return self
@@ -652,11 +877,190 @@ class NaturalLanguageQueryPlan(BaseModel):
                 f"查询块 {block.block_id} 的 alias 必须直接来源于 source_tables："
                 + ", ".join(invalid_alias_sources)
             )
+        available_outer_sources = (
+            set(block.source_tables) | set(block.input_blocks) | set(alias_names)
+        ) - {alias.source_table for alias in block.aliases}
+        outer_relation_sources = NaturalLanguageQueryPlan._validate_relation_chain(
+            block_id=block.block_id,
+            component_path="joins",
+            base_source=block.base_source,
+            joins=block.joins,
+            available_sources=available_outer_sources,
+        )
+        for condition_index, condition in enumerate(block.quantified_conditions):
+            if condition.implementation == "having":
+                continue
+            assert condition.collection_base_source is not None
+            collection_sources = NaturalLanguageQueryPlan._validate_relation_chain(
+                block_id=block.block_id,
+                component_path=(
+                    f"quantified_conditions[{condition_index}].collection_joins"
+                ),
+                base_source=condition.collection_base_source,
+                joins=condition.collection_joins,
+                available_sources=available_outer_sources,
+            )
+            overlapping_sources = sorted(outer_relation_sources & collection_sources)
+            if overlapping_sources:
+                raise ValueError(
+                    f"查询块 {block.block_id} 的 quantified_conditions"
+                    f"[{condition_index}] 内外层数据源名称不能相同："
+                    + ", ".join(overlapping_sources)
+                    + "；同一真实表承担不同角色时必须声明不同 aliases"
+                )
+            member_expressions = [condition.predicate] + condition.collection_filters
+            member_qualifiers = {
+                qualifier
+                for expression in member_expressions
+                for qualifier, _ in re.findall(
+                    r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b",
+                    expression,
+                )
+            }
+            invalid_member_qualifiers = sorted(member_qualifiers - collection_sources)
+            if invalid_member_qualifiers:
+                raise ValueError(
+                    f"查询块 {block.block_id} 的 quantified_conditions"
+                    f"[{condition_index}] 成员条件只能引用 collection_base_source "
+                    "和 collection_joins："
+                    + ", ".join(invalid_member_qualifiers)
+                )
+            correlation_qualifiers = {
+                qualifier
+                for qualifier, _ in re.findall(
+                    r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b",
+                    condition.correlation_condition or "",
+                )
+            }
+            if not correlation_qualifiers.intersection(collection_sources) or not (
+                correlation_qualifiers.intersection(outer_relation_sources)
+            ):
+                raise ValueError(
+                    f"查询块 {block.block_id} 的 quantified_conditions"
+                    f"[{condition_index}].correlation_condition 必须同时引用"
+                    "集合子查询数据源和外层主体数据源"
+                )
+        outer_component_expressions = (
+            block.grain_fields
+            + [query_filter.condition for query_filter in block.filters]
+            + [
+                key
+                for condition in block.quantified_conditions
+                for key in condition.subject_key
+            ]
+            + [
+                expression
+                for condition in block.quantified_conditions
+                if condition.implementation == "having"
+                for expression in (
+                    condition.member_key
+                    + condition.collection_filters
+                    + [condition.predicate]
+                )
+            ]
+            + [select_field.field for select_field in block.select_fields]
+            + block.group_by
+            + [aggregation.expression for aggregation in block.aggregations]
+            + [having.condition for having in block.having]
+            + [order_by.field for order_by in block.order_by]
+        )
+        outer_component_qualifiers = {
+            qualifier
+            for expression in outer_component_expressions
+            for qualifier, _ in re.findall(
+                r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b",
+                expression,
+            )
+        }
+        invalid_outer_qualifiers = sorted(
+            outer_component_qualifiers - outer_relation_sources
+        )
+        if invalid_outer_qualifiers:
+            raise ValueError(
+                f"查询块 {block.block_id} 的粒度、普通筛选、输出、聚合或排序只能引用"
+                "外层 base_source 和 joins："
+                + ", ".join(invalid_outer_qualifiers)
+                + "；需要额外关系时请声明 JOIN 或拆分 query_block"
+            )
         NaturalLanguageQueryPlan._validate_block_expressions(
             block=block,
             previous_blocks=previous_blocks,
             alias_names=set(alias_names),
         )
+
+    # 校验一条外层或集合子查询关系链的起点、顺序、ON 作用域和右侧稳定键。
+    @staticmethod
+    def _validate_relation_chain(
+        *,
+        block_id: str,
+        component_path: str,
+        base_source: str,
+        joins: list[QueryPlanJoin],
+        available_sources: set[str],
+    ) -> set[str]:
+        if base_source not in available_sources:
+            raise ValueError(
+                f"查询块 {block_id} 的 {component_path} 起始数据源不属于"
+                f"可直接引用的数据源：{base_source}"
+            )
+        joined_sources: set[str] = {base_source}
+        for join_index, query_join in enumerate(joins):
+            if query_join.right_source not in available_sources:
+                raise ValueError(
+                    f"查询块 {block_id} 的 {component_path}[{join_index}].right_source "
+                    f"不属于可直接引用的数据源：{query_join.right_source}"
+                )
+            if query_join.right_source in joined_sources:
+                raise ValueError(
+                    f"查询块 {block_id} 的 {component_path} 重复关联数据源："
+                    f"{query_join.right_source}"
+                )
+            condition_qualifiers = {
+                qualifier
+                for qualifier, _ in re.findall(
+                    r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b",
+                    query_join.condition,
+                )
+            }
+            if query_join.right_source not in condition_qualifiers:
+                raise ValueError(
+                    f"查询块 {block_id} 的 {component_path}[{join_index}].condition "
+                    f"必须引用 right_source {query_join.right_source}"
+                )
+            if not condition_qualifiers.intersection(joined_sources):
+                raise ValueError(
+                    f"查询块 {block_id} 的 {component_path}[{join_index}].condition "
+                    "必须关联到已经进入左侧结果集的数据源"
+                )
+            unavailable_qualifiers = sorted(
+                condition_qualifiers - joined_sources - {query_join.right_source}
+            )
+            if unavailable_qualifiers:
+                raise ValueError(
+                    f"查询块 {block_id} 的 {component_path}[{join_index}].condition "
+                    "引用了尚未进入关联链的数据源："
+                    + ", ".join(unavailable_qualifiers)
+                )
+            expected_key_pattern = re.compile(
+                rf"{re.escape(query_join.right_source)}\."
+                r"[A-Za-z_][A-Za-z0-9_]*",
+                flags=re.IGNORECASE,
+            )
+            if any(
+                expected_key_pattern.fullmatch(key) is None
+                for key in query_join.right_key
+            ):
+                raise ValueError(
+                    f"查询块 {block_id} 的 {component_path}[{join_index}].right_key "
+                    f"必须全部使用 {query_join.right_source}.原始字段名"
+                )
+            if len(query_join.right_key) != len(set(query_join.right_key)):
+                raise ValueError(
+                    f"查询块 {block_id} 的 {component_path}[{join_index}].right_key "
+                    "不能重复"
+                )
+            joined_sources.add(query_join.right_source)
+        return joined_sources
 
     # 校验表达式限定符，并保证输入块只暴露其显式选择的稳定输出列。
     @staticmethod
@@ -669,6 +1073,7 @@ class NaturalLanguageQueryPlan(BaseModel):
         expressions = (
             block.grain_fields
             + [join.condition for join in block.joins]
+            + [key for join in block.joins for key in join.right_key]
             + [query_filter.condition for query_filter in block.filters]
             + [condition.predicate for condition in block.quantified_conditions]
             + [
@@ -739,31 +1144,65 @@ class NaturalLanguageQueryPlan(BaseModel):
         if len(rule_ids) != len(set(rule_ids)):
             raise ValueError("implemented_business_rules[].rule_id 不能重复")
         for implementation in self.implemented_business_rules:
-            if len(implementation.plan_references) != len(
-                set(implementation.plan_references)
-            ):
-                raise ValueError("implemented_business_rules[].plan_references 不能重复")
-            for reference in implementation.plan_references:
-                matched_reference = re.fullmatch(
-                    r"query_blocks\[([A-Za-z_][A-Za-z0-9_]*)\]\."
-                    r"(joins|filters|quantified_conditions|select_fields|"
-                    r"group_by|aggregations|having|order_by)\[(\d+)\]",
-                    reference,
+            self._validate_plan_references(
+                implementation.plan_references,
+                blocks_by_id,
+                "implemented_business_rules[].plan_references",
+            )
+        caliber_descriptions = [item.description for item in self.business_caliber]
+        if len(caliber_descriptions) != len(set(caliber_descriptions)):
+            raise ValueError("business_caliber[].description 不能重复")
+        for caliber_index, caliber in enumerate(self.business_caliber):
+            self._validate_plan_references(
+                caliber.plan_references,
+                blocks_by_id,
+                f"business_caliber[{caliber_index}].plan_references",
+            )
+
+    # 统一验证自然语言规则和业务口径只能引用已存在的正式列表项或块级关系语义。
+    @staticmethod
+    def _validate_plan_references(
+        references: list[str],
+        blocks_by_id: dict[str, QueryPlanBlock],
+        field_path: str,
+    ) -> None:
+        if len(references) != len(set(references)):
+            raise ValueError(f"{field_path} 不能重复")
+        for reference in references:
+            indexed_reference = re.fullmatch(
+                r"query_blocks\[([A-Za-z_][A-Za-z0-9_]*)\]\."
+                r"(joins|filters|quantified_conditions|select_fields|"
+                r"group_by|aggregations|having|order_by)\[(\d+)\]",
+                reference,
+            )
+            scalar_reference = re.fullmatch(
+                r"query_blocks\[([A-Za-z_][A-Za-z0-9_]*)\]\."
+                r"(base_source|deduplication)",
+                reference,
+            )
+            if indexed_reference is None and scalar_reference is None:
+                raise ValueError(
+                    "plan_references 必须带查询块作用域，例如 "
+                    "query_blocks[qualified_users].filters[0] 或 "
+                    "query_blocks[result_rows].deduplication"
                 )
-                if matched_reference is None:
-                    raise ValueError(
-                        "plan_references 必须带查询块作用域，例如 "
-                        "query_blocks[qualified_users].filters[0]"
-                    )
-                block_id, component_name, raw_index = matched_reference.groups()
-                if block_id not in blocks_by_id:
-                    raise ValueError(f"计划组件引用了不存在的查询块：{reference}")
-                component_size = len(getattr(blocks_by_id[block_id], component_name))
-                if int(raw_index) >= component_size:
-                    raise ValueError(
-                        f"计划组件引用越界：{reference}，"
-                        f"{component_name} 只有 {component_size} 项"
-                    )
+            if indexed_reference is not None:
+                block_id, component_name, raw_index = indexed_reference.groups()
+            else:
+                assert scalar_reference is not None
+                block_id, _ = scalar_reference.groups()
+                component_name = ""
+                raw_index = "0"
+            if block_id not in blocks_by_id:
+                raise ValueError(f"计划组件引用了不存在的查询块：{reference}")
+            if indexed_reference is None:
+                continue
+            component_size = len(getattr(blocks_by_id[block_id], component_name))
+            if int(raw_index) >= component_size:
+                raise ValueError(
+                    f"计划组件引用越界：{reference}，"
+                    f"{component_name} 只有 {component_size} 项"
+                )
 
     # 返回最终结果查询块，供展示、审计和现有领域策略读取根作用域。
     @property
@@ -938,7 +1377,9 @@ def build_natural_language_query_tool_definition() -> dict[str, object]:
             "同时提交结构化的只读 SQL 数据获取计划和确定性结果塑形计划。"
             "query_plan 必须由拓扑有序 query_blocks 组成，并由 root_block_id 指向根块；"
             "资格判断与最终明细粒度不同时必须拆成独立查询块。"
-            "所有关联、筛选、返回字段、分组和排序均须保留原始标识符；"
+            "每块必须明确 FROM 起点、有序 JOIN 右侧/类型/基数/右键、完整 ON "
+            "与 DISTINCT 口径；所有关联、筛选、返回字段、分组和排序"
+            "均须保留原始标识符；"
             "query_plan 只供 SQL 查询执行层使用，result_shape_plan 不得改变查询口径；"
             "pagination.limit 是规划层确定的结果行上限；"
             "为 null 时后续 SQL 将按筛选条件完整执行。"
@@ -1017,8 +1458,17 @@ def render_natural_language_query_plan(
             "- 粒度键：" + ("、".join(f"`{item}`" for item in block.grain_fields) or "全局单行"),
             "- 真实表：" + ("、".join(f"`{item}`" for item in block.source_tables) or "无"),
             "- 前置块：" + ("、".join(f"`{item}`" for item in block.input_blocks) or "无"),
+            f"- 起始数据源：`{block.base_source}`",
             "- 关联："
-            + ("；".join(f"`{item.condition}`" for item in block.joins) or "无"),
+            + (
+                "；".join(
+                    f"`{item.join_type}` `{item.right_source}` "
+                    f"({item.cardinality}) ON `{item.condition}`"
+                    for item in block.joins
+                )
+                or "无"
+            ),
+            f"- 去重：`{block.deduplication.mode}`（{block.deduplication.reason}）",
             "- 筛选："
             + ("；".join(f"`{item.condition}`" for item in block.filters) or "无"),
             "- 量词："
@@ -1026,7 +1476,22 @@ def render_natural_language_query_plan(
                 "；".join(
                     f"`{item.quantifier}` {item.collection}（主体键 "
                     + "、".join(f"`{key}`" for key in item.subject_key)
-                    + f"；成员条件 `{item.predicate}`）"
+                    + f"；成员条件 `{item.predicate}`；实现 `{item.implementation}`"
+                    + (
+                        f"；集合 FROM `{item.collection_base_source}`"
+                        + (
+                            "，JOIN "
+                            + "、".join(
+                                f"`{query_join.right_source}`"
+                                for query_join in item.collection_joins
+                            )
+                            if item.collection_joins
+                            else ""
+                        )
+                        if item.collection_base_source is not None
+                        else ""
+                    )
+                    + "）"
                     for item in block.quantified_conditions
                 )
                 or "无"
@@ -1058,7 +1523,9 @@ def render_natural_language_query_plan(
         else "规划未设置行数上限；SQL 将完整执行当前筛选条件，偏移量为 0。"
     )
     business_caliber_lines = [
-        f"- {business_caliber}" for business_caliber in query_plan.business_caliber
+        f"- {business_caliber.description}："
+        + "、".join(business_caliber.plan_references)
+        for business_caliber in query_plan.business_caliber
     ] or ["- 无额外业务口径。"]
     assumption_lines = [f"- {assumption}" for assumption in query_plan.assumptions] or [
         "- 无额外假设。"

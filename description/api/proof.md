@@ -56,7 +56,8 @@ proof_record.status = 1
     "created_at": "2026-08-12T10:30:45",
     "proof_date": "2026-08-11",
     "note": "晚间跑步 5 公里",
-    "review_comment": "距离满足单次要求"
+    "preliminary_review_comment": "距离满足单次要求",
+    "review_comment": null
   }
 ]
 ```
@@ -69,7 +70,8 @@ proof_record.status = 1
 | `created_at` | `datetime` | 实际上传时间，使用 ISO 8601 格式 |
 | `proof_date` | `date` | 实际运动日期，格式为 `YYYY-MM-DD` |
 | `note` | `string \| null` | 用户运动备注 |
-| `review_comment` | `string \| null` | 初审意见 |
+| `preliminary_review_comment` | `string \| null` | 大模型初审意见 |
+| `review_comment` | `string \| null` | 管理员终审意见；待终审记录通常为 `null` |
 
 没有匹配记录时返回空数组 `[]` 和 `200 OK`。空数组不区分参赛记录不存在、全部已终审或全部被其他条件排除。
 
@@ -114,12 +116,12 @@ Content-Type: application/json
 | 字段 | 类型 | 必填 | 约束 | 说明 |
 | --- | --- | --- | --- | --- |
 | `proof_record_id` | `integer` | 是 | 大于 `0` | 待终审凭证 ID |
-| `review_comment` | `string \| null` | 是 | 非空时去除首尾空白后为 `1～500` 个字符 | 终审评语，覆盖初审意见；无需评语时传 `null` |
+| `review_comment` | `string \| null` | 是 | 非空时去除首尾空白后为 `1～500` 个字符 | 终审评语；无需评语时传 `null` |
 | `decision` | `string` | 是 | `approved` 或 `rejected` | 终审决定 |
 
 只有 `status = 1` 且 `review_status = preliminary_approved` 的凭证可以终审。已经终审或处于其他初审状态的凭证不能重复提交，避免重复撤销进度。
 
-决定为 `approved` 时，接口将 `review_status` 更新为 `approved` 并覆盖 `review_comment`，不改变凭证 `increase` 或项目进度。
+决定为 `approved` 时，接口将 `review_status` 更新为 `approved` 并写入 `review_comment`，不改变 `preliminary_review_comment`、凭证 `increase` 或项目进度。
 
 决定为 `rejected` 时，在同一事务中执行：
 

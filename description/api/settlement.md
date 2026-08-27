@@ -211,7 +211,8 @@ proof_record.status = 1
     "created_at": "2026-07-30T20:15:00",
     "proof_date": "2026-07-30",
     "note": "晚间跑步 5 公里",
-    "review_comment": "初审符合单次要求"
+    "preliminary_review_comment": "初审符合单次要求",
+    "review_comment": null
   }
 ]
 ```
@@ -225,7 +226,8 @@ proof_record.status = 1
 | `created_at` | `datetime` | 凭证实际上传时间 |
 | `proof_date` | `date` | 凭证对应运动日期 |
 | `note` | `string \| null` | 用户运动备注 |
-| `review_comment` | `string \| null` | 初审意见 |
+| `preliminary_review_comment` | `string \| null` | 大模型初审意见 |
+| `review_comment` | `string \| null` | 管理员终审意见；待终审记录通常为 `null` |
 
 没有符合条件的凭证时返回空数组 `[]` 和 `200 OK`。
 
@@ -272,7 +274,7 @@ proof_record.status = 1
 
 决定为 `approved` 时，在同一事务内：
 
-1. 将凭证更新为终审通过；初审已经计入的 `increase` 和项目进度保持不变。
+1. 将凭证更新为终审通过并把请求中的 `review_comment` 保存为终审意见；保留 `preliminary_review_comment`，初审已经计入的 `increase` 和项目进度保持不变。
 2. 将该凭证对应的 `season_supplement_eligibility.status` 更新为 `0`，关闭继续补传资格。
 3. 重新检查该用户是否仍有 `preliminary_approved` 凭证或 `status = 1` 的补传资格。
 4. 阻塞条件全部消失后，按最终项目完成数、挑战等级和连续完成月份自动计算积分。

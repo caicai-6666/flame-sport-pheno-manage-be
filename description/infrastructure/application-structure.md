@@ -183,7 +183,7 @@ cp .env.example .env
 | 连接池 | `MYSQL_POOL_SIZE`、`MYSQL_MAX_OVERFLOW`、`MYSQL_POOL_RECYCLE_SECONDS` | 数据库连接池容量与回收周期 |
 | 客户端后端 | `CLIENT_BACKEND_BASE_URL`、`CLIENT_BACKEND_TIMEOUT_SECONDS` | 客户端后端局域网服务地址和请求超时 |
 | 图片缓存 | `IMAGE_CACHE_SECONDS` | 所有图片响应的浏览器私有缓存时效，单位为秒 |
-| 查询智能体 | `DEEPSEEK_*`、`AGENT_QUERY_*` | 模型连接、各阶段单次输出、生成与工具次数、活动会话、事件历史、会话保留和 SSE 心跳 |
+| 查询智能体 | `DEEPSEEK_*`、`AGENT_QUERY_*` | 模型连接、各阶段单次输出、生成与工具次数、活动会话、事件历史、会话保留、SSE 心跳和脱敏诊断日志 |
 
 配置由 `pydantic-settings` 从根目录 `.env` 和进程环境变量加载并校验。数据库密码使用 `SecretStr` 保存，构造连接地址时通过 SQLAlchemy `URL` 处理特殊字符。
 
@@ -235,9 +235,13 @@ AGENT_QUERY_MAX_ACTIVE_SESSIONS=20
 AGENT_QUERY_EVENT_HISTORY_SIZE=200
 AGENT_QUERY_SESSION_TTL_SECONDS=3600
 AGENT_QUERY_SSE_HEARTBEAT_SECONDS=15
+AGENT_QUERY_DIAGNOSTIC_LOG_ENABLED=false
+AGENT_QUERY_DIAGNOSTIC_LOG_LEVEL=basic
 ```
 
 管理端不会因存在密钥而自动发起模型请求。只有创建查询任务后，业务对齐、查询规划、单表检索、SQL 生成、结果翻译和结果审计才会使用 DeepSeek Beta strict function calling。翻译层按待翻译字段独立调用模型，并受 `AGENT_QUERY_TRANSLATION_MAX_PARALLEL_FIELDS` 限制；`MAX_TOKENS`、并发数、生成轮次和工具次数分别构成独立预算，不能互相替代。
+
+查询诊断日志默认关闭。`basic` 只记录阶段、状态、次数、稳定错误码和耗时；`detailed` 额外记录涉及表、结果字段、已通过静态安全校验的参数化 SQL 模板及返回行数。修改开关或等级后必须重启应用，排障结束后应恢复为关闭。
 
 查询会话与事件只保存在单进程内存，`AGENT_QUERY_MAX_ACTIVE_SESSIONS` 包含正在运行和等待用户回答的任务。当前部署必须保持单 Worker；配置与完整安全边界见 [查询智能体运行时与业务域扩展](query-agent-runtime.md)。修改配置后需要重启应用。
 

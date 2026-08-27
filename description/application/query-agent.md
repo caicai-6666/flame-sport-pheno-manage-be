@@ -82,6 +82,8 @@ flowchart LR
 
 运动业务域中，“运动记录”“运动凭证”和“打卡记录”默认对齐为用户逐条提交的运动凭证明细。“有效打卡记录”“审核通过的运动凭证”等表达中的修饰语仍是查询条件，对齐时不得因同义词归一而丢失。
 
+核心玩法还区分大模型初审意见和管理员终审意见：两者独立保留，终审不得覆盖初审结论。用户指定审核阶段时，对齐层必须保留该阶段；查询跨越多个审核阶段的审核说明时，规划层分别返回初审与终审意见。减重等阶段型挑战不再假定用户基础资料含有身高，BMI 或其他派生指标的基线应从月初凭证信息及其初审意见理解。
+
 用户要求查看凭证关联图片时，对齐结果只保留“查看图片”的业务意图和每条凭证的唯一标识，不得改写为返回图片内容或图片地址；实际图片由后续图片查看流程根据凭证标识获取。
 
 运动业务域会在对齐终止工具提交后再次校验这一交付要求；如果对齐结果遗漏凭证唯一标识，工作流会把明确的修复信息作为原工具结果反馈给模型，不会让不完整需求进入查询规划阶段。
@@ -92,9 +94,9 @@ flowchart LR
 
 ### 2.3 查询规划
 
-规划层按需读取白名单表结构，必要时用单表候选检索确认用户提到的实际实体值。规划结果分为两份：`query_plan` 是由 `query_blocks` 组成的 SQL 数据获取计划，`root_block_id` 指向最终结果块；`result_shape_plan` 是翻译后本地程序使用的透传或动态转列计划。每个查询块独立声明行粒度 `row_granularity`、粒度键 `grain_fields`、本块及其内部普通子查询读取的真实表 `source_tables`、前置块 `input_blocks`，以及只在本块生效的关联、筛选、量词、分组、聚合、`HAVING`、输出字段和排序。两份计划由规划终止工具同时提交，但分开消费。
+规划层按需读取白名单表结构，必要时用单表候选检索确认用户提到的实际实体值。规划结果分为两份：`query_plan` 是由 `query_blocks` 组成的 SQL 数据获取计划，`root_block_id` 指向最终结果块；`result_shape_plan` 是翻译后本地程序使用的透传或动态转列计划。每个查询块独立声明行粒度 `row_granularity`、粒度键 `grain_fields`、本块读取的真实表 `source_tables`、前置块 `input_blocks` 和外层 FROM 起点 `base_source`。`joins` 按 SQL 顺序显式声明右侧数据源、`inner/left` 保留语义、相对当前左侧行的关联基数、右侧稳定键和完整 ON；`deduplication` 唯一决定该块是否使用普通 `SELECT DISTINCT`。筛选、量词、分组、聚合、`HAVING`、输出字段和排序也只在所属块生效。两份计划由规划终止工具同时提交，但分开消费。
 
-对齐层确认的每个集合量词都必须落实到某个查询块。量词通过 `subject_key` 声明被筛选主体键，数量型量词还通过 `member_key` 声明去重计数的集合成员键；`predicate`、`collection_filters` 和相关子查询的 `correlation_condition` 分别表示成员条件、集合范围和内外层关联。使用 `HAVING` 时，量词主体键必须与所在块的 `grain_fields` 完全一致。每个 `applied_business_rules` 标识也必须通过带块作用域的引用定位实际组件，例如 `query_blocks[qualified_users].filters[0]`，不能维护第二份伪 SQL。
+对齐层确认的每个集合量词都必须落实到某个查询块。量词通过 `subject_key` 声明被筛选主体键，数量型量词还通过单一 `member_key` 声明去重计数的集合成员键；`predicate`、`collection_filters` 和相关子查询的 `correlation_condition` 分别表示成员条件、集合范围和内外层关联。`all/any/none` 还通过 `collection_base_source` 和有序 `collection_joins` 唯一声明相关子查询内部的 FROM、JOIN 类型与完整 ON，成员条件只能引用该内部关系，关联条件必须同时引用内外层。`any`、`all/none`、数量型量词分别唯一派生 `EXISTS`、`NOT EXISTS` 和条件去重计数 `HAVING`，规划不再接收可与量词冲突的实现提示。数量型量词的 `subject_key`、`grain_fields` 和 `group_by` 必须完全一致，且不得再声明重复的自由 `having`。`require_non_empty` 显式决定 all/none 是否要求集合非空。每个 `applied_business_rules` 和面向人的 `business_caliber` 都必须通过带块作用域的 `plan_references` 定位实际组件，例如 `query_blocks[qualified_users].filters[0]`，不能维护第二份伪 SQL。`assumptions` 固定为空；影响结果的不确定事实必须先询问用户。
 
 当资格判断粒度与最终明细粒度不一致时，规划必须先建立 `qualification` 或 `aggregation` 块，在主体粒度输出合格主体键，再由根 `result` 块读取该前置块并返回明细。禁止在同一块按主体分组或执行 `HAVING`，同时选择下级明细字段；分组块的输出只能是分组键或已声明聚合表达式。备注字段只描述业务含义，不能修复这种结构冲突。完整导出要求 `pagination.limit = null`。塑形计划只能引用根块 `select_fields[].result_field`；`pivot` 必须使用最终行主体真实 ID 作为稳定分组键，用户未要求的技术 ID 放入 `hidden_fields`。
 
@@ -131,9 +133,9 @@ SQL 子图按“生成、校验、执行”三步运行，只接收 `query_plan`
 
 SQL 子图在校验通过后同时保留两种等价形态：数据库执行形态将命名占位符编译为 asyncmy 使用的 `%s`；来源分析形态保留 `:parameter_name`，供后续 SQLGlot 重新解析字段与来源表。翻译层不得将 `%s` 执行 SQL 作为 AST 分析输入。
 
-SQL 静态校验还会验证同一个 `EXISTS` 或 `NOT EXISTS` 是否同时包含规划要求的成员条件或反条件、全部集合范围，以及跨越子查询作用域的主体关联。仅在两个内层表之间建立同字段关联不能冒充外层主体关联。数值比较按十进制等值归一化，规划别名和 SQL 别名均还原到真实表名，避免 `1.0000` 与 `1.0`、不同合法别名造成误判。WHERE、HAVING、JOIN 和嵌套量词子查询中的筛选字面量必须参数化；错误反馈会指出具体谓词和值，并在有限生成预算内交给同一 SQL 工具调用修复。
+SQL 静态校验还会验证同一个 `EXISTS` 或 `NOT EXISTS` 是否使用 `SELECT 1`、计划指定的内部 FROM 和有序 JOIN，并同时包含规划要求的成员条件或反条件、全部集合范围，以及跨越子查询作用域的主体关联。仅在两个内层表之间建立同字段关联不能冒充外层主体关联；内部错误 ON、集合运算、`GROUP BY`、`HAVING`、排序或分页也不能进入量词子查询。数量型量词必须精确生成 `COUNT(DISTINCT CASE WHEN <集合范围 AND 成员条件> THEN <成员键> END)`，比较符和数量也必须与 `exactly/at_least/at_most` 一致，错误的计数键、`>=`/等号互换或额外冲突 `HAVING` 都会被拒绝。数值比较按十进制等值归一化。WHERE、HAVING、JOIN 和嵌套量词子查询中的筛选字面量必须参数化；错误反馈会指出具体谓词和值，并在有限生成预算内交给同一 SQL 工具调用修复。
 
-SQL AST 校验会逐块核对 CTE 集合、真实表、前置块、输出表达式、`GROUP BY`、`JOIN`、`WHERE` 和 `HAVING`。条件即使在整条 SQL 中出现，只要位于错误查询块或错误子句也会被拒绝；SQL 也不能增加无关 CTE 或省略计划块。同一真实表承担多个角色时必须使用计划声明的角色别名，避免不同角色被归一化后误判为等价。错误会以原 `submit_sql_query` 的 `tool_call_id` 写入同一消息上下文，模型在剩余预算内修复，只有重新通过全部静态校验的 SQL 才会执行。
+SQL AST 校验会逐块核对 CTE 集合、真实表、前置块、输出表达式、`GROUP BY`、`WHERE` 和 `HAVING`。关系形状则按声明顺序精确核对：FROM 必须为 `base_source`，每个 JOIN 必须使用对应 `right_source`、`join_type` 和完整 ON，不能换成逗号关联、改变保留侧、把 ON 移入 WHERE 或增加未声明谓词；普通 `SELECT DISTINCT` 也必须与 `deduplication.mode` 双向一致。角色别名会逐项核对别名到真实来源表的映射，不能只保留别名文字却交换来源。每个 CTE 必须是一条独立 SELECT，非根块不能分页；查询块只允许协议已表达的 SELECT 子句，因此 `UNION`、`QUALIFY`、分组汇总修饰、非默认空值排序和表分区等改变结果范围的结构都会被拒绝。条件即使在整条 SQL 中出现，只要位于错误查询块或错误子句也会被拒绝；SQL 也不能增加无关 CTE 或省略计划块。错误会以原 `submit_sql_query` 的 `tool_call_id` 写入同一消息上下文，模型在剩余预算内修复，只有重新通过全部静态校验的 SQL 才会执行。
 
 ### 2.6 结果翻译
 

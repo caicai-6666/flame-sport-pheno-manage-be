@@ -31,7 +31,12 @@ from app.agent.runtime.model_options import (
     build_non_thinking_completion_options,
     build_strict_tools_base_url,
 )
-from app.agent.tools.query_plan import NaturalLanguageQueryPlan
+from app.agent.tools.query_plan import (
+    NaturalLanguageQueryPlan,
+    QueryPlanBlock,
+    QueryPlanJoin,
+    QueryPlanQuantifiedCondition,
+)
 from app.agent.tools.strict_schema import (
     StrictToolSchemaValidationError,
     build_strict_tool_definition,
@@ -431,20 +436,22 @@ def _build_sql_generation_system_prompt() -> str:
 6. 查询计划是唯一业务事实来源。不要读取或假定用户原问题、规划阶段的思考过程、表概述或任何未提供数据。
 7. 每个 select_fields 项都带有稳定 `result_field`。SELECT 必须按 select_fields 顺序为每项显式使用 `AS result_field`，result_columns 必须按相同顺序精确填写这些 result_field，不得新增、删除、改名或重复。
 8. 严格遵循查询计划的 pagination：limit 为 null 时不得自行添加 LIMIT；limit 为整数时必须使用该整数。不要为了审计模型上下文、性能猜测或其他自行判断增加或缩小结果范围。
-9. 对 all 和 none 量词，成员 predicate 不能先作为外层普通 WHERE 删除反例。必须按 quantified_conditions 的实现方式完成主体资格判断；EXISTS、NOT EXISTS 或相关子查询必须在同一个子查询内完整实现 correlation_condition、全部 collection_filters 和正确方向的成员 predicate/反条件。若最终还要返回集合成员行，应先确定合格主体，再在外层关联并返回成员。
+9. 对 all 和 none 量词，成员 predicate 不能先作为外层普通 WHERE 删除反例。必须按 quantified_conditions 由 quantifier 唯一派生的实现完成主体资格判定；any 使用 EXISTS，all/none 使用 NOT EXISTS，exactly/at_least/at_most 使用规范 HAVING。每个 EXISTS/NOT EXISTS 必须写成规范的 `SELECT 1`，FROM 精确使用 collection_base_source，按顺序完整实现 collection_joins，且不得附加 DISTINCT、GROUP BY、HAVING、ORDER BY、LIMIT、OFFSET 或集合运算；同一子查询还要完整实现 correlation_condition、全部 collection_filters 和正确方向的成员 predicate/反条件。require_non_empty=true 时还必须按相同内部关系用正向 EXISTS 证明集合非空。数量型量词必须在所属块 HAVING 中精确写为 `COUNT(DISTINCT CASE WHEN collection_filters AND predicate THEN member_key END) <operator> :count`，exactly/at_least/at_most 的 operator 分别是 `=`/`>=`/`<=`。若最终还要返回集合成员行，应先确定合格主体，再在外层关联并返回成员。
 10. query_blocks 是不可跨越的条件作用域。每个非根查询块必须实现为与 block_id 同名的一个 CTE，且只能读取自身 source_tables 和 input_blocks；根查询块是最外层 SELECT。不得遗漏、增加或重命名计划查询块，也不得把某块的 JOIN、WHERE、GROUP BY、HAVING 或量词条件移动到其他块。
 11. 每个查询块的 SELECT 必须按该块 select_fields 顺序显式使用 AS result_field。后续块只能通过 `input_block.result_field` 引用前置块输出。最终 result_columns 只填写根查询块的 result_field。
-12. aliases 对查询块内的外层 SELECT 和嵌套子查询共同生效。必须精确使用计划已声明的角色别名，不得为 EXISTS/NOT EXISTS 成员表临时发明 `alias2`、`member_alias` 等新别名，也不得改回真实表名；量词成员表只在相关子查询使用时，不要把它额外加入外层 FROM 或 JOIN。
+12. aliases 对查询块内的外层 SELECT 和嵌套子查询共同生效。必须精确使用计划已声明的角色别名，未声明 aliases 时不得自行为表或 CTE 添加别名。不得为 EXISTS/NOT EXISTS 成员表临时发明 `alias2`、`member_alias` 等新别名，也不得改回真实表名；量词成员表只在相关子查询使用时，不要把它额外加入外层 FROM 或 JOIN。
+13. 每个查询块的外层关系形状必须逐字段实现：FROM 起始数据源精确等于 base_source；JOIN 按计划顺序精确使用 right_source 和 join_type；完整 condition 只能位于对应 JOIN ON，不得多加 ON 条件、换成逗号连接或移入 WHERE。deduplication.mode=distinct 时必须 SELECT DISTINCT，mode=none 时禁止 DISTINCT。cardinality 和 right_key 只是规划层已确认的行放大语义，SQL 不得据此自行改写聚合或去重。
 
 输入是合法 YAML，字段含义固定如下：
 - `query_plan` 是 SQL 层唯一权威的数据获取计划；`query_goal` 是查询目标，`root_block_id` 标识最外层结果块，`query_blocks` 按依赖拓扑顺序排列。
 - `tables` 列出参与表；每项的 `table_name` 是真实表名，`role` 是本次职责。
-- 每个查询块的 `row_granularity` 和 `grain_fields` 定义本块行粒度；`source_tables` 是本块直接读取的真实表，`input_blocks` 是本块直接读取的前置 CTE。`aliases`、`joins`、`filters`、`quantified_conditions`、`group_by`、`aggregations`、`having` 和 `order_by` 只在所属块生效。
-- `quantified_conditions.subject_key` 是资格主体键，数量型量词的 `member_key` 是去重计数键；`predicate`、`correlation_condition`、`collection_filters` 不能互相替代。
+- 每个查询块的 `row_granularity` 和 `grain_fields` 定义本块行粒度；`source_tables` 是本块及其普通子查询读取的真实表，`input_blocks` 是本块直接读取的前置 CTE。`base_source` 是外层 FROM；`joins` 依次定义右侧数据源、INNER/LEFT 保留语义、关联基数、右侧键和完整 ON；`deduplication` 唯一定义 SELECT DISTINCT。`aliases`、`filters`、`quantified_conditions`、`group_by`、`aggregations`、`having` 和 `order_by` 只在所属块生效。
+- `quantified_conditions.subject_key` 是资格主体键，数量型量词的单一 `member_key` 是去重计数键；`predicate`、`correlation_condition`、`collection_filters` 不能互相替代。all/any/none 的 `collection_base_source` 与 `collection_joins` 唯一定义相关子查询内部关系形状；数量型量词固定将这两项设为 null 和空列表。SQL 实现由 quantifier 唯一派生，`require_non_empty` 则唯一决定 all/none 是否额外要求集合非空。
 - `implemented_business_rules` 只把核心规则映射到 joins、filters、quantified_conditions 等已有计划组件，便于审计覆盖情况；不得把它当成第二份 SQL 表达式来源。SQL 只需准确实现被引用的正式计划组件。
+- `strategy` 和 `strategy_reason` 只是规划层由正式组件派生的人工审阅信息；不得据此改变 base_source、joins、quantified_conditions、分组或筛选。
 - `select_fields` 是所属查询块的输出字段；`field` 是字段或表达式，`result_field` 是该块 SQL 必须输出的 AS 别名，`purpose` 是简短表头标签。
 - `pagination.limit` 是根查询块最大结果行数或 null，`pagination.offset` 是根查询块偏移量。
-- `business_caliber` 是必须落实的业务口径；`assumptions` 是已确认允许保留的假设。
+- `business_caliber` 只用于解释及审计；每项 `plan_references` 已指向真正执行该口径的正式计划组件，不得根据 description 额外增删 SQL 条件。`assumptions` 必须为空列表。
 - `allowed_table_schemas` 是允许读取的表结构列表；每项的 `table` 是真实表名，`columns` 是字段列表，`field_name`、`data_type`、`foreign_key`、`comment` 分别表示真实字段、数据库类型、外键目标和字段注释。
 
 只能按以上固定含义读取 YAML，不能把 YAML 键名误当成数据库标识符。"""
@@ -567,7 +574,12 @@ def _validate_ast_safety(
             message="SQL 仅允许 SELECT 或 WITH ... SELECT 查询",
             repair_action="将草稿重写为一条只读 SELECT；需要分步计算时使用 WITH ... SELECT。",
         )
-    if expression.args.get("locks"):
+    locking_selects = [
+        select_expression
+        for select_expression in expression.find_all(exp.Select)
+        if select_expression.args.get("locks")
+    ]
+    if expression.args.get("locks") or locking_selects:
         raise SqlValidationError(
             code="locking_read_forbidden",
             message="SQL 不允许使用 FOR UPDATE 或其他锁定读取",
@@ -594,6 +606,30 @@ def _validate_ast_safety(
                 code="qualified_table_forbidden",
                 message="SQL 不允许指定数据库或目录名",
                 repair_action="删除数据库或目录前缀，仅使用查询计划声明的原始表名。",
+            )
+        unsupported_table_modifiers = sorted(
+            key
+            for key, value in table.args.items()
+            if key not in {"this", "db", "catalog", "alias"}
+            and value is not None
+            and value is not False
+            and value != []
+        )
+        if unsupported_table_modifiers:
+            raise SqlValidationError(
+                code="table_modifier_forbidden",
+                message=(
+                    f"SQL 数据源 {table.name} 使用了计划未声明的表修饰："
+                    + "、".join(unsupported_table_modifiers)
+                ),
+                repair_action=(
+                    f"删除表 `{table.name}` 上的 PARTITION、TABLESAMPLE、版本或其他"
+                    "数据范围修饰，只读取计划声明的完整数据源。"
+                ),
+                details={
+                    "table_name": table.name,
+                    "modifiers": unsupported_table_modifiers,
+                },
             )
         if table.name not in cte_names:
             physical_table_names.add(table.name)
@@ -715,12 +751,15 @@ def _normalize_column_table_aliases(
     expression: exp.Expression,
     declared_aliases: dict[str, str] | None = None,
 ) -> exp.Expression:
-    alias_to_table_name = dict(declared_aliases or {})
-    alias_to_table_name.update({
-        table.alias: table.name
-        for table in expression.find_all(exp.Table)
-        if table.alias and table.alias != table.name
-    })
+    alias_to_table_name = (
+        {
+            table.alias: table.name
+            for table in expression.find_all(exp.Table)
+            if table.alias and table.alias != table.name
+        }
+        if declared_aliases is None
+        else dict(declared_aliases)
+    )
 
     # 只改写列的限定符，不改变表节点和 SQL 执行文本。
     def replace_column_alias(node: exp.Expression) -> exp.Expression:
@@ -776,13 +815,28 @@ def _normalize_numeric_literals(expression: exp.Expression) -> exp.Expression:
     return expression.copy().transform(replace_numeric_literal)
 
 
+# 移除 AST 中不改变运算结构的显式括号，避免同义条件因排版不同被误拒。
+def _remove_expression_parentheses(expression: exp.Expression) -> exp.Expression:
+    # 用内部子树替换 Paren 节点，sqlglot 会按实际优先级重新渲染必要括号。
+    def replace_parenthesis(node: exp.Expression) -> exp.Expression:
+        if isinstance(node, exp.Paren):
+            return node.this.copy()
+        return node
+
+    return expression.copy().transform(replace_parenthesis)
+
+
 # 使用归一化 MySQL 文本比较两个表达式子树，忽略排版和等值数值精度差异。
 def _expressions_are_equivalent(
     left: exp.Expression,
     right: exp.Expression,
 ) -> bool:
-    normalized_left = _normalize_numeric_literals(left)
-    normalized_right = _normalize_numeric_literals(right)
+    normalized_left = _normalize_numeric_literals(
+        _remove_expression_parentheses(left)
+    )
+    normalized_right = _normalize_numeric_literals(
+        _remove_expression_parentheses(right)
+    )
     if normalized_left.sql(dialect="mysql") == normalized_right.sql(
         dialect="mysql"
     ):
@@ -837,21 +891,6 @@ def _parse_quantified_plan_condition(
     return condition_where.this
 
 
-# 判断一个子表达式是否包含与规划条件等价的完整谓词，比较前统一还原 SQL 表别名。
-def _expression_contains_condition(
-    expression: exp.Expression,
-    expected_condition: exp.Expression,
-    sql_aliases: dict[str, str],
-) -> bool:
-    return any(
-        _expressions_are_equivalent(
-            _normalize_column_table_aliases(candidate, sql_aliases),
-            expected_condition,
-        )
-        for candidate in expression.walk()
-    )
-
-
 # 解析规划中的跨表关联条件；无效条件必须回到规划层修正，不能要求 SQL 模型猜测真实关系。
 def _parse_planned_join_condition(
     condition_text: str,
@@ -904,31 +943,6 @@ def _walk_without_nested_selects(
             continue
         scoped_expressions.extend(_walk_without_nested_selects(child))
     return scoped_expressions
-
-
-# 判断关联条件是否位于当前 SELECT 的 JOIN、WHERE 或 HAVING 中，嵌套查询中的同名条件不计入。
-def _select_scope_contains_condition(
-    select_expression: exp.Select,
-    expected_condition: exp.Expression,
-    sql_aliases: dict[str, str],
-) -> bool:
-    condition_roots: list[exp.Expression] = []
-    for join_expression in select_expression.args.get("joins") or []:
-        on_expression = join_expression.args.get("on")
-        if on_expression is not None:
-            condition_roots.append(on_expression)
-    for clause_name in ("where", "having"):
-        clause = select_expression.args.get(clause_name)
-        if clause is not None and clause.this is not None:
-            condition_roots.append(clause.this)
-    return any(
-        _expressions_are_equivalent(
-            _normalize_column_table_aliases(candidate, sql_aliases),
-            expected_condition,
-        )
-        for condition_root in condition_roots
-        for candidate in _walk_without_nested_selects(condition_root)
-    )
 
 
 # 解析查询块中的普通筛选或 HAVING 条件，无法解析时明确返回规划阶段修正。
@@ -1028,6 +1042,37 @@ def _get_query_block_selects(
     if with_expression is not None:
         for cte in with_expression.expressions:
             cte_name = cte.alias_or_name
+            cte_alias = cte.args.get("alias")
+            cte_column_aliases = (
+                list(cte_alias.args.get("columns") or [])
+                if isinstance(cte_alias, exp.TableAlias)
+                else []
+            )
+            cte_modifiers = sorted(
+                key
+                for key, value in cte.args.items()
+                if key not in {"this", "alias"}
+                and value is not None
+                and value is not False
+                and value != []
+            )
+            if cte_column_aliases or cte_modifiers:
+                raise SqlValidationError(
+                    code="query_block_cte_modifier_forbidden",
+                    message=(
+                        f"查询块 CTE {cte_name} 使用了计划未声明的列重命名或修饰"
+                    ),
+                    repair_action=(
+                        f"将 CTE `{cte_name}` 改为普通 `AS (SELECT ...)`；"
+                        "删除 CTE 名称后的列别名列表及 MATERIALIZED 等修饰，"
+                        "输出名只能由该查询块 select_fields.result_field 决定。"
+                    ),
+                    details={
+                        "block_id": cte_name,
+                        "column_alias_count": len(cte_column_aliases),
+                        "modifiers": cte_modifiers,
+                    },
+                )
             if cte_name in ctes_by_name:
                 raise SqlValidationError(
                     code="query_block_cte_duplicated",
@@ -1071,12 +1116,18 @@ def _get_query_block_selects(
         )
     block_selects = {query_plan.root_block_id: root_select}
     for block_id, cte in ctes_by_name.items():
-        cte_select = cte.this if isinstance(cte.this, exp.Select) else cte.this.find(exp.Select)
+        cte_select = cte.this
         if not isinstance(cte_select, exp.Select):
             raise SqlValidationError(
-                code="query_block_select_missing",
-                message=f"查询块 {block_id} 没有可执行的 SELECT",
-                repair_action=f"将 CTE `{block_id}` 改为一条 SELECT 查询。",
+                code="query_block_set_operation_forbidden",
+                message=(
+                    f"查询块 {block_id} 必须是一条独立 SELECT，不能使用 UNION、"
+                    "INTERSECT 或 EXCEPT"
+                ),
+                repair_action=(
+                    f"将 CTE `{block_id}` 精确改为查询计划对应的一条 SELECT；"
+                    "删除所有集合运算分支。"
+                ),
             )
         block_selects[block_id] = cte_select
     return block_selects
@@ -1115,6 +1166,424 @@ def _get_query_block_sources(
     return physical_tables, input_blocks
 
 
+# 限定每个计划查询块可出现的 SELECT 子句，拒绝协议未表达的 QUALIFY 等隐式筛选。
+def _validate_query_block_select_arguments(
+    select_expression: exp.Select,
+    block_id: str,
+    *,
+    is_root: bool,
+) -> None:
+    allowed_arguments = {
+        "expressions",
+        "from_",
+        "joins",
+        "where",
+        "group",
+        "having",
+        "order",
+        "distinct",
+    }
+    if is_root:
+        allowed_arguments.update({"with", "with_", "limit", "offset"})
+    unexpected_arguments = sorted(
+        key
+        for key, value in select_expression.args.items()
+        if key not in allowed_arguments
+        and value is not None
+        and value is not False
+        and value != []
+    )
+    if unexpected_arguments:
+        raise SqlValidationError(
+            code="query_block_select_clause_forbidden",
+            message=(
+                f"查询块 {block_id} 使用了计划协议未声明的 SELECT 子句："
+                + "、".join(unexpected_arguments)
+            ),
+            repair_action=(
+                f"删除查询块 `{block_id}` 中的 QUALIFY、WINDOW、CONNECT、"
+                "MATCH、PREWHERE 或其他未进入查询计划的附加子句；"
+                "仅保留正式计划对应的 SELECT/FROM/JOIN/WHERE/GROUP BY/"
+                "HAVING/ORDER BY/DISTINCT，且分页只允许位于根查询块。"
+            ),
+            details={
+                "block_id": block_id,
+                "unexpected_select_arguments": unexpected_arguments,
+            },
+        )
+
+
+# 将 JOIN ON 顶层的 AND 拆成无序原子条件，允许等值两侧和 AND 书写顺序不同。
+def _flatten_conjunction(expression: exp.Expression) -> list[exp.Expression]:
+    if isinstance(expression, exp.Paren):
+        return _flatten_conjunction(expression.this)
+    if isinstance(expression, exp.And):
+        return _flatten_conjunction(expression.this) + _flatten_conjunction(
+            expression.expression
+        )
+    return [expression]
+
+
+# 比较两个完整 JOIN ON 条件，拒绝缺失或额外的关联谓词。
+def _join_conditions_are_equivalent(
+    actual_condition: exp.Expression,
+    expected_condition: exp.Expression,
+    comparison_aliases: dict[str, str],
+) -> bool:
+    actual_parts = [
+        _normalize_column_table_aliases(part, comparison_aliases)
+        for part in _flatten_conjunction(actual_condition)
+    ]
+    expected_parts = _flatten_conjunction(expected_condition)
+    if len(actual_parts) != len(expected_parts):
+        return False
+    unmatched_actual_parts = list(actual_parts)
+    for expected_part in expected_parts:
+        matched_index = next(
+            (
+                index
+                for index, actual_part in enumerate(unmatched_actual_parts)
+                if _expressions_are_equivalent(actual_part, expected_part)
+            ),
+            None,
+        )
+        if matched_index is None:
+            return False
+        unmatched_actual_parts.pop(matched_index)
+    return not unmatched_actual_parts
+
+
+# 将 sqlglot JOIN 归一为计划协议允许的 inner/left，其他保留语义一律拒绝。
+def _get_supported_join_type(join_expression: exp.Join) -> str | None:
+    side = str(join_expression.args.get("side") or "").upper()
+    kind = str(join_expression.args.get("kind") or "").upper()
+    if join_expression.args.get("on") is None:
+        return None
+    if not side and kind in {"", "INNER"}:
+        return "inner"
+    if side == "LEFT" and kind in {"", "OUTER"}:
+        return "left"
+    return None
+
+
+# 精确核对查询块外层 FROM、JOIN 保留侧、ON 和 DISTINCT，阻止 SQL 渲染器二次决策。
+def _validate_query_block_relation_shape(
+    block_select: exp.Select,
+    block: QueryPlanBlock,
+    comparison_aliases: dict[str, str],
+) -> None:
+    from_expression = block_select.args.get("from_")
+    base_table = from_expression.this if from_expression is not None else None
+    if not isinstance(base_table, exp.Table):
+        raise SqlValidationError(
+            code="query_block_base_source_mismatch",
+            message=f"SQL 查询块 {block.block_id} 没有使用计划指定的 FROM 起始数据源",
+            repair_action=(
+                f"将查询块 `{block.block_id}` 的外层 FROM 精确改为 "
+                f"`{block.base_source}`，不得使用派生表或额外别名。"
+            ),
+            details={"block_id": block.block_id, "expected_base_source": block.base_source},
+        )
+    actual_base_source = base_table.alias_or_name
+    if actual_base_source != block.base_source:
+        raise SqlValidationError(
+            code="query_block_base_source_mismatch",
+            message=f"SQL 查询块 {block.block_id} 的 FROM 起始数据源与计划不一致",
+            repair_action=(
+                f"将查询块 `{block.block_id}` 的外层 FROM 起始数据源"
+                f"精确改为 `{block.base_source}`；当前为 `{actual_base_source}`。"
+            ),
+            details={
+                "block_id": block.block_id,
+                "expected_base_source": block.base_source,
+                "actual_base_source": actual_base_source,
+            },
+        )
+
+    actual_joins = list(block_select.args.get("joins") or [])
+    if len(actual_joins) != len(block.joins):
+        raise SqlValidationError(
+            code="query_block_join_count_mismatch",
+            message=f"SQL 查询块 {block.block_id} 的外层 JOIN 数量与计划不一致",
+            repair_action=(
+                f"按 query_blocks[{block.block_id}].joins 的顺序且只生成 "
+                f"{len(block.joins)} 个外层 JOIN；当前为 {len(actual_joins)} 个。"
+            ),
+            details={
+                "block_id": block.block_id,
+                "expected_join_count": len(block.joins),
+                "actual_join_count": len(actual_joins),
+            },
+        )
+    for join_index, (actual_join, planned_join) in enumerate(
+        zip(actual_joins, block.joins, strict=True)
+    ):
+        actual_right_table = actual_join.this
+        actual_right_source = (
+            actual_right_table.alias_or_name
+            if isinstance(actual_right_table, exp.Table)
+            else ""
+        )
+        if actual_right_source != planned_join.right_source:
+            raise SqlValidationError(
+                code="query_block_join_source_mismatch",
+                message=(
+                    f"SQL 查询块 {block.block_id} 的第 {join_index + 1} 个 "
+                    "JOIN 右侧数据源与计划不一致"
+                ),
+                repair_action=(
+                    f"将 query_blocks[{block.block_id}].joins[{join_index}] "
+                    f"对应的 JOIN 右侧精确改为 `{planned_join.right_source}`，"
+                    f"不得改变 JOIN 顺序或添加别名。"
+                ),
+                details={
+                    "block_id": block.block_id,
+                    "join_index": join_index,
+                    "expected_right_source": planned_join.right_source,
+                    "actual_right_source": actual_right_source or None,
+                },
+            )
+        actual_join_type = _get_supported_join_type(actual_join)
+        if actual_join_type != planned_join.join_type:
+            raise SqlValidationError(
+                code="query_block_join_type_mismatch",
+                message=(
+                    f"SQL 查询块 {block.block_id} 的第 {join_index + 1} 个 "
+                    "JOIN 保留语义与计划不一致"
+                ),
+                repair_action=(
+                    f"将 query_blocks[{block.block_id}].joins[{join_index}] "
+                    f"对应的 JOIN 类型精确改为 `{planned_join.join_type}`，"
+                    "不得换成逗号关联、CROSS/RIGHT/FULL JOIN 或移除 ON。"
+                ),
+                details={
+                    "block_id": block.block_id,
+                    "join_index": join_index,
+                    "expected_join_type": planned_join.join_type,
+                    "actual_join_type": actual_join_type,
+                },
+            )
+        actual_on = actual_join.args.get("on")
+        expected_on = _parse_planned_join_condition(
+            planned_join.condition,
+            join_index,
+        )
+        if actual_on is None or not _join_conditions_are_equivalent(
+            actual_on,
+            expected_on,
+            comparison_aliases,
+        ):
+            raise SqlValidationError(
+                code="query_block_join_condition_mismatch",
+                message=(
+                    f"SQL 查询块 {block.block_id} 的第 {join_index + 1} 个 "
+                    "JOIN ON 与计划完整条件不一致"
+                ),
+                repair_action=(
+                    f"将 query_blocks[{block.block_id}].joins[{join_index}] "
+                    f"对应的 ON 精确改为 `{planned_join.condition}`；"
+                    "不得缺少、多加条件或移入 WHERE/HAVING。"
+                ),
+                details={
+                    "block_id": block.block_id,
+                    "join_index": join_index,
+                    "expected_condition": planned_join.condition,
+                },
+            )
+
+    distinct_expression = block_select.args.get("distinct")
+    actual_distinct = bool(distinct_expression)
+    expected_distinct = block.deduplication.mode == "distinct"
+    has_distinct_modifiers = (
+        isinstance(distinct_expression, exp.Distinct)
+        and any(
+            value is not None and value is not False and value != []
+            for value in distinct_expression.args.values()
+        )
+    )
+    if actual_distinct != expected_distinct or has_distinct_modifiers:
+        expected_sql = "SELECT DISTINCT" if expected_distinct else "SELECT"
+        raise SqlValidationError(
+            code="query_block_deduplication_mismatch",
+            message=f"SQL 查询块 {block.block_id} 的 DISTINCT 语义与计划不一致",
+            repair_action=(
+                f"将查询块 `{block.block_id}` 的投影精确改为 `{expected_sql}`；"
+                f"该块 deduplication.mode 是 `{block.deduplication.mode}`。"
+            ),
+            details={
+                "block_id": block.block_id,
+                "expected_deduplication": block.deduplication.mode,
+                "actual_distinct": actual_distinct,
+                "has_distinct_modifiers": has_distinct_modifiers,
+            },
+        )
+
+
+# 识别 WHERE 顶层的 EXISTS 极性，供数量与量词契约精确对齐。
+def _get_exists_clause_polarity(
+    expression: exp.Expression,
+) -> Literal["exists", "not_exists"] | None:
+    normalized_expression = _remove_expression_parentheses(expression)
+    if isinstance(normalized_expression, exp.Exists):
+        return "exists"
+    if isinstance(normalized_expression, exp.Not) and isinstance(
+        normalized_expression.this,
+        exp.Exists,
+    ):
+        return "not_exists"
+    return None
+
+
+# 将已声明普通条件与实际子句原子谓词一对一匹配，返回未被消费的实际条件。
+def _remove_matching_clause_conditions(
+    actual_parts: list[exp.Expression],
+    expected_parts: list[exp.Expression],
+    comparison_aliases: dict[str, str],
+) -> tuple[list[exp.Expression], list[exp.Expression]]:
+    unmatched_actual_parts = [
+        _normalize_column_table_aliases(part, comparison_aliases)
+        for part in actual_parts
+    ]
+    missing_expected_parts: list[exp.Expression] = []
+    for expected_part in expected_parts:
+        matched_index = next(
+            (
+                index
+                for index, actual_part in enumerate(unmatched_actual_parts)
+                if _expressions_are_equivalent(actual_part, expected_part)
+            ),
+            None,
+        )
+        if matched_index is None:
+            missing_expected_parts.append(expected_part)
+            continue
+        unmatched_actual_parts.pop(matched_index)
+    return unmatched_actual_parts, missing_expected_parts
+
+
+# 精确校验查询块 WHERE/HAVING 的普通条件和量词占位，拒绝模型自行加码。
+def _validate_query_block_clause_shape(
+    block_select: exp.Select,
+    block: QueryPlanBlock,
+    comparison_aliases: dict[str, str],
+) -> None:
+    where_clause = block_select.args.get("where")
+    actual_where_parts = (
+        _flatten_conjunction(where_clause.this)
+        if where_clause is not None and where_clause.this is not None
+        else []
+    )
+    expected_filter_parts = [
+        part
+        for filter_index, query_filter in enumerate(block.filters)
+        for part in _flatten_conjunction(
+            _parse_query_block_condition(
+                query_filter.condition,
+                block.block_id,
+                "filters",
+                filter_index,
+            )
+        )
+    ]
+    remaining_where_parts, missing_filter_parts = _remove_matching_clause_conditions(
+        actual_where_parts,
+        expected_filter_parts,
+        comparison_aliases,
+    )
+    expected_exists_count = sum(
+        condition.implementation == "exists"
+        for condition in block.quantified_conditions
+    ) + sum(
+        condition.require_non_empty
+        for condition in block.quantified_conditions
+    )
+    expected_not_exists_count = sum(
+        condition.implementation == "not_exists"
+        for condition in block.quantified_conditions
+    )
+    actual_exists_polarities = [
+        _get_exists_clause_polarity(part)
+        for part in remaining_where_parts
+    ]
+    where_shape_matches = (
+        not missing_filter_parts
+        and all(polarity is not None for polarity in actual_exists_polarities)
+        and actual_exists_polarities.count("exists") == expected_exists_count
+        and actual_exists_polarities.count("not_exists")
+        == expected_not_exists_count
+    )
+    if not where_shape_matches:
+        raise SqlValidationError(
+            code="query_block_where_shape_mismatch",
+            message=(
+                f"SQL 查询块 {block.block_id} 的 WHERE 条件集合与正式计划不一致"
+            ),
+            repair_action=(
+                f"在查询块 `{block.block_id}` 中只保留 filters 声明的"
+                f" {len(expected_filter_parts)} 个原子条件、{expected_exists_count} 个 "
+                f"EXISTS 和 {expected_not_exists_count} 个 NOT EXISTS；"
+                "删除未声明的 WHERE 条件，不得把计划条件移入子查询。"
+            ),
+            details={
+                "block_id": block.block_id,
+                "expected_filter_atom_count": len(expected_filter_parts),
+                "missing_filter_atom_count": len(missing_filter_parts),
+                "expected_exists_count": expected_exists_count,
+                "expected_not_exists_count": expected_not_exists_count,
+                "actual_remaining_polarities": actual_exists_polarities,
+            },
+        )
+
+    if any(
+        condition.implementation == "having"
+        for condition in block.quantified_conditions
+    ):
+        return
+    having_clause = block_select.args.get("having")
+    actual_having_parts = (
+        _flatten_conjunction(having_clause.this)
+        if having_clause is not None and having_clause.this is not None
+        else []
+    )
+    expected_having_parts = [
+        part
+        for having_index, having_condition in enumerate(block.having)
+        for part in _flatten_conjunction(
+            _parse_query_block_condition(
+                having_condition.condition,
+                block.block_id,
+                "having",
+                having_index,
+            )
+        )
+    ]
+    remaining_having_parts, missing_having_parts = (
+        _remove_matching_clause_conditions(
+            actual_having_parts,
+            expected_having_parts,
+            comparison_aliases,
+        )
+    )
+    if missing_having_parts or remaining_having_parts:
+        raise SqlValidationError(
+            code="query_block_having_shape_mismatch",
+            message=(
+                f"SQL 查询块 {block.block_id} 的 HAVING 条件集合与正式计划不一致"
+            ),
+            repair_action=(
+                f"将查询块 `{block.block_id}` 的 HAVING 精确改为 having "
+                f"声明的 {len(expected_having_parts)} 个原子条件；"
+                "删除未声明条件，不得把 WHERE 或量词条件搬入 HAVING。"
+            ),
+            details={
+                "block_id": block.block_id,
+                "expected_having_atom_count": len(expected_having_parts),
+                "missing_having_atom_count": len(missing_having_parts),
+                "extra_having_atom_count": len(remaining_having_parts),
+            },
+        )
+
+
 # 校验查询块输出别名、数据源和关联条件均落实在其自身 AST 作用域。
 def _validate_query_block_implementation(
     expression: exp.Expression,
@@ -1124,6 +1593,24 @@ def _validate_query_block_implementation(
     all_block_ids = set(block_selects)
     for block in query_plan.query_blocks:
         block_select = block_selects[block.block_id]
+        if block.block_id != query_plan.root_block_id and (
+            block_select.args.get("limit") is not None
+            or block_select.args.get("offset") is not None
+        ):
+            raise SqlValidationError(
+                code="query_block_pagination_forbidden",
+                message=f"非根查询块 {block.block_id} 不允许自行截断中间结果",
+                repair_action=(
+                    f"删除 CTE `{block.block_id}` 内的 LIMIT 和 OFFSET；"
+                    "pagination 只允许由根查询块实现。"
+                ),
+                details={"block_id": block.block_id},
+            )
+        _validate_query_block_select_arguments(
+            block_select,
+            block.block_id,
+            is_root=block.block_id == query_plan.root_block_id,
+        )
         comparison_aliases = (
             {}
             if block.aliases
@@ -1155,31 +1642,98 @@ def _validate_query_block_implementation(
                 },
             )
         if block.aliases:
+            expected_alias_sources = {
+                alias.alias: alias.source_table for alias in block.aliases
+            }
+            actual_alias_sources: dict[str, set[str]] = {}
+            unexpected_unaliased_sources: set[str] = set()
+            aliased_source_tables = set(expected_alias_sources.values())
+            for table in block_select.find_all(exp.Table):
+                if _find_node_query_block(table, block_selects) != block.block_id:
+                    continue
+                if table.name in all_block_ids:
+                    continue
+                if table.alias:
+                    actual_alias_sources.setdefault(table.alias, set()).add(table.name)
+                elif table.name in aliased_source_tables:
+                    unexpected_unaliased_sources.add(table.name)
             actual_role_aliases = {
                 table.alias_or_name
                 for table in block_select.find_all(exp.Table)
                 if _find_node_query_block(table, block_selects) == block.block_id
                 and table.name not in all_block_ids
             }
-            aliased_source_tables = {alias.source_table for alias in block.aliases}
             expected_role_aliases = {alias.alias for alias in block.aliases} | (
                 set(block.source_tables) - aliased_source_tables
             )
-            if actual_role_aliases != expected_role_aliases:
+            alias_source_mismatches = {
+                alias_name: sorted(actual_sources)
+                for alias_name, actual_sources in actual_alias_sources.items()
+                if alias_name not in expected_alias_sources
+                or actual_sources != {expected_alias_sources[alias_name]}
+            }
+            missing_declared_aliases = sorted(
+                set(expected_alias_sources) - set(actual_alias_sources)
+            )
+            if (
+                actual_role_aliases != expected_role_aliases
+                or alias_source_mismatches
+                or missing_declared_aliases
+                or unexpected_unaliased_sources
+            ):
                 raise SqlValidationError(
                     code="query_block_alias_mismatch",
-                    message=f"SQL 查询块 {block.block_id} 没有按计划使用角色别名",
+                    message=(
+                        f"SQL 查询块 {block.block_id} 的角色别名或其真实来源表与计划不一致"
+                    ),
                     repair_action=(
-                        f"查询块 `{block.block_id}` 必须精确使用角色别名 "
-                        f"{sorted(expected_role_aliases)}；当前为 "
-                        f"{sorted(actual_role_aliases)}。"
+                        f"查询块 `{block.block_id}` 必须精确使用别名到真实表的映射 "
+                        f"{expected_alias_sources}；不得交换别名来源、遗漏角色或把已声明"
+                        "别名的表改回无别名引用。"
                     ),
                     details={
                         "block_id": block.block_id,
                         "expected_aliases": sorted(expected_role_aliases),
                         "actual_aliases": sorted(actual_role_aliases),
+                        "expected_alias_sources": expected_alias_sources,
+                        "alias_source_mismatches": alias_source_mismatches,
+                        "missing_declared_aliases": missing_declared_aliases,
+                        "unexpected_unaliased_sources": sorted(
+                            unexpected_unaliased_sources
+                        ),
                     },
                 )
+        else:
+            undeclared_aliases = sorted(
+                {
+                    table.alias
+                    for table in block_select.find_all(exp.Table)
+                    if _find_node_query_block(table, block_selects) == block.block_id
+                    and table.alias
+                    and table.alias != table.name
+                }
+            )
+            if undeclared_aliases:
+                raise SqlValidationError(
+                    code="query_block_alias_mismatch",
+                    message=(
+                        f"SQL 查询块 {block.block_id} 使用了计划未声明的别名"
+                    ),
+                    repair_action=(
+                        f"查询块 `{block.block_id}` 未声明 aliases，请删除别名 "
+                        f"{undeclared_aliases}；如同一真实表必须承担多个角色，"
+                        "则返回查询规划阶段显式声明所有角色别名。"
+                    ),
+                    details={
+                        "block_id": block.block_id,
+                        "undeclared_aliases": undeclared_aliases,
+                    },
+                )
+        _validate_query_block_relation_shape(
+            block_select,
+            block,
+            comparison_aliases,
+        )
         expected_outputs = [field.result_field for field in block.select_fields]
         actual_outputs = [item.alias_or_name for item in block_select.expressions]
         if actual_outputs != expected_outputs:
@@ -1234,6 +1788,34 @@ def _validate_query_block_implementation(
             )
         actual_group = block_select.args.get("group")
         actual_group_expressions = list(actual_group.expressions) if actual_group else []
+        actual_group_modifiers = (
+            sorted(
+                key
+                for key, value in actual_group.args.items()
+                if key != "expressions"
+                and value is not None
+                and value is not False
+                and value != []
+            )
+            if actual_group is not None
+            else []
+        )
+        if actual_group_modifiers:
+            raise SqlValidationError(
+                code="query_block_group_modifier_forbidden",
+                message=(
+                    f"查询块 {block.block_id} 的 GROUP BY 使用了计划未声明的修饰："
+                    + "、".join(actual_group_modifiers)
+                ),
+                repair_action=(
+                    f"删除查询块 `{block.block_id}` 的 WITH ROLLUP、CUBE、"
+                    "GROUPING SETS 或其他分组修饰，只保留计划中的 group_by 字段。"
+                ),
+                details={
+                    "block_id": block.block_id,
+                    "modifiers": actual_group_modifiers,
+                },
+            )
         expected_group_expressions = [
             _parse_query_block_value_expression(
                 field_name,
@@ -1316,13 +1898,27 @@ def _validate_query_block_implementation(
                     and bool(actual_order_item.args.get("desc"))
                     else "ASC"
                 )
+                expected_nulls_first = actual_direction == "ASC"
+                actual_nulls_first = (
+                    bool(actual_order_item.args.get("nulls_first"))
+                    if isinstance(actual_order_item, exp.Ordered)
+                    else expected_nulls_first
+                )
+                has_order_modifier = (
+                    isinstance(actual_order_item, exp.Ordered)
+                    and actual_order_item.args.get("with_fill") is not None
+                )
                 if not _expressions_are_equivalent(
                     _normalize_column_table_aliases(
                         actual_order_field,
                         comparison_aliases,
                     ),
                     expected_order_field,
-                ) or actual_direction != planned_order_item.direction:
+                ) or (
+                    actual_direction != planned_order_item.direction
+                    or actual_nulls_first != expected_nulls_first
+                    or has_order_modifier
+                ):
                     order_mismatch = True
                     break
         if order_mismatch:
@@ -1338,33 +1934,6 @@ def _validate_query_block_implementation(
                     + "。"
                 ),
                 details={"block_id": block.block_id, "expected_order_by": expected_order},
-            )
-        for join_index, planned_join in enumerate(block.joins):
-            expected_condition = _parse_planned_join_condition(
-                planned_join.condition,
-                join_index,
-            )
-            if _select_scope_contains_condition(
-                block_select,
-                expected_condition,
-                comparison_aliases,
-            ):
-                continue
-            raise SqlValidationError(
-                code="query_block_join_wrong_scope",
-                message=(
-                    f"查询计划中的关联没有在指定查询块 {block.block_id} 内实现："
-                    f"{planned_join.condition}"
-                ),
-                repair_action=(
-                    f"只在查询块 `{block.block_id}` 的 JOIN ON、WHERE 或 HAVING 中加入 "
-                    f"`{planned_join.condition}`，不得移动到其他 CTE 或根查询块。"
-                ),
-                details={
-                    "block_id": block.block_id,
-                    "join_index": join_index,
-                    "condition": planned_join.condition,
-                },
             )
         for component_name, planned_conditions, clause_name in (
             ("filters", block.filters, "where"),
@@ -1401,6 +1970,11 @@ def _validate_query_block_implementation(
                         "condition": planned_condition.condition,
                     },
                 )
+        _validate_query_block_clause_shape(
+            block_select,
+            block,
+            comparison_aliases,
+        )
     return block_selects
 
 
@@ -1411,36 +1985,125 @@ def _exists_contains_outer_correlation(
     sql_aliases: dict[str, str],
 ) -> bool:
     local_select = exists_expression.this
+    if not isinstance(local_select, exp.Select):
+        return False
     local_aliases = {
         table.alias_or_name
         for table in local_select.find_all(exp.Table)
         if table.find_ancestor(exp.Select) is local_select
     }
-    for candidate in local_select.find_all(exp.EQ):
-        normalized_candidate = _normalize_column_table_aliases(
-            candidate,
-            sql_aliases,
+    actual_equalities = list(local_select.find_all(exp.EQ))
+    for expected_part in _flatten_conjunction(expected_correlation):
+        if not isinstance(expected_part, exp.EQ):
+            return False
+        matching_candidate = next(
+            (
+                candidate
+                for candidate in actual_equalities
+                if _expressions_are_equivalent(
+                    _normalize_column_table_aliases(candidate, sql_aliases),
+                    expected_part,
+                )
+            ),
+            None,
         )
-        if not _expressions_are_equivalent(
-            normalized_candidate,
-            expected_correlation,
-        ):
-            continue
-        candidate_columns = list(candidate.find_all(exp.Column))
+        if matching_candidate is None:
+            return False
+        candidate_columns = list(matching_candidate.find_all(exp.Column))
         if len(candidate_columns) != 2:
-            continue
+            return False
         local_flags = [
             bool(column.table) and column.table in local_aliases
             for column in candidate_columns
         ]
-        if any(local_flags) and not all(local_flags):
-            return True
-    return False
+        if not any(local_flags) or all(local_flags):
+            return False
+    return True
+
+
+# 只返回当前 SELECT 顶层 WHERE 合取项中的 EXISTS，防止嵌套子查询冒充量词实现。
+def _get_top_level_where_exists(
+    select_expression: exp.Select,
+) -> list[tuple[exp.Exists, bool]]:
+    where_expression = select_expression.args.get("where")
+    if where_expression is None or where_expression.this is None:
+        return []
+    exists_items: list[tuple[exp.Exists, bool]] = []
+    for condition_part in _flatten_conjunction(where_expression.this):
+        current_part = condition_part
+        while isinstance(current_part, exp.Paren):
+            current_part = current_part.this
+        if isinstance(current_part, exp.Exists):
+            exists_items.append((current_part, False))
+        elif isinstance(current_part, exp.Not) and isinstance(
+            current_part.this,
+            exp.Exists,
+        ):
+            exists_items.append((current_part.this, True))
+    return exists_items
+
+
+# 精确校验量词子查询的 SELECT、FROM 和有序 JOIN，禁止内部再次改变集合范围。
+def _quantified_select_has_exact_relation_shape(
+    select_expression: exp.Select,
+    expected_base_source: str,
+    expected_joins: list[QueryPlanJoin],
+    comparison_aliases: dict[str, str],
+) -> bool:
+    allowed_select_arguments = {"expressions", "from_", "joins", "where"}
+    if any(
+        key not in allowed_select_arguments
+        and value is not None
+        and value is not False
+        and value != []
+        for key, value in select_expression.args.items()
+    ):
+        return False
+    if len(select_expression.expressions) != 1:
+        return False
+    projection = select_expression.expressions[0]
+    if not isinstance(projection, exp.Literal) or not projection.is_int:
+        return False
+    if int(projection.this) != 1:
+        return False
+    from_expression = select_expression.args.get("from_")
+    base_table = from_expression.this if from_expression is not None else None
+    if not isinstance(base_table, exp.Table):
+        return False
+    if base_table.alias_or_name != expected_base_source:
+        return False
+    actual_joins = list(select_expression.args.get("joins") or [])
+    if len(actual_joins) != len(expected_joins):
+        return False
+    for join_index, (actual_join, expected_join) in enumerate(
+        zip(actual_joins, expected_joins, strict=True)
+    ):
+        actual_right_table = actual_join.this
+        if not isinstance(actual_right_table, exp.Table):
+            return False
+        if actual_right_table.alias_or_name != expected_join.right_source:
+            return False
+        if _get_supported_join_type(actual_join) != expected_join.join_type:
+            return False
+        actual_on = actual_join.args.get("on")
+        expected_on = _parse_planned_join_condition(
+            expected_join.condition,
+            join_index,
+        )
+        if actual_on is None or not _join_conditions_are_equivalent(
+            actual_on,
+            expected_on,
+            comparison_aliases,
+        ):
+            return False
+    return True
 
 
 # 要求成员条件、集合范围和内外层关联同时出现在同一个正确极性的 EXISTS 子查询中。
 def _exists_tree_satisfies_quantified_contract(
     expression: exp.Expression,
+    expected_base_source: str,
+    expected_joins: list[QueryPlanJoin],
     expected_predicate: exp.Expression,
     expected_correlation: exp.Expression | None,
     expected_collection_filters: list[exp.Expression],
@@ -1448,26 +2111,54 @@ def _exists_tree_satisfies_quantified_contract(
     block_id: str | None = None,
     block_selects: dict[str, exp.Select] | None = None,
     preserve_declared_aliases: bool = False,
+    consumed_exists_ids: set[int] | None = None,
 ) -> bool:
     sql_aliases = (
         {} if preserve_declared_aliases else _build_sql_alias_mapping(expression)
     )
-    for exists_expression in expression.find_all(exp.Exists):
+    owning_select = expression if isinstance(expression, exp.Select) else expression.find(exp.Select)
+    if not isinstance(owning_select, exp.Select):
+        return False
+    for exists_expression, is_not_exists in _get_top_level_where_exists(
+        owning_select
+    ):
+        if consumed_exists_ids is not None and id(exists_expression) in consumed_exists_ids:
+            continue
+        if is_not_exists != require_not_exists:
+            continue
         if (
             block_id is not None
             and block_selects is not None
             and _find_node_query_block(exists_expression, block_selects) != block_id
         ):
             continue
-        parent = exists_expression.parent
-        is_not_exists = isinstance(parent, exp.Not)
-        if is_not_exists != require_not_exists:
+        local_select = exists_expression.this
+        if not isinstance(local_select, exp.Select):
             continue
-        if not _expression_contains_condition(
-            exists_expression,
-            expected_predicate,
+        if not _quantified_select_has_exact_relation_shape(
+            local_select,
+            expected_base_source,
+            expected_joins,
             sql_aliases,
         ):
+            continue
+        where_expression = local_select.args.get("where")
+        if where_expression is None or where_expression.this is None:
+            continue
+        expected_parts = [expected_predicate] + expected_collection_filters
+        if expected_correlation is not None:
+            expected_parts.append(expected_correlation)
+        expected_atomic_parts = [
+            part
+            for expected_part in expected_parts
+            for part in _flatten_conjunction(expected_part)
+        ]
+        remaining_parts, missing_parts = _remove_matching_clause_conditions(
+            _flatten_conjunction(where_expression.this),
+            expected_atomic_parts,
+            sql_aliases,
+        )
+        if missing_parts or remaining_parts:
             continue
         if expected_correlation is not None and not _exists_contains_outer_correlation(
             exists_expression,
@@ -1475,20 +2166,138 @@ def _exists_tree_satisfies_quantified_contract(
             sql_aliases,
         ):
             continue
-        if not all(
-            _expression_contains_condition(
-                exists_expression,
-                collection_filter,
-                sql_aliases,
-            )
-            for collection_filter in expected_collection_filters
-        ):
-            continue
+        if consumed_exists_ids is not None:
+            consumed_exists_ids.add(id(exists_expression))
         return True
     return False
 
 
-# 对 EXISTS/NOT EXISTS 量词执行 AST 语义校验，防止运算符变化把 all、any、none 查询反转。
+# 根据数量量词构造唯一的条件去重计数 HAVING，供 SQL AST 精确比较。
+def _build_expected_quantified_count_condition(
+    condition: QueryPlanQuantifiedCondition,
+    condition_index: int,
+) -> exp.Expression:
+    operator_by_quantifier = {
+        "exactly": "=",
+        "at_least": ">=",
+        "at_most": "<=",
+    }
+    operator = operator_by_quantifier[condition.quantifier]
+    assert condition.count is not None
+    assert len(condition.member_key) == 1
+    member_condition = " AND ".join(
+        f"({condition_text})"
+        for condition_text in condition.collection_filters + [condition.predicate]
+    )
+    condition_sql = (
+        "COUNT(DISTINCT CASE WHEN "
+        f"{member_condition} THEN {condition.member_key[0]} END) "
+        f"{operator} {condition.count}"
+    )
+    try:
+        select_expression = parse_one(
+            f"SELECT 1 HAVING {condition_sql}",
+            read="mysql",
+        )
+    except ParseError as error:
+        raise SqlValidationError(
+            code="invalid_quantified_count_contract",
+            message=(
+                f"查询计划中的数量量词 quantified_conditions"
+                f"[{condition_index}] 无法组成规范 HAVING"
+            ),
+            repair_action=(
+                "返回查询规划阶段，把该量词的 predicate、collection_filters "
+                "和单一 member_key 改为真实字段组成的 MySQL 表达式。"
+            ),
+            retry_target="query_planning",
+            details={"condition_index": condition_index},
+        ) from error
+    having_expression = select_expression.args.get("having")
+    assert having_expression is not None
+    return having_expression.this
+
+
+# 校验 all/none 要求非空时的正向 EXISTS 只包含主体关联和集合范围。
+def _exists_tree_satisfies_non_empty_contract(
+    expression: exp.Expression,
+    expected_base_source: str,
+    expected_joins: list[QueryPlanJoin],
+    expected_correlation: exp.Expression,
+    expected_collection_filters: list[exp.Expression],
+    block_id: str,
+    block_selects: dict[str, exp.Select],
+    preserve_declared_aliases: bool,
+    consumed_exists_ids: set[int] | None = None,
+) -> bool:
+    sql_aliases = (
+        {} if preserve_declared_aliases else _build_sql_alias_mapping(expression)
+    )
+    expected_parts = [
+        part
+        for expected_expression in [
+            expected_correlation,
+            *expected_collection_filters,
+        ]
+        for part in _flatten_conjunction(expected_expression)
+    ]
+    owning_select = expression if isinstance(expression, exp.Select) else expression.find(exp.Select)
+    if not isinstance(owning_select, exp.Select):
+        return False
+    for exists_expression, is_not_exists in _get_top_level_where_exists(
+        owning_select
+    ):
+        if consumed_exists_ids is not None and id(exists_expression) in consumed_exists_ids:
+            continue
+        if is_not_exists:
+            continue
+        if _find_node_query_block(exists_expression, block_selects) != block_id:
+            continue
+        local_select = exists_expression.this
+        if not isinstance(local_select, exp.Select):
+            continue
+        if not _quantified_select_has_exact_relation_shape(
+            local_select,
+            expected_base_source,
+            expected_joins,
+            sql_aliases,
+        ):
+            continue
+        where_expression = local_select.args.get("where")
+        if where_expression is None or where_expression.this is None:
+            continue
+        actual_parts = [
+            _normalize_column_table_aliases(part, sql_aliases)
+            for part in _flatten_conjunction(where_expression.this)
+        ]
+        if len(actual_parts) != len(expected_parts):
+            continue
+        unmatched_parts = list(actual_parts)
+        for expected_part in expected_parts:
+            matched_index = next(
+                (
+                    index
+                    for index, actual_part in enumerate(unmatched_parts)
+                    if _expressions_are_equivalent(actual_part, expected_part)
+                ),
+                None,
+            )
+            if matched_index is None:
+                break
+            unmatched_parts.pop(matched_index)
+        else:
+            if not unmatched_parts and _exists_contains_outer_correlation(
+                exists_expression,
+                expected_correlation,
+                sql_aliases,
+            ):
+                if consumed_exists_ids is not None:
+                    consumed_exists_ids.add(id(exists_expression))
+                return True
+    return False
+
+
+# 对数量 HAVING 和 EXISTS/NOT EXISTS 量词执行 AST 语义校验，防止运算符或空集口径变化。
 def _validate_quantified_condition_implementation(
     expression: exp.Expression,
     draft: SqlQueryDraft,
@@ -1499,6 +2308,9 @@ def _validate_quantified_condition_implementation(
         draft.parameters,
     )
     block_selects = _get_query_block_selects(resolved_expression, query_plan)
+    consumed_exists_ids_by_block: dict[str, set[int]] = {
+        block.block_id: set() for block in query_plan.query_blocks
+    }
     for block, index, condition in query_plan.iter_quantified_conditions():
         comparison_aliases = (
             {} if block.aliases else _build_sql_alias_mapping(block_selects[block.block_id])
@@ -1527,50 +2339,84 @@ def _validate_quantified_condition_implementation(
                 condition.collection_filters
             )
         ]
-        if condition.implementation_hint == "having":
-            missing_having_contract: list[str] = []
-            for label, expected_expression in (
-                [("predicate", expected_predicate)]
-                + [
-                    (f"collection_filters[{filter_index}]", collection_filter)
-                    for filter_index, collection_filter in enumerate(
-                        expected_collection_filters
-                    )
+        if condition.implementation == "having":
+            numeric_conditions = [
+                (candidate_index, candidate)
+                for candidate_index, candidate in enumerate(
+                    block.quantified_conditions
+                )
+                if candidate.implementation == "having"
+            ]
+            expected_count_conditions = [
+                _build_expected_quantified_count_condition(
+                    candidate,
+                    candidate_index,
+                )
+                for candidate_index, candidate in numeric_conditions
+            ]
+            having_clause = block_selects[block.block_id].args.get("having")
+            actual_having_parts = (
+                [
+                    _normalize_column_table_aliases(part, comparison_aliases)
+                    for part in _flatten_conjunction(having_clause.this)
                 ]
-            ):
-                if any(
-                    _expressions_are_equivalent(
-                        _normalize_column_table_aliases(candidate, comparison_aliases),
-                        expected_expression,
+                if having_clause is not None and having_clause.this is not None
+                else []
+            )
+            unmatched_actual_parts = list(actual_having_parts)
+            all_count_conditions_match = (
+                len(unmatched_actual_parts) == len(expected_count_conditions)
+            )
+            if all_count_conditions_match:
+                for expected_count_condition in expected_count_conditions:
+                    matched_index = next(
+                        (
+                            actual_index
+                            for actual_index, actual_part in enumerate(
+                                unmatched_actual_parts
+                            )
+                            if _expressions_are_equivalent(
+                                actual_part,
+                                expected_count_condition,
+                            )
+                        ),
+                        None,
                     )
-                    for candidate in _walk_without_nested_selects(
-                        block_selects[block.block_id]
-                    )
-                ):
-                    continue
-                missing_having_contract.append(label)
-            if not missing_having_contract:
+                    if matched_index is None:
+                        all_count_conditions_match = False
+                        break
+                    unmatched_actual_parts.pop(matched_index)
+            if all_count_conditions_match and not unmatched_actual_parts:
                 continue
+            operator_by_quantifier = {
+                "exactly": "=",
+                "at_least": ">=",
+                "at_most": "<=",
+            }
             raise SqlValidationError(
-                code="quantified_having_contract_missing",
+                code="quantified_count_mismatch",
                 message=(
-                    f"查询块 {block.block_id} 的 HAVING 量词没有完整实现成员条件和集合范围"
+                    f"查询块 {block.block_id} 的数量量词没有精确实现计数键、"
+                    "成员范围、比较符和目标数量"
                 ),
                 repair_action=(
-                    f"只在查询块 `{block.block_id}` 中补充缺失的量词组件："
-                    + "、".join(missing_having_contract)
-                    + "。predicate 可放入条件聚合或适用的成员筛选；"
-                    "collection_filters 必须限定本块参与量化的成员集合。"
+                    f"将查询块 `{block.block_id}` 的 HAVING 精确改为 "
+                    "`COUNT(DISTINCT CASE WHEN <collection_filters AND predicate> "
+                    f"THEN {condition.member_key[0]} END) "
+                    f"{operator_by_quantifier[condition.quantifier]} {condition.count}`；"
+                    "不得改用其他计数键、比较符，也不得多加 HAVING 条件。"
                 ),
                 details={
                     "block_id": block.block_id,
                     "condition_index": index,
-                    "missing_components": missing_having_contract,
+                    "member_key": condition.member_key[0],
+                    "operator": operator_by_quantifier[condition.quantifier],
+                    "count": condition.count,
                 },
             )
-        if condition.implementation_hint not in {"exists", "not_exists"}:
+        if condition.implementation not in {"exists", "not_exists"}:
             continue
-        require_not_exists = condition.implementation_hint == "not_exists"
+        require_not_exists = condition.implementation == "not_exists"
         if condition.quantifier == "all" and require_not_exists:
             expected_predicate = _build_predicate_complement(expected_predicate)
         elif condition.quantifier == "none" and require_not_exists:
@@ -1579,8 +2425,11 @@ def _validate_quantified_condition_implementation(
             expected_predicate = expected_predicate.copy()
         else:
             continue
-        if _exists_tree_satisfies_quantified_contract(
+        assert condition.collection_base_source is not None
+        quantified_contract_satisfied = _exists_tree_satisfies_quantified_contract(
             block_selects[block.block_id],
+            condition.collection_base_source,
+            condition.collection_joins,
             expected_predicate,
             expected_correlation,
             expected_collection_filters,
@@ -1588,7 +2437,26 @@ def _validate_quantified_condition_implementation(
             block.block_id,
             block_selects,
             bool(block.aliases),
-        ):
+            consumed_exists_ids_by_block[block.block_id],
+        )
+        non_empty_contract_satisfied = (
+            not condition.require_non_empty
+            or (
+                expected_correlation is not None
+                and _exists_tree_satisfies_non_empty_contract(
+                    block_selects[block.block_id],
+                    condition.collection_base_source,
+                    condition.collection_joins,
+                    expected_correlation,
+                    expected_collection_filters,
+                    block.block_id,
+                    block_selects,
+                    bool(block.aliases),
+                    consumed_exists_ids_by_block[block.block_id],
+                )
+            )
+        )
+        if quantified_contract_satisfied and non_empty_contract_satisfied:
             continue
         expected_sql = expected_predicate.sql(dialect="mysql")
         exists_keyword = "NOT EXISTS" if require_not_exists else "EXISTS"
@@ -1606,7 +2474,9 @@ def _validate_quantified_condition_implementation(
                 f"SQL 没有正确实现量词 {condition.quantifier} 的成员判断"
             ),
             repair_action=(
-                f"在同一个 {exists_keyword} 子查询中同时使用："
+                f"在同一个 {exists_keyword} 子查询中使用 `SELECT 1 FROM "
+                f"{condition.collection_base_source}`，并按 collection_joins 精确实现"
+                "内部 JOIN；同时使用："
                 f"内外层关联 `{correlation_sql}`；"
                 f"集合范围 {collection_filter_sql or ['无额外条件']}；"
                 f"成员条件 `{expected_sql}`。不要把关联改成两个内层表之间的条件。"
@@ -1618,7 +2488,14 @@ def _validate_quantified_condition_implementation(
                 "expected_member_condition": expected_sql,
                 "expected_correlation_condition": correlation_sql,
                 "expected_collection_filters": collection_filter_sql,
-                "implementation_hint": condition.implementation_hint,
+                "expected_collection_base_source": condition.collection_base_source,
+                "expected_collection_joins": [
+                    query_join.model_dump()
+                    for query_join in condition.collection_joins
+                ],
+                "implementation": condition.implementation,
+                "require_non_empty": condition.require_non_empty,
+                "missing_non_empty_exists": not non_empty_contract_satisfied,
             },
         )
 
