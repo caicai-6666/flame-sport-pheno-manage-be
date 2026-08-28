@@ -129,6 +129,10 @@ class AgentQueryPipeline:
             ("确认并继续", "修正查询"),
         )
 
+    # 在线程中等待规划字段复核，避免同步条件变量阻塞 FastAPI 事件循环和 SSE 心跳。
+    async def _request_plan_review_async(self, question: str) -> str:
+        return await asyncio.to_thread(self._request_plan_review, question)
+
     # 在对齐结果进入规划前强制请求用户确认，拒绝或修改不会消耗后续模型和数据库资源。
     async def _confirm_alignment(self, aligned_question: str) -> bool:
         answer = await asyncio.to_thread(
@@ -216,8 +220,8 @@ class AgentQueryPipeline:
             self._domain_profile,
             settings=self._settings,
             schema_reader=schema_reader,
-            user_input_reader=self._request_clarification,
-            plan_review_reader=self._request_plan_review,
+            user_input_reader=self._request_clarification_async,
+            plan_review_reader=self._request_plan_review_async,
             trace_writer=self._trace_writer,
             progress_emitter=self._progress_emitter,
         )
