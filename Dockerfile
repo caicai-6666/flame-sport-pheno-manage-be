@@ -17,6 +17,7 @@ RUN python -m pip install --upgrade pip \
     && python -m pip install --requirement requirements.txt
 
 COPY --chown=app:app app ./app
+COPY --chown=app:app data ./data
 
 USER app
 

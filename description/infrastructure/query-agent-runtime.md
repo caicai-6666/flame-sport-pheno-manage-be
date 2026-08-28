@@ -2,30 +2,54 @@
 
 > **文档目的**
 >
-> 本文档说明 `app/agent/` 的通用引擎、工具、业务域配置、模型与数据库适配、安全边界及新增业务域的方法。
+> 本文档说明 `app/agent/text2sql/` 的查询引擎、子图、工具、业务域配置、模型与数据库适配、安全边界及新增业务域的方法。
 
 ## 1. 包结构与依赖方向
 
 ```text
 app/agent/
-├── domains/       # 业务域 Profile、词汇、规则、表概述和实体检索配置
-├── engine/        # 对齐、规划、SQL、翻译、塑形、审计子图和完整 Pipeline
-├── events/        # 结构化进度模型、友好文案和 SSE 编码
-├── interaction/   # 会话状态、交互暂停恢复和事件订阅
-├── runtime/       # 模型选项、表结构缓存、结构读取和单表候选读取
-├── tools/         # 通用 Pydantic 工具参数与 strict Schema 构造
-└── query_manager.py
+├── __init__.py
+└── text2sql/
+│   ├── domains/   # 业务域 Profile、词汇、规则、表概述和实体检索配置
+│   ├── events/    # 结构化进度模型、友好文案和 SSE 编码
+│   ├── interaction/ # 会话状态、交互暂停恢复和事件订阅
+│   ├── shared/    # 模型选项、YAML 上下文、表结构读取缓存和共享工具
+│   ├── subgraphs/ # 对齐、规划、SQL、翻译、塑形和审计六个独立子图包
+│   ├── diagnostics.py
+│   ├── pipeline.py
+│   └── query_manager.py
 ```
 
 依赖方向为：
 
 ```text
 HTTP router → application service → query manager → pipeline
-                                               ├── common tools/runtime
+                                               ├── text2sql shared
+                                               ├── selected subgraphs
                                                └── selected domain profile
 ```
 
-通用工具不导入运动业务包。业务域通过 `QueryDomainProfile` 注入允许表、资源路径、展示名称和禁止在对齐结果中泄漏的数据库标识符。
+当前查询会话、SSE 事件、交互等待、诊断日志和后台任务管理都直接依赖 Text-to-SQL 流水线，因此与业务域、共享能力和六个子图一起收口于 `app/agent/text2sql/`。`app/agent/` 根目录只保留智能体类型的命名空间，后续新增其他智能体业务时应建立新的同级业务包，不得把其运行时混入 `text2sql/`。通用工具不导入运动业务包；业务域通过 `QueryDomainProfile` 注入允许表、资源路径、展示名称和禁止在对齐结果中泄漏的数据库标识符。
+
+### 1.1 子图包契约
+
+每个子图使用同一种目录边界：
+
+```text
+<subgraph>/
+├── prompt/
+│   ├── __init__.py  # Prompt 的公开入口
+│   └── prompt.py    # 固定提示词、上下文构建器或无模型声明
+├── node.py          # LangGraph 状态、节点和子图运行类
+├── tool.py          # 该子图专属或聚合使用的工具协议
+└── __init__.py      # 装配并公开稳定的子图入口
+```
+
+调用方必须从子图包的 `__init__.py` 导入子图运行类，不得从 `node.py` 拼装节点，也不得跨子图直接复用私有 Prompt。`pipeline.py` 只依赖六个子图包的公开入口。`prompt/` 可以按上下文职责继续拆分其他 Python 文件，但对外统一经由其 `__init__.py` 暴露。
+
+`tool.py` 是子图工具的公开边界。业务对齐、SQL、翻译和审计的终止工具由各自 `tool.py` 定义；规划子图的计划、表结构和单表检查协议由 `tool.py` 聚合，具体 Pydantic 模型可继续按工具规模拆分；确定性塑形子图不调用模型，因此显式声明空工具集合。跨子图都需要的 `ask_user`、`think`、Pydantic Schema、嵌套 JSON 参数兼容和参数错误反馈位于 `text2sql/shared/tools/`，由使用它们的子图 `tool.py` 重新组织，而不是复制实现。
+
+旧的 `app/agent/engine/`、`app/agent/runtime/`、`app/agent/tools/` 和 `app/agent/domains/` 已移除，不再提供兼容导入。应用代码、测试和实验脚本必须使用 `app.agent.text2sql` 下的公开入口，避免重新形成并行目录结构。
 
 ---
 
@@ -104,7 +128,7 @@ tables:
 
 Profile 加载时会检查允许表非空且不重复、表标签完整、每张允许表对应一个表上下文文件、资源文件存在，以及受保护数据库标识符非空；`table-overview.txt` 的“三标签、每表一条”属于当前配置契约，解析器会将其转换为 YAML，但目前不会在启动时逐项校验标签内容。HTTP 请求只能选择显式注册表中的 `domain_key`，不能提供路径或动态导入位置。
 
-新增积分等业务域时，应复制资源结构、按真实业务重新编写全部知识文件、建立独立 Profile，并在 `app/agent/domains/registry.py` 显式注册。通用引擎、工具协议、会话和 SSE 不应随业务域复制。
+新增积分等业务域时，应复制资源结构、按真实业务重新编写全部知识文件、建立独立 Profile，并在 `app/agent/text2sql/domains/registry.py` 显式注册。通用引擎、工具协议、会话和 SSE 不应随业务域复制。
 
 当前已注册的 `rewards` 业务域覆盖用户、部门、赛季参与、赛季结算积分、积分流水、商品和奖品履约。它与 `sports` 使用相同的查询流水线，但拥有独立的表白名单、业务词汇、核心规则、实体匹配配置和查询计划校验器。业务域专属 Prompt 规则通过 Profile 注入，通用 Prompt 不再硬编码运动凭证语义。
 
@@ -112,23 +136,50 @@ Profile 加载时会检查允许表非空且不重复、表标签完整、每张
 
 ## 3. 模型调用约束
 
-模型通过 OpenAI 兼容 SDK 调用 DeepSeek。工具型阶段使用 Beta strict function calling；全部阶段关闭供应商隐藏思考，并分别设置 `max_tokens`。生成轮次和工具次数另由 `AGENT_QUERY_*` 配置限制。
+模型统一通过 OpenAI 兼容 SDK 调用。`AGENT_QUERY_MODEL_PROVIDER` 为整条查询流水线选择唯一供应商，所有子图必须共享对应的地址、密钥、模型和超时，禁止形成阶段间混用。业务对齐、查询规划、单表候选检索、SQL 生成、结果翻译和结果审计的工具用途与参数均由 Pydantic 类说明及 `Field.description` 生成标准 Function Calling JSON Schema，不启用供应商 strict 模式，模型返回参数继续由相同 Pydantic 模型在本地校验。全部阶段按供应商协议关闭隐藏思考，并分别设置 `max_tokens`。生成轮次和工具次数另由 `AGENT_QUERY_*` 配置限制。
+
+业务对齐层、查询规划层、单表候选检索、SQL 子图、结果翻译和结果审计使用 `AsyncOpenAI`、异步 LangGraph 节点和 `ainvoke`，公开 `run` 返回可等待结果。由 `from_settings` 创建的子图拥有对应 SDK 客户端，并在运行成功、失败或取消后关闭客户端连接池；调用方自行注入的客户端默认仍由调用方管理。表结构缓存未命中时通过工作线程桥接现有同步读取器，候选数据和最终 SQL 则直接使用异步 MySQL 驱动。`AgentQueryPipeline.run` 直接等待上述异步子图；不调用模型的确定性塑形仍通过 `asyncio.to_thread` 隔离同步计算。
+
+### 3.1 全局模型供应商与工具标签模板
+
+`AGENT_QUERY_MODEL_PROVIDER` 选择整条查询流水线使用的模型供应商：
+
+| 值 | 连接配置 | 工具阶段地址 | 关闭思考的请求参数 |
+| --- | --- | --- | --- |
+| `deepseek` | `DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL`、`DEEPSEEK_MODEL`、`DEEPSEEK_HTTP_TIMEOUT_SECONDS` | 所有模型阶段统一使用标准地址 | `extra_body.thinking.type=disabled` |
+| `vllm` | `VLLM_API_KEY`、`VLLM_BASE_URL`、`VLLM_MODEL`、`VLLM_HTTP_TIMEOUT_SECONDS` | 始终使用配置的标准 OpenAI 兼容地址 | `extra_body.chat_template_kwargs.enable_thinking=false` |
+
+供应商选择同时决定连接信息和关闭思考的请求参数，但不自动决定模型的工具标签格式。vLLM 可以承载 DeepSeek、Qwen、Kimi 等不同模型，其工具解析器和 Chat Template 必须在服务端正确配置，并与 `VLLM_MODEL` 公开的模型标识一致。新增供应商时，在 `shared/model_options.py` 增加连接解析和独立 `ModelRequestProfile`，不得在各子图内重复判断供应商。
+
+`AGENT_QUERY_TOOL_TAG_TEMPLATE` 可以填写 `data/tool-tag/` 下的单个 `.txt` 文件名，是整条查询流水线的唯一模板配置源；业务对齐、查询规划、单表候选检索、SQL 生成、结果翻译和结果审计均复用该变量，不提供阶段专用覆盖配置。默认使用为 `deepseek-v4-flash` 提供的 `deepseek-v4.txt`，通过 vLLM 承载 Qwen3.6 时应改为 `qwen3.6.txt`，留空时不注入模板。模板只描述供应商标签语法，使用 `TOOL_NAME`、`PARAMETER_NAME` 和 `PARAMETER_VALUE` 等显式占位符，不得写入 `think`、`submit_sql_query` 等具体工具或任何业务内容；真实工具名和参数只以当轮 Function Calling Schema 为准。Qwen3.6 模板依据其[官方 `tokenizer_config.json`](https://huggingface.co/Qwen/Qwen3.6-27B/blob/main/tokenizer_config.json)使用 `<tool_call>`、`<function=...>` 和 `<parameter=...>` 标签，不得替换成 DeepSeek DSML 或早期 Qwen3 Hermes JSON 格式。运行时拒绝目录分隔符、非 `.txt` 文件、缺失文件、空文件及超过 `16000` 字符的内容，避免环境变量形成任意文件读取或无界 Prompt 注入。Docker 镜像会复制该受控目录。
+
+工具标签模板会作为稳定格式提醒追加在原始用户任务末尾。模型返回普通文本、没有形成 OpenAI `tool_calls` 时，同一模板还会随精确协议错误再次加入紧邻重试上下文，明确要求使用标签结构而非正文模拟工具调用。模型修正后，运行时移除无效响应和临时错误反馈，但保留原始任务中的常驻提醒；参数 Schema 错误仍使用精确字段反馈，不重复增加模板。模板必须与实际模型版本以及 vLLM 的 `--tool-call-parser`、`--chat-template` 配置一致，不能仅根据 `deepseek` 或 `vllm` 请求体系自动猜测。
 
 | 阶段 | 主要输出 | 工具策略 |
 | --- | --- | --- |
-| 业务对齐 | 标准业务需求或放弃理由 | 首轮 `think`，随后强制调用已注册工具 |
-| 查询规划 | 独立 SQL 数据获取计划、结果塑形计划或放弃理由 | 首轮强制 `think`，后续强制工具调用 |
-| 单表候选 | 一条单表 SELECT | 强制唯一 strict 工具 |
-| SQL 生成 | 参数化 SQL 草稿 | 强制唯一 strict 工具，校验失败有限重试 |
-| 翻译目标识别 | 待翻译结果列及直接来源 | 强制唯一 strict 工具，语义失败有限重试 |
-| 注释映射提取 | 单字段原始值与展示值映射 | 每字段强制唯一 strict 工具，语义失败有限重试 |
-| 结果审计 | 相关性、表格说明和统计摘要 | 强制唯一 strict 工具，参数错误有限重试 |
+| 业务对齐 | 标准业务需求或放弃理由 | Pydantic 标准工具 Schema；API 使用 `tool_choice=auto`，Prompt 要求每轮唯一工具调用且首轮使用 `think` |
+| 查询规划 | 独立 SQL 数据获取计划、结果塑形计划或放弃理由 | Pydantic 标准工具 Schema；API 使用 `tool_choice=auto`，程序校验首轮 `think`、工具组合和修复顺序 |
+| 单表候选 | 一条单表 SELECT | Pydantic 标准工具 Schema；API 使用 `tool_choice=auto`，程序要求唯一 `execute_single_table_select` |
+| SQL 生成 | 参数化 SQL 草稿 | Pydantic 标准工具 Schema；API 使用 `tool_choice=auto`，程序要求唯一 `submit_sql_query` 并按错误阶段清理上下文 |
+| 翻译目标识别 | 待翻译结果列及直接来源 | Pydantic 标准工具 Schema；API 使用 `tool_choice=auto`，程序要求唯一 `submit_translation_targets` |
+| 注释映射提取 | 单字段原始值与展示值映射 | Pydantic 标准工具 Schema；每字段独立使用 `tool_choice=auto`，程序要求唯一 `submit_translation_rules` |
+| 结果审计 | 相关性、表格说明和统计摘要 | Pydantic 标准工具 Schema；API 使用 `tool_choice=auto`，程序要求唯一 `submit_query_result_audit` 并有限修复 |
 
 所有工具参数先由 Pydantic 校验。Schema 违规和业务校验失败以带原 `tool_call_id` 的正常工具结果加入模型上下文，反馈会指出错误字段、错误原因和唯一修复动作。查询规划终止工具不再使用独立的固定修复次数；每次可修复失败都继续占用统一的规划生成次数和工具调用次数，直到生成合法计划或达到 `AGENT_QUERY_PLANNING_MAX_GENERATIONS`、`AGENT_QUERY_PLANNING_MAX_TOOL_CALLS`，避免部署配置允许继续生成时被隐藏的小上限提前终止。当前默认分别为 30 次模型生成和 60 次工具调用；后者包含并行表结构读取、思考和终止工具重提，不能按付费模型生成次数理解。
 
-SQL 生成仍强制唯一 `submit_sql_query`。若供应商响应未形成唯一工具调用，或 `finish_reason = length` 表示输出达到单次上限，子图不会在第一次偶发协议错误时直接终止，而是把稳定错误码和唯一修复动作加入普通上下文，在 `AGENT_QUERY_SQL_MAX_GENERATIONS` 内要求模型仅重提一次完整、紧凑的工具调用。该机制不扩大 `DEEPSEEK_QUERY_SQL_MAX_TOKENS` 单次输出上限；用尽生成次数后按实际错误码结束。
+业务对齐、规划、单表候选、SQL、翻译和审计工具都优先按原始 Pydantic Schema 严格校验。若参数因 OpenAI 兼容工具解析器二次序列化而校验失败，兼容层会递归遍历外层参数字典和数组，只尝试还原以 `{` 或 `[` 开头且确实可解析的嵌套 JSON 字符串，然后重新执行完整 Pydantic 校验。首次校验已经成功时不会进入兼容转换，因此内容恰好是合法 JSON 的正常字符串字段仍保持原值；非法 JSON、额外字段和嵌套类型错误也不会被兼容接受。
 
-DeepSeek 兼容接口偶尔会把 strict 工具中本应为对象的 `query_plan`、`result_shape_plan` 二次编码为 JSON 字符串。规划入口只在字符串可解析且解析结果确实为 JSON 对象时解开这一层编码，随后仍执行完全相同的 Pydantic、查询块和业务域校验；无效 JSON、数组或标量不会被容错接受。终止工具收到可修复失败后，Prompt 要求下一轮直接重提同一工具，不再插入无信息量 `think` 消耗生成预算。
+业务对齐层在 `tool_choice=auto` 下由程序校验工具顺序和唯一性：首个有效调用必须是唯一的 `think`，后续每轮也只能调用一个已注册工具。配置的工具标签会从首轮开始随任务常驻；未调用工具、首轮工具错误、同轮多工具或未知工具不会立即终止，而会作为可重试协议反馈进入紧邻的下一轮上下文，其中无 `tool_calls` 的反馈会再次强调工具标签格式。模型完成修正后，运行时会从后续模型上下文中同时移除无效 assistant 响应及其临时错误反馈，避免已解决错误持续影响工具选择；内部诊断轨迹仍保留错误和修正过程，便于排障审计。
+
+SQL 生成在 `tool_choice=auto` 下由程序要求唯一 `submit_sql_query`。若供应商响应未形成唯一工具调用，或 `finish_reason = length` 表示输出达到单次上限，子图不会在第一次偶发协议错误时直接终止，而是把稳定错误码和唯一修复动作加入普通上下文，在 `AGENT_QUERY_SQL_MAX_GENERATIONS` 内要求模型重提完整、紧凑的工具调用。无调用 ID 的反馈会再次附加全局工具标签；已有调用 ID 的错误使用对应 `tool` 消息返回。该机制不扩大 `DEEPSEEK_QUERY_SQL_MAX_TOKENS` 单次输出上限；用尽生成次数后按实际错误码结束。
+
+SQL 修复上下文按失败阶段维护。工具协议或 Pydantic 参数错误在新工具参数成功解析后清除；AST、安全、计划一致性或分页校验错误只有在新 SQL 通过完整静态校验后清除；可修复数据库错误保留到后续草稿重新进入执行。更晚阶段的错误不会被一次无关的协议修复降级，原始模型响应和诊断轨迹也不会因上下文压缩而删除。
+
+翻译目标识别与单字段注释映射同样在 `tool_choice=auto` 下要求唯一的指定工具。普通文本、多工具、错误工具、输出截断、Pydantic 参数错误、字段血缘错误和注释外推都会获得分类错误码与单一修复动作；没有调用 ID 时再次提供全局工具标签模板。每个调用最多进行一次局部修复，修正后即结束当前独立节点，因此旧错误上下文不会传给其他翻译字段或后续子图。单字段映射通过异步信号量受控并发，固定系统提示、仅含占位符的通用 tool-tag 和工具 Schema 位于动态字段 YAML 之前，以提高相邻请求的前缀复用机会。真实工具名和参数只来自当轮 Schema，不会由模板注入其他阶段的工具概念。
+
+结果审计也在 `tool_choice=auto` 下要求唯一 `submit_query_result_audit`。普通文本、多工具、错误工具、输出截断和参数 Schema 错误分别返回稳定错误码；参数错误使用原调用 ID 的 `tool` 结果，缺少工具时使用带通用 tool-tag 的协议反馈，临时 API 请求失败使用不包含内部连接信息的独立反馈。每类错误最多修复或重试一次，失败后仍保留程序生成的完整表格和统计事实。审计子图通过异步 SDK 和 `ainvoke` 运行，不重新执行 SQL，也不重新统计完整结果。
+
+部分兼容接口会把本应为对象或数组的工具参数二次编码为 JSON 字符串。规划入口只在首次 Pydantic 校验失败后递归解开可验证的嵌套 JSON，随后仍执行完全相同的 Pydantic、查询块和业务域校验；无效 JSON、错误嵌套类型和额外字段不会被容错接受。终止工具收到可修复失败后，状态机要求下一轮直接重提同一工具，无关 `think` 不会被执行，也不会消耗一次有效修复机会。
 
 SQL 层把查询块声明的 `aliases` 视为整个块作用域的角色集合，外层 SELECT 与块内相关子查询都必须精确复用，不能临时增加第二套成员别名。规划层因此会先拒绝把相关量词成员表同时放入资格块外层关联的方案，使 SQL 生成器无需在计划外创造别名，也避免主体资格 CTE 因成员展开产生重复行。
 
@@ -160,7 +211,7 @@ columns:
     comment: 用户ID
 ```
 
-其中 `comment` 原样来自数据库结构，不由模型补写或改写。工具成功执行后回传给模型的事实同样使用 YAML；工具参数、strict Schema 和带原 `tool_call_id` 的失败反馈继续使用 JSON，这是供应商函数调用协议的一部分，不能改成 YAML。
+其中 `comment` 原样来自数据库结构，不由模型补写或改写。工具成功执行后回传给模型的事实同样使用 YAML；工具参数、工具 JSON Schema 和带原 `tool_call_id` 的失败反馈继续使用 JSON，这是供应商函数调用协议的一部分，不能改成 YAML。
 
 ---
 
@@ -242,7 +293,7 @@ SQL 成功后先运行独立 `ResultTranslationSubgraph`：
 
 ## 8. SSE 与运行时边界
 
-会话为每个订阅者创建独立 `asyncio.Queue`，模型线程通过线程安全回调向 FastAPI 事件循环投递。事件历史使用固定长度队列；`Last-Event-ID` 只能补发仍在历史窗口内的事件。心跳间隔由环境配置控制，响应设置 `X-Accel-Buffering: no`。
+会话为每个订阅者创建独立 `asyncio.Queue`。异步业务对齐节点直接在 FastAPI 事件循环发布进度；其余同步子图通过线程安全回调向该事件循环投递。事件历史使用固定长度队列；`Last-Event-ID` 只能补发仍在历史窗口内的事件。心跳间隔由环境配置控制，响应设置 `X-Accel-Buffering: no`。
 
 由于认证使用 Bearer Header，浏览器原生 `EventSource` 无法直接携带现有令牌。管理前端应使用支持流式读取的 `fetch` 客户端，或在未来建立同源安全 Cookie/一次性 SSE 票据后再使用 `EventSource`。禁止把长期 Bearer Token 放进 URL 查询参数。
 

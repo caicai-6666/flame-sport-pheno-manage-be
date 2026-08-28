@@ -6,7 +6,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.agent.query_manager import AgentQueryManager
+from app.agent.text2sql.query_manager import AgentQueryManager
 from app.clients.client_backend import ClientBackendClient
 from app.core.config import get_settings
 from app.db.session import async_session_factory, engine

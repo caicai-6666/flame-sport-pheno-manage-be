@@ -12,14 +12,16 @@
 app/
 ├── __init__.py
 ├── main.py                       # FastAPI 应用工厂、生命周期和启动入口
-├── agent/                        # 可配置业务域的只读查询智能体运行时
-│   ├── domains/                  # 业务词汇、规则、表范围和实体匹配配置
-│   ├── engine/                   # 对齐、规划、SQL、审计子图和完整流水线
-│   ├── events/                   # 友好进度事件和 SSE 编码
-│   ├── interaction/              # 查询会话、用户交互暂停恢复和事件订阅
-│   ├── runtime/                  # 模型选项、结构缓存和只读数据适配器
-│   ├── tools/                    # 通用 Pydantic 工具协议
-│   └── query_manager.py          # 后台任务、容量和生命周期管理
+├── agent/                        # 智能体业务命名空间
+│   └── text2sql/                 # 可配置业务域的完整只读查询智能体
+│       ├── domains/              # 业务词汇、规则、表范围和实体匹配配置
+│       ├── events/               # 友好进度事件和 SSE 编码
+│       ├── interaction/          # 查询会话、用户交互暂停恢复和事件订阅
+│       ├── shared/               # 模型选项、结构缓存和共享工具
+│       ├── subgraphs/            # 六个独立查询子图
+│       ├── diagnostics.py        # 脱敏诊断日志
+│       ├── pipeline.py           # 子图流水线装配
+│       └── query_manager.py      # 后台任务、容量和生命周期管理
 ├── schemas/
 │   ├── __init__.py               # HTTP Schema 包声明，不集中重导出模型
 │   ├── admin_auth.py             # 管理员认证请求与响应结构
@@ -139,9 +141,9 @@ from app.main import app
 
 1. 启动时创建可复用连接池的客户端后端 HTTP 客户端。
 2. 将客户端保存在 `app.state.client_backend`，供后续依赖注入层获取。
-3. 创建单进程查询智能体管理器和专用工作线程池；只有收到查询请求后才调用模型或查询数据库。
+3. 创建单进程查询智能体管理器；只有收到查询请求后才启动异步流水线、调用模型或查询数据库。
 4. 配置启用时启动赛季状态与结算后台任务，并立即执行一次停机补偿检查。
-5. 退出时取消查询会话和后台任务，再关闭查询线程池与 HTTP 客户端连接池。
+5. 退出时取消查询会话和异步流水线任务，再关闭 HTTP 客户端连接池。
 6. 最后释放异步 MySQL 引擎的连接池。
 
 模块导入不会主动访问 MySQL 或客户端后端。生命周期启动后，赛季任务会访问 MySQL，并可能调用固定的客户端立即初审接口；单次失败只记录日志并等待下个周期，不阻止 HTTP 服务启动。需要依赖可用性判断时，应由独立的就绪检查承担。
@@ -183,7 +185,7 @@ cp .env.example .env
 | 连接池 | `MYSQL_POOL_SIZE`、`MYSQL_MAX_OVERFLOW`、`MYSQL_POOL_RECYCLE_SECONDS` | 数据库连接池容量与回收周期 |
 | 客户端后端 | `CLIENT_BACKEND_BASE_URL`、`CLIENT_BACKEND_TIMEOUT_SECONDS` | 客户端后端局域网服务地址和请求超时 |
 | 图片缓存 | `IMAGE_CACHE_SECONDS` | 所有图片响应的浏览器私有缓存时效，单位为秒 |
-| 查询智能体 | `DEEPSEEK_*`、`AGENT_QUERY_*` | 模型连接、各阶段单次输出、生成与工具次数、活动会话、事件历史、会话保留、SSE 心跳和脱敏诊断日志 |
+| 查询智能体 | `DEEPSEEK_*`、`VLLM_*`、`AGENT_QUERY_*` | 全局模型供应商及连接、共享工具标签模板、各阶段单次输出、生成与工具次数、活动会话、事件历史、会话保留、SSE 心跳和脱敏诊断日志 |
 
 配置由 `pydantic-settings` 从根目录 `.env` 和进程环境变量加载并校验。数据库密码使用 `SecretStr` 保存，构造连接地址时通过 SQLAlchemy `URL` 处理特殊字符。
 
@@ -220,6 +222,12 @@ DEEPSEEK_API_KEY=
 DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-v4-flash
 DEEPSEEK_HTTP_TIMEOUT_SECONDS=60
+VLLM_API_KEY=EMPTY
+VLLM_BASE_URL=http://127.0.0.1:8000/v1
+VLLM_MODEL=deepseek-v4-flash
+VLLM_HTTP_TIMEOUT_SECONDS=60
+AGENT_QUERY_MODEL_PROVIDER=deepseek
+AGENT_QUERY_TOOL_TAG_TEMPLATE=deepseek-v4.txt
 DEEPSEEK_QUERY_ALIGNMENT_MAX_TOKENS=1200
 DEEPSEEK_QUERY_PLANNING_MAX_TOKENS=3000
 DEEPSEEK_QUERY_INSPECTION_MAX_TOKENS=800
@@ -239,7 +247,7 @@ AGENT_QUERY_DIAGNOSTIC_LOG_ENABLED=false
 AGENT_QUERY_DIAGNOSTIC_LOG_LEVEL=basic
 ```
 
-管理端不会因存在密钥而自动发起模型请求。只有创建查询任务后，业务对齐、查询规划、单表检索、SQL 生成、结果翻译和结果审计才会使用 DeepSeek Beta strict function calling。翻译层按待翻译字段独立调用模型，并受 `AGENT_QUERY_TRANSLATION_MAX_PARALLEL_FIELDS` 限制；`MAX_TOKENS`、并发数、生成轮次和工具次数分别构成独立预算，不能互相替代。
+管理端不会因存在密钥而自动发起模型请求。只有创建查询任务后才会调用模型。`AGENT_QUERY_MODEL_PROVIDER` 为整条查询流水线统一选择 `deepseek` 或 `vllm`；所有子图共享该供应商的地址、密钥、模型和超时，不允许单独覆盖。业务对齐、查询规划、单表候选检索、SQL 生成、结果翻译和结果审计均采用标准 Pydantic Function Calling，因此 vLLM 服务端必须配置与所承载模型匹配的工具解析器和 Chat Template。`AGENT_QUERY_TOOL_TAG_TEMPLATE` 是全局唯一模板配置，由全部模型工具阶段共享；vLLM 承载 Qwen3.6 时应选择 `qwen3.6.txt`。模板只描述标签语法并使用显式占位符，不包含任何具体工具名、参数名或业务示例；真实调用只依赖当轮工具 Schema。任务提示词会在动态业务上下文之前提供该通用模板，模型未形成 `tool_calls` 时还会在错误反馈中再次收到同一格式提示。留空表示关闭格式模板提示，配置时只能填写镜像内 `data/tool-tag/` 下的单个 `.txt` 文件名。翻译层按待翻译字段独立异步调用模型，并受 `AGENT_QUERY_TRANSLATION_MAX_PARALLEL_FIELDS` 限制；`MAX_TOKENS`、并发数、生成轮次和工具次数分别构成独立预算，不能互相替代。
 
 查询诊断日志默认关闭。`basic` 只记录阶段、状态、次数、稳定错误码和耗时；`detailed` 额外记录涉及表、结果字段、已通过静态安全校验的参数化 SQL 模板及返回行数。修改开关或等级后必须重启应用，排障结束后应恢复为关闭。
 

@@ -6,8 +6,8 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
 
-from app.agent.events.sse import encode_sse_event, encode_sse_heartbeat
-from app.agent.query_manager import (
+from app.agent.text2sql.events.sse import encode_sse_event, encode_sse_heartbeat
+from app.agent.text2sql.query_manager import (
     AgentQueryCapacityError,
     AgentQueryManager,
     AgentQueryNotFoundError,

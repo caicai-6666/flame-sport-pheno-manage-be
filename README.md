@@ -77,7 +77,7 @@ router → services → repositories / clients
 
 | 目录 | 职责 |
 | --- | --- |
-| `app/agent/` | 可注入业务域的查询工作流、通用工具、只读运行时、会话交互和进度事件 |
+| `app/agent/` | 智能体业务命名空间；当前 `text2sql/` 独立承载查询会话、交互、事件、业务域和完整查询工作流 |
 | `app/router/` | HTTP 路径、认证依赖、参数位置、服务调用和异常映射 |
 | `app/schemas/` | Pydantic 请求响应模型及传输层字段校验 |
 | `app/services/` | 业务用例、事务边界、跨仓储和外部服务编排 |
@@ -208,8 +208,8 @@ Authorization: Bearer <access-token>
 | MySQL | `MYSQL_*` | 数据库连接、字符集、日志和连接池 |
 | 客户端后端 | `CLIENT_BACKEND_BASE_URL`、`CLIENT_BACKEND_TIMEOUT_SECONDS` | 内部管理接口基础地址和超时 |
 | 图片缓存 | `IMAGE_CACHE_SECONDS` | 可缓存图片中转响应的私有缓存秒数 |
-| DeepSeek | `DEEPSEEK_*` | OpenAI 兼容模型连接及查询各阶段单次输出预算；仅创建查询后调用 |
-| 查询智能体 | `AGENT_QUERY_*` | 生成与工具预算、活动会话、事件历史、会话保留、SSE 心跳和脱敏诊断日志 |
+| 模型连接 | `DEEPSEEK_*` | OpenAI 兼容模型连接及查询各阶段单次输出预算；仅创建查询后调用 |
+| 查询智能体 | `AGENT_QUERY_*` | 全局模型请求体系与共享工具标签模板、生成与工具预算、活动会话、事件历史、会话保留、SSE 心跳和脱敏诊断日志 |
 
 业务日期统一使用 `Asia/Shanghai`。容器时区也固定为该值，但日期边界相关代码仍显式指定时区，不依赖宿主机默认配置。
 

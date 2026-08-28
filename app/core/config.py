@@ -97,6 +97,18 @@ class Settings(BaseSettings):
     deepseek_base_url: AnyHttpUrl = AnyHttpUrl("https://api.deepseek.com")
     deepseek_model: str = Field(default="deepseek-v4-flash", min_length=1)
     deepseek_http_timeout_seconds: float = Field(default=60.0, gt=0)
+    # vLLM 连接配置只在对应请求体系启用时使用，默认值用于无鉴权的本地 OpenAI 兼容服务。
+    vllm_api_key: SecretStr = SecretStr("EMPTY")
+    vllm_base_url: AnyHttpUrl = AnyHttpUrl("http://127.0.0.1:8000/v1")
+    vllm_model: str = Field(default="deepseek-v4-flash", min_length=1)
+    vllm_http_timeout_seconds: float = Field(default=60.0, gt=0)
+    # 查询智能体整条流水线统一使用同一模型供应商，禁止不同子图分别选择服务。
+    agent_query_model_provider: Literal["deepseek", "vllm"] = "deepseek"
+    # 整条查询流水线共享同一工具标签模板，文件只能从 data/tool-tag 受控目录选择。
+    agent_query_tool_tag_template: str | None = Field(
+        default="deepseek-v4.txt",
+        max_length=128,
+    )
     # 查询智能体为不同职责设定单次生成硬上限，防止工具循环或 JSON 输出意外放大成本。
     deepseek_query_alignment_max_tokens: int = Field(default=1200, ge=128, le=8192)
     deepseek_query_planning_max_tokens: int = Field(default=3000, ge=256, le=8192)

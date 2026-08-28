@@ -1,7 +1,7 @@
 """为管理 API 编排查询智能体会话操作和安全响应转换。"""
 
-from app.agent.interaction.session import AgentQuerySession
-from app.agent.query_manager import AgentQueryManager
+from app.agent.text2sql.interaction.session import AgentQuerySession
+from app.agent.text2sql.query_manager import AgentQueryManager
 from app.schemas.agent_query import (
     AgentInteractionResponse,
     AgentQueryCachedRecordIdsResponse,

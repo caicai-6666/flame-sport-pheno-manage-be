@@ -60,10 +60,16 @@ flowchart LR
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | DeepSeek OpenAI 兼容接口地址 |
 | `DEEPSEEK_MODEL` | `deepseek-v4-flash` | 两个后端共享的默认模型名称 |
 | `DEEPSEEK_HTTP_TIMEOUT_SECONDS` | `60` | DeepSeek 单次 HTTP 请求超时 |
+| `VLLM_API_KEY` | `EMPTY` | vLLM OpenAI 兼容服务鉴权值；服务未启用鉴权时沿用占位值 |
+| `VLLM_BASE_URL` | `http://127.0.0.1:8000/v1` | vLLM OpenAI 兼容接口地址；容器部署时必须改为容器可达地址 |
+| `VLLM_MODEL` | `deepseek-v4-flash` | vLLM 服务公开的模型标识，必须与服务端注册名称一致 |
+| `VLLM_HTTP_TIMEOUT_SECONDS` | `60` | vLLM 单次 HTTP 请求超时 |
+| `AGENT_QUERY_MODEL_PROVIDER` | `deepseek` | 查询智能体全局模型供应商，可选 `deepseek` 或 `vllm` |
+| `AGENT_QUERY_TOOL_TAG_TEMPLATE` | `deepseek-v4.txt` | 已适配工具阶段共享、用于工具调用提醒和无工具调用纠错的受控模板文件名 |
 | `DEEPSEEK_QUERY_*_MAX_TOKENS` | 见查询智能体运行文档 | 各查询阶段（含结果翻译）的单次生成上限 |
 | `AGENT_QUERY_*` | 见查询智能体运行文档 | 查询生成轮次、翻译字段并发、工具次数和进程内会话资源上限 |
 
-Compose 会把共享的 `MYSQL_USER`、`MYSQL_PASSWORD`、`MYSQL_DATABASE`、基础 `DEEPSEEK_*` 配置，以及查询智能体的 `DEEPSEEK_QUERY_*`、`AGENT_QUERY_*` 配置注入管理端后端，并将数据库主机固定为 `mysql:3306`。客户端后端默认使用 `http://backend:8000/flame/api/admin`；只有 Compose 服务名或管理接口路径变化时才调整该环境变量，生产容器不得误走公网。
+Compose 会把共享的 `MYSQL_USER`、`MYSQL_PASSWORD`、`MYSQL_DATABASE`、基础 `DEEPSEEK_*` 配置，以及管理端查询智能体的 `VLLM_*`、`DEEPSEEK_QUERY_*`、`AGENT_QUERY_*` 配置注入管理端后端，并将数据库主机固定为 `mysql:3306`。`AGENT_QUERY_MODEL_PROVIDER` 对整条查询流水线生效，禁止为不同子图分别选择供应商。客户端后端默认使用 `http://backend:8000/flame/api/admin`；只有 Compose 服务名或管理接口路径变化时才调整该环境变量，生产容器不得误走公网。
 
 管理端后端容器固定注入 `TZ=Asia/Shanghai`，镜像也使用相同默认值。涉及赛季日期边界的业务代码仍应显式使用 `Asia/Shanghai`，不得只依赖容器系统时区。
 
