@@ -1,0 +1,67 @@
+{
+  "entities": [
+    {
+      "entity_type": "user",
+      "table_name": "user",
+      "id_field": "id",
+      "display_field": "name",
+      "match_mode": "name_fuzzy",
+      "similarity": {
+        "algorithm": "damerau_levenshtein",
+        "threshold": 0.78,
+        "max_edit_distance": 2,
+        "max_candidates": 3,
+        "max_scan_rows": 2000
+      }
+    },
+    {
+      "entity_type": "department",
+      "table_name": "department",
+      "id_field": "id",
+      "display_field": "name",
+      "match_mode": "name_fuzzy",
+      "similarity": {
+        "algorithm": "damerau_levenshtein",
+        "threshold": 0.78,
+        "max_edit_distance": 2,
+        "max_candidates": 3,
+        "max_scan_rows": 2000
+      }
+    },
+    {
+      "entity_type": "project",
+      "table_name": "project",
+      "id_field": "id",
+      "display_field": "name",
+      "match_mode": "name_fuzzy",
+      "similarity": {
+        "algorithm": "damerau_levenshtein",
+        "threshold": 0.78,
+        "max_edit_distance": 2,
+        "max_candidates": 3,
+        "max_scan_rows": 2000
+      }
+    },
+    {
+      "entity_type": "project_level",
+      "table_name": "project_level",
+      "id_field": "id",
+      "display_field": "name",
+      "match_mode": "name_fuzzy",
+      "similarity": {
+        "algorithm": "damerau_levenshtein",
+        "threshold": 0.78,
+        "max_edit_distance": 2,
+        "max_candidates": 3,
+        "max_scan_rows": 2000
+      }
+    },
+    {
+      "entity_type": "season",
+      "table_name": "season",
+      "id_field": "id",
+      "display_field": "name",
+      "match_mode": "exact_only"
+    }
+  ]
+}

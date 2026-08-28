@@ -1,0 +1,9 @@
+必须让服务端把响应解析为 OpenAI `tool_calls`，不要用普通正文描述或模拟工具调用。以下内容只定义 Qwen3.6 的标签语法，不定义任何具体工具或业务参数；双花括号中的内容是占位符，必须根据本轮已注册工具 Schema 替换，禁止原样输出，结束标签后不要追加任何正文：
+
+<tool_call>
+<function={{TOOL_NAME}}>
+<parameter={{PARAMETER_NAME}}>
+{{PARAMETER_VALUE}}
+</parameter>
+</function>
+</tool_call>

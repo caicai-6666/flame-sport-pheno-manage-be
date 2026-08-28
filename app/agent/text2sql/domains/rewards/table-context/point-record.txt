@@ -1,0 +1,17 @@
+TABLE: point_record
+ROW_GRAIN: 一行代表一个用户的积分变动或商品兑换履约流水。
+PURPOSE: 记录全局积分增加、扣减、退款、赛季奖励和后台调整，以及商品兑换的履约状态。
+QUERY_ROLE: 用于查询当前余额、积分明细、兑换记录、积分变动类型、变动后余额和奖品履约；不直接保存赛季归属。
+DATA_CHARACTER: 跨赛季的积分事件明细。每条记录保存变动后的余额；商品兑换履约状态只对兑换流水有效。
+QUERY_INVARIANTS:
+- point_record.status = 1 表示有效流水；当前余额和当前积分统计默认只使用有效流水。
+- change_points 为本次变动值，正数增加积分，负数扣减积分；统计变动总额时按用户要求的时间范围和变动类型聚合。
+- points_after 为该次变动后的用户全局余额；查询当前余额时取最新有效流水的余额事实，不得把多条 points_after 相加；最新记录先按 created_at 判断，同一时间再按 id 判断。
+- change_type = exchange 表示商品兑换扣减；兑换记录需要 product_id 非空并关联 product。
+- gift_distribution_status 只对有效商品兑换流水有业务意义；待发放查询还必须限定兑换类型、商品存在和有效状态。
+- gift_distribution_status 的业务状态为 pending 待发放、distributed 已发放、rejected 拒绝发放；终态不能互相覆盖。
+- change_type = season_reward 只能说明流水是赛季奖励类型，当前无法从本表结构化确定它属于哪个具体赛季。
+RELATIONSHIPS:
+- user: many-to-one。多条积分流水属于一个用户。
+- product: many-to-one optional。商品兑换及退款流水可以关联一个商品；赛季奖励和人工调整通常没有商品。
+- season: no direct relationship。积分流水没有 season_id，赛季结算结果应从 season_user 查询。

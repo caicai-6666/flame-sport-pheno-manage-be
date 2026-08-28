@@ -1,0 +1,7 @@
+必须让服务端把响应解析为 OpenAI `tool_calls`，不要把工具调用解释写在普通正文中。以下内容只定义 DeepSeek V4 DSML 的标签语法，不定义任何具体工具或业务参数；双花括号中的内容是占位符，必须根据本轮已注册工具 Schema 替换，禁止原样输出：
+
+<｜DSML｜tool_calls>
+<｜DSML｜invoke name="{{TOOL_NAME}}">
+<｜DSML｜parameter name="{{PARAMETER_NAME}}" string="{{IS_STRING}}">{{PARAMETER_VALUE}}</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜tool_calls>
