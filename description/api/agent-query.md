@@ -160,6 +160,8 @@ data: {"stage":"confirmation","event_type":"interaction_required","status":"wait
 
 服务器还会发送 `: heartbeat` 注释维持连接。响应禁止缓存并设置 `X-Accel-Buffering: no`。
 
+Planning 内部的某一轮 SQL 读取或表格整理失败时，工作流仍可能根据工具反馈自动修正。此类可恢复失败统一发送 `event_type = progress_updated`、`status = running`；前端可以展示当前修正进度，但不得将其识别为查询失败。只有 `event_type = query_failed` 表示整个查询已经不可恢复地终止。
+
 最终结果审计成功时，`stage = result` 的 `stage_completed` 与最终 `query_completed` 事件的 `message` 都是受约束的 `result_summary`，用于直接向操作员说明完整结果的行数、类别分布或数值极值。审计不可用时，事件改为说明结果表已生成但摘要暂不可用。
 
 这些用户可见的 `message` 可以包含用于排版的换行与连续空格，但接口仍返回普通 JSON 字符串。SSE、轨迹和结果接口中的同一终态摘要保持一致。

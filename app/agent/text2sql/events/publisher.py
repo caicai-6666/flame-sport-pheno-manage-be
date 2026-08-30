@@ -105,13 +105,13 @@ class AgentProgressReporter:
             )
         )
 
-    # 原料查询失败时关闭当前执行阶段，后续是否修正由规划模型根据工具反馈决定。
+    # 原料查询的单轮失败仍允许规划模型修正重试，因此只发布运行中进度，避免前端误判为查询终态。
     def material_query_failed(self) -> None:
         self.emit(
             AgentProgressUpdate(
                 stage="execution",
-                event_type="stage_completed",
-                status="failure",
+                event_type="progress_updated",
+                status="running",
                 title="本轮数据读取未完成",
                 message="正在根据安全错误提示调整查询要求。",
             )
@@ -148,13 +148,13 @@ class AgentProgressReporter:
             )
         )
 
-    # 塑形失败时给操作员稳定提示，具体技术错误仅通过内部工具反馈和诊断轨迹处理。
+    # 塑形的单轮失败仍允许规划模型修正重试，因此只发布运行中进度，真正终止统一由查询终态事件表达。
     def material_shaping_failed(self) -> None:
         self.emit(
             AgentProgressUpdate(
                 stage="shaping",
-                event_type="stage_completed",
-                status="failure",
+                event_type="progress_updated",
+                status="running",
                 title="本轮表格整理未完成",
                 message="正在根据结果布局反馈调整整理方式。",
             )
