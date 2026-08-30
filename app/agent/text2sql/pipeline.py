@@ -1,10 +1,10 @@
-"""装配业务对齐、规划、SQL、翻译、塑形与审计子图。"""
+"""装配业务对齐、交互式查询规划、翻译与结果审计主链路。"""
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
 from app.agent.text2sql.domains.base import QueryDomainProfile
 from app.agent.text2sql.subgraphs.alignment import (
@@ -19,19 +19,17 @@ from app.agent.text2sql.subgraphs.audit import (
     QueryResultAuditResult,
     QueryResultAuditSubgraph,
 )
-from app.agent.text2sql.subgraphs.shaping import (
-    ResultShapingSubgraph,
-    ResultShapingSubgraphResult,
-)
+from app.agent.text2sql.subgraphs.shaping import ResultShapingSubgraphResult
 from app.agent.text2sql.subgraphs.translation import (
     ResultTranslationSubgraph,
     ResultTranslationSubgraphResult,
 )
-from app.agent.text2sql.subgraphs.sql import SqlQuerySubgraph, SqlQuerySubgraphResult
+from app.agent.text2sql.subgraphs.sql import SqlQuerySubgraphResult
 from app.agent.text2sql.events.models import AgentProgressUpdate
 from app.agent.text2sql.events.publisher import ProgressEmitter
-from app.agent.text2sql.shared.table_schema_cache import CachingTableSchemaReader
-from app.agent.text2sql.shared.table_schema_reader import InformationSchemaTableSchemaReader
+from app.agent.text2sql.model_messages import ModelMessageTraceQueue
+from app.agent.text2sql.subgraphs.planning.tools.table_schema_cache import CachingTableSchemaReader
+from app.agent.text2sql.subgraphs.planning.tools.table_schema_reader import InformationSchemaTableSchemaReader
 from app.agent.text2sql.subgraphs.planning.tools.table_schema import TableSchemaToolResponse
 from app.core.config import Settings, get_settings
 
@@ -42,6 +40,7 @@ InteractionRequester = Callable[
 ]
 TraceWriter = Callable[[str], None]
 SchemaReader = Callable[[str], TableSchemaToolResponse]
+UserMessageFormatter = Callable[[str], Awaitable[str]]
 
 
 class AgentQueryPipelineResult(BaseModel):
@@ -70,7 +69,7 @@ def _build_result_message(audit_result: QueryResultAuditResult) -> str:
 
 
 class AgentQueryPipeline:
-    """以业务域配置装配共享工具和六个子图，并通过统一事件出口报告关键阶段。"""
+    """以业务域配置装配主链路；SQL 与塑形由规划阶段的受控工具完成。"""
 
     # 保存不可变业务域、运行预算和交互出口，实际模型与数据库适配器在单次运行中装配。
     def __init__(
@@ -80,7 +79,9 @@ class AgentQueryPipeline:
         progress_emitter: ProgressEmitter | None = None,
         settings: Settings | None = None,
         trace_writer: TraceWriter | None = None,
+        message_trace_queue: ModelMessageTraceQueue | None = None,
         schema_reader: SchemaReader | None = None,
+        user_message_formatter: UserMessageFormatter | None = None,
     ) -> None:
         domain_profile.validate_resources()
         self._domain_profile = domain_profile
@@ -88,7 +89,9 @@ class AgentQueryPipeline:
         self._progress_emitter = progress_emitter
         self._settings = settings or get_settings()
         self._trace_writer = trace_writer
+        self._message_trace_queue = message_trace_queue
         self._schema_reader = schema_reader
+        self._user_message_formatter = user_message_formatter
 
     # 发布面向操作员的稳定阶段事件，禁止把 SQL、工具参数或原始模型文本塞入 message。
     def _emit(
@@ -113,13 +116,26 @@ class AgentQueryPipeline:
             )
         )
 
+    # 在唯一展示边界调用格式化器；模型或供应商异常时必须回退原文，不得阻断主查询。
+    async def _format_user_message(self, message: str) -> str:
+        if self._user_message_formatter is None:
+            return message
+        try:
+            return await self._user_message_formatter(message)
+        except Exception:
+            return message
+
     # 将子图的单问题回调转换为可暂停的正式交互请求，答案由查询会话恢复后同步返回。
     def _request_clarification(self, question: str) -> str:
         return self._interaction_requester("clarification", question, ())
 
-    # 在线程中等待现有同步会话交互，使异步业务对齐节点不会阻塞 FastAPI 事件循环。
+    # 先整理用户可见问题，再在线程中等待同步会话交互，避免阻塞 FastAPI 事件循环。
     async def _request_clarification_async(self, question: str) -> str:
-        return await asyncio.to_thread(self._request_clarification, question)
+        formatted_question = await self._format_user_message(question)
+        return await asyncio.to_thread(
+            self._request_clarification,
+            formatted_question,
+        )
 
     # 复核查询计划时只提供确认或修正选择，具体修正内容由后续独立澄清交互收集。
     def _request_plan_review(self, question: str) -> str:
@@ -129,28 +145,31 @@ class AgentQueryPipeline:
             ("确认并继续", "修正查询"),
         )
 
-    # 在线程中等待规划字段复核，避免同步条件变量阻塞 FastAPI 事件循环和 SSE 心跳。
+    # 先整理规划复核问题，再在线程中等待答案，避免阻塞事件循环和 SSE 心跳。
     async def _request_plan_review_async(self, question: str) -> str:
-        return await asyncio.to_thread(self._request_plan_review, question)
-
-    # 在对齐结果进入规划前强制请求用户确认，拒绝或修改不会消耗后续模型和数据库资源。
-    async def _confirm_alignment(self, aligned_question: str) -> bool:
-        answer = await asyncio.to_thread(
-            self._interaction_requester,
-            "confirmation",
-            f"我将按以下需求继续查询：{aligned_question}",
-            ("确认并继续", "取消查询"),
+        formatted_question = await self._format_user_message(question)
+        return await asyncio.to_thread(
+            self._request_plan_review,
+            formatted_question,
         )
-        return answer.strip().lower() in {
-            "确认并继续",
-            "确认",
-            "继续",
-            "是",
-            "yes",
-            "y",
-        }
 
-    # 异步编排完整流水线；模型与数据库节点直接等待，仅隔离确定性同步塑形计算。
+    # 展示业务对齐结果并提供确认或修正入口，具体修正内容由随后自由文本交互收集。
+    def _request_alignment_review(self, question: str) -> str:
+        return self._interaction_requester(
+            "confirmation",
+            question,
+            ("确认并继续", "修正需求"),
+        )
+
+    # 先整理业务对齐复核问题，再在线程中等待用户确认或修正。
+    async def _request_alignment_review_async(self, question: str) -> str:
+        formatted_question = await self._format_user_message(question)
+        return await asyncio.to_thread(
+            self._request_alignment_review,
+            formatted_question,
+        )
+
+    # 异步编排完整流水线；规划阶段选中的完整结果直接进入翻译，不再重复查询或塑形。
     async def run(self, user_question: str) -> AgentQueryPipelineResult:
         normalized_question = user_question.strip()
         if not normalized_question:
@@ -173,7 +192,8 @@ class AgentQueryPipeline:
             self._domain_profile,
             settings=self._settings,
             user_input_reader=self._request_clarification_async,
-            trace_writer=self._trace_writer,
+            alignment_review_reader=self._request_alignment_review_async,
+            message_trace_queue=self._message_trace_queue,
             progress_emitter=self._progress_emitter,
         )
         alignment_result = await alignment_subgraph.run(
@@ -182,12 +202,15 @@ class AgentQueryPipeline:
         )
         if alignment_result.status == "abandoned":
             assert alignment_result.abandonment is not None
+            abandonment_message = await self._format_user_message(
+                alignment_result.abandonment.user_message
+            )
             return AgentQueryPipelineResult(
                 status="abandoned",
                 domain_key=self._domain_profile.key,
                 user_question=normalized_question,
                 alignment_result=alignment_result,
-                user_message=alignment_result.abandonment.user_message,
+                user_message=abandonment_message,
             )
 
         assert alignment_result.aligned_request is not None
@@ -198,17 +221,6 @@ class AgentQueryPipeline:
             "查询需求已整理",
             alignment_result.aligned_request.aligned_question,
         )
-        if not await self._confirm_alignment(
-            alignment_result.aligned_request.aligned_question
-        ):
-            return AgentQueryPipelineResult(
-                status="abandoned",
-                domain_key=self._domain_profile.key,
-                user_question=normalized_question,
-                alignment_result=alignment_result,
-                user_message="用户取消了本次查询。",
-            )
-
         self._emit(
             "planning",
             "stage_started",
@@ -223,6 +235,7 @@ class AgentQueryPipeline:
             user_input_reader=self._request_clarification_async,
             plan_review_reader=self._request_plan_review_async,
             trace_writer=self._trace_writer,
+            message_trace_queue=self._message_trace_queue,
             progress_emitter=self._progress_emitter,
         )
         planning_result = await planning_agent.run(
@@ -232,82 +245,65 @@ class AgentQueryPipeline:
         )
         if planning_result.status == "abandoned":
             assert planning_result.abandonment is not None
+            abandonment_message = await self._format_user_message(
+                planning_result.abandonment.user_message
+            )
             return AgentQueryPipelineResult(
                 status="abandoned",
                 domain_key=self._domain_profile.key,
                 user_question=normalized_question,
                 alignment_result=alignment_result,
                 planning_result=planning_result,
-                user_message=planning_result.abandonment.user_message,
+                user_message=abandonment_message,
             )
 
         self._emit(
             "planning",
             "stage_completed",
             "success",
-            "查询方案已准备",
-            "需要的数据、筛选范围和结果形式已经确定。",
+            "查询结果布局已确认",
+            "原料查询和表格整理已经完成，正在转换业务状态。",
         )
-        assert planning_result.query_plan is not None
-        self._emit(
-            "sql_generation",
-            "stage_started",
-            "running",
-            "正在生成安全查询",
-            "正在把查询方案转换为只读查询并执行安全检查。",
-        )
-        sql_subgraph = SqlQuerySubgraph.from_settings(
-            self._domain_profile,
-            settings=self._settings,
-            schema_reader=schema_reader,
-            trace_writer=self._trace_writer,
-            progress_emitter=self._progress_emitter,
-        )
-        sql_result = await sql_subgraph.run(
-            planning_result.query_plan,
-            planning_result.schema_results,
-            max_generation_count=self._settings.agent_query_sql_max_generations,
-        )
-        if sql_result.status == "failure":
+        final_result = planning_result.final_result
+        if final_result is None:
             return AgentQueryPipelineResult(
                 status="failure",
                 domain_key=self._domain_profile.key,
                 user_question=normalized_question,
                 alignment_result=alignment_result,
                 planning_result=planning_result,
-                sql_result=sql_result,
-                error=sql_result.error or "查询生成或执行失败。",
+                error="查询规划未选择可进入翻译阶段的成功表格。",
             )
-
-        self._emit(
-            "execution",
-            "stage_completed",
-            "success",
-            "数据读取完成",
-            f"共读取到 {sql_result.returned_row_count} 条结果，正在整理展示内容。",
-        )
+        sql_result = final_result.sql_result
+        shaping_result = final_result.shaping_result
         self._emit(
             "translation",
             "stage_started",
             "running",
             "正在转换业务状态",
-            "正在将结果中的状态和类型编码转换为可读业务含义。",
+            "正在将最终表格中的状态和类型编码转换为可读业务含义。",
         )
-        assert sql_result.sql is not None
         assert sql_result.analysis_sql is not None
         translation_subgraph = ResultTranslationSubgraph.from_settings(
             self._domain_profile,
             settings=self._settings,
             schema_reader=schema_reader,
             trace_writer=self._trace_writer,
+            message_trace_queue=self._message_trace_queue,
         )
+        result_column_sources = {
+            column.key: column.source_result_field
+            for column in shaping_result.columns
+            if column.source_result_field is not None
+        }
         translation_result = await translation_subgraph.run(
             sql=sql_result.analysis_sql,
-            result_columns=sql_result.result_columns,
-            rows=sql_result.rows,
+            result_columns=[column.key for column in shaping_result.columns],
+            rows=shaping_result.rows,
             schema_results=sql_result.schema_results,
+            result_column_sources=result_column_sources,
         )
-        translated_sql_result = sql_result.model_copy(
+        translated_shaping_result = shaping_result.model_copy(
             update={"rows": translation_result.translated_rows}
         )
         if translation_result.status == "success":
@@ -329,51 +325,8 @@ class AgentQueryPipeline:
                 "stage_completed",
                 "failure",
                 "业务状态转换暂不可用",
-                "查询结果将保留数据库原始值并继续生成表格。",
+                "最终表格将保留数据库原始值并继续生成结果。",
             )
-        assert planning_result.result_shape_plan is not None
-        self._emit(
-            "shaping",
-            "stage_started",
-            "running",
-            "正在整理表格结构",
-            "正在按已确认的结果布局整理行列。",
-        )
-        shaping_result = await asyncio.to_thread(
-            ResultShapingSubgraph().run,
-            planning_result.query_plan,
-            planning_result.result_shape_plan,
-            translated_sql_result.rows,
-        )
-        if shaping_result.status == "failure":
-            self._emit(
-                "shaping",
-                "stage_completed",
-                "failure",
-                "表格结构整理失败",
-                "查询数据已读取，但无法按确认的布局生成最终表格。",
-            )
-            return AgentQueryPipelineResult(
-                status="failure",
-                domain_key=self._domain_profile.key,
-                user_question=normalized_question,
-                alignment_result=alignment_result,
-                planning_result=planning_result,
-                sql_result=sql_result,
-                translation_result=translation_result,
-                shaping_result=shaping_result,
-                error=shaping_result.error or "结果塑形失败。",
-            )
-        self._emit(
-            "shaping",
-            "stage_completed",
-            "success",
-            "表格结构整理完成",
-            (
-                f"已将 {shaping_result.source_row_count} 条查询数据整理为 "
-                f"{shaping_result.result_row_count} 行结果。"
-            ),
-        )
         self._emit(
             "result",
             "stage_started",
@@ -385,15 +338,27 @@ class AgentQueryPipeline:
             self._domain_profile,
             settings=self._settings,
             trace_writer=self._trace_writer,
+            message_trace_queue=self._message_trace_queue,
         )
         audit_result = await audit_subgraph.run(
             normalized_question,
             alignment_result,
             planning_result,
-            translated_sql_result,
-            shaping_result,
+            sql_result,
+            translated_shaping_result,
         )
-        result_message = _build_result_message(audit_result)
+        result_message = await self._format_user_message(
+            _build_result_message(audit_result)
+        )
+        # 让 SSE、轨迹和结果接口继续共享同一摘要，只改变现有字符串的空白排版。
+        if audit_result.status == "success" and audit_result.assessment is not None:
+            audit_result = audit_result.model_copy(
+                update={
+                    "assessment": audit_result.assessment.model_copy(
+                        update={"result_summary": result_message}
+                    )
+                }
+            )
         self._emit(
             "result",
             "stage_completed",
@@ -409,7 +374,7 @@ class AgentQueryPipeline:
             planning_result=planning_result,
             sql_result=sql_result,
             translation_result=translation_result,
-            shaping_result=shaping_result,
+            shaping_result=translated_shaping_result,
             audit_result=audit_result,
             user_message=result_message,
         )

@@ -4,6 +4,7 @@ from typing import Any
 
 __all__ = [
     "DeepSeekQueryPlanningAgent",
+    "PlanningFinalQueryResult",
     "QueryPlanningAgentResult",
     "QueryPlanningExecutionError",
 ]

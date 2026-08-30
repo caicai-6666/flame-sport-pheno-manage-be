@@ -1,4 +1,4 @@
-"""将工具参数校验异常转换为可供 Text-to-SQL 模型修复的标准返回值。"""
+"""将 Function Calling 参数校验异常转换为可供模型修复的标准返回值。"""
 
 from collections.abc import Sequence
 import json

@@ -11,6 +11,10 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlglot import exp, parse_one
 
 from app.agent.text2sql.domains.base import QueryDomainProfile
+from app.agent.text2sql.model_messages import (
+    ModelMessageTraceQueue,
+    create_traced_chat_completion,
+)
 from app.agent.text2sql.shared.yaml_context import parse_yaml_context, render_yaml_context
 from app.agent.text2sql.shared.model_options import (
     DEFAULT_TRANSLATION_MAX_TOKENS,
@@ -21,9 +25,9 @@ from app.agent.text2sql.shared.tool_tag_template import (
     load_tool_tag_template,
     resolve_query_tool_tag_template_filename,
 )
-from app.agent.text2sql.shared.table_schema_cache import CachingTableSchemaReader
-from app.agent.text2sql.shared.table_schema_reader import InformationSchemaTableSchemaReader
-from app.agent.text2sql.shared.tools.argument_feedback import (
+from app.agent.text2sql.subgraphs.planning.tools.table_schema_cache import CachingTableSchemaReader
+from app.agent.text2sql.subgraphs.planning.tools.table_schema_reader import InformationSchemaTableSchemaReader
+from app.agent.text2sql.function_calling.feedback import (
     build_tool_argument_error_message,
 )
 from app.agent.text2sql.subgraphs.planning.tools.table_schema import (
@@ -167,6 +171,7 @@ class _ResultTranslationState(TypedDict, total=False):
     sql: str
     result_columns: list[str]
     rows: list[dict[str, Any]]
+    result_column_sources: dict[str, str] | None
     provided_schema_results: list[TableSchemaToolResponse] | None
     schema_results: list[TableSchemaToolResponse]
     schema_fields: dict[str, dict[str, _SchemaField]]
@@ -428,6 +433,7 @@ class ResultTranslationSubgraph:
         max_tokens: int = DEFAULT_TRANSLATION_MAX_TOKENS,
         max_parallel_fields: int = MAX_PARALLEL_TRANSLATION_FIELD_COUNT,
         trace_writer: Callable[[str], None] | None = None,
+        message_trace_queue: ModelMessageTraceQueue | None = None,
         request_profile: str = "deepseek",
         tool_tag_template: str | None = None,
         close_client_after_run: bool = False,
@@ -444,6 +450,7 @@ class ResultTranslationSubgraph:
         self._max_tokens = max_tokens
         self._max_parallel_fields = max_parallel_fields
         self._trace_writer = trace_writer
+        self._message_trace_queue = message_trace_queue
         self._request_profile = get_model_request_profile(request_profile)
         self._tool_tag_template = tool_tag_template
         self._close_client_after_run = close_client_after_run
@@ -466,6 +473,7 @@ class ResultTranslationSubgraph:
         settings: Settings | None = None,
         schema_reader: SchemaReader | None = None,
         trace_writer: Callable[[str], None] | None = None,
+        message_trace_queue: ModelMessageTraceQueue | None = None,
     ) -> "ResultTranslationSubgraph":
         resolved_settings = settings or get_settings()
         connection = resolve_model_provider_connection(resolved_settings)
@@ -490,6 +498,7 @@ class ResultTranslationSubgraph:
                 resolved_settings.agent_query_translation_max_parallel_fields
             ),
             trace_writer=trace_writer,
+            message_trace_queue=message_trace_queue,
             request_profile=connection.provider,
             tool_tag_template=load_tool_tag_template(
                 resolve_query_tool_tag_template_filename(resolved_settings)
@@ -596,7 +605,15 @@ class ResultTranslationSubgraph:
         self,
         state: _ResultTranslationState,
     ) -> dict[str, Any]:
-        table_names, direct_lineage = _extract_direct_result_lineage(state["sql"])
+        table_names, sql_direct_lineage = _extract_direct_result_lineage(state["sql"])
+        result_column_sources = state.get("result_column_sources")
+        direct_lineage = sql_direct_lineage
+        if result_column_sources is not None:
+            direct_lineage = {
+                result_field: sql_direct_lineage[source_result_field]
+                for result_field, source_result_field in result_column_sources.items()
+                if source_result_field in sql_direct_lineage
+            }
         schema_results, schema_fields = await self._load_schema_context(
             table_names,
             state.get("provided_schema_results"),
@@ -630,7 +647,10 @@ class ResultTranslationSubgraph:
             self._write_trace(
                 f"[翻译层节点 1] 第 {attempt + 1} 次模型调用：识别待翻译字段"
             )
-            response = await self._client.chat.completions.create(
+            response = await create_traced_chat_completion(
+                client=self._client,
+                message_queue=self._message_trace_queue,
+                node="translation.target_detection",
                 model=self._model,
                 messages=[*messages],
                 tools=[tool],
@@ -946,7 +966,10 @@ class ResultTranslationSubgraph:
                 f"[翻译层节点 2][{target.result_field}] "
                 f"第 {attempt + 1} 次模型调用：解析字段 comment"
             )
-            response = await self._client.chat.completions.create(
+            response = await create_traced_chat_completion(
+                client=self._client,
+                message_queue=self._message_trace_queue,
+                node=f"translation.rule_generation.{target.result_field}",
                 model=self._model,
                 messages=[*messages],
                 tools=[tool],
@@ -1194,13 +1217,14 @@ class ResultTranslationSubgraph:
         )
         return {"translated_rows": translated_rows}
 
-    # 异步运行独立翻译子图；模型或结构异常时保留原始行，且释放本次自行创建的模型客户端。
+    # 异步翻译最终塑形列；通过列来源映射追溯 SQL 原始别名，异常时完整保留塑形结果。
     async def run(
         self,
         sql: str,
         result_columns: list[str],
         rows: list[dict[str, Any]],
         schema_results: list[TableSchemaToolResponse] | None = None,
+        result_column_sources: dict[str, str] | None = None,
     ) -> ResultTranslationSubgraphResult:
         if not sql.strip():
             raise ValueError("最终 SQL 不能为空")
@@ -1218,6 +1242,7 @@ class ResultTranslationSubgraph:
                         "sql": sql,
                         "result_columns": result_columns,
                         "rows": rows,
+                        "result_column_sources": result_column_sources,
                         "provided_schema_results": schema_results,
                     }
                 )

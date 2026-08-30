@@ -99,37 +99,29 @@ Authorization: Bearer <admin-token>
 {
   "interaction_id": "9c3d5314a9554ed0ae63b15ad8ecbf06",
   "interaction_type": "confirmation",
-  "question": "我将按以下需求继续查询：查询当前进行中的赛季名称和起止日期",
-  "options": ["确认并继续", "取消查询"],
+  "question": "我将按以下需求继续查询：查询当前进行中的赛季名称和起止日期\n请选择‘确认并继续’或‘修正需求’。",
+  "options": ["确认并继续", "修正需求"],
   "allow_free_text": false
 }
 ```
 
-`interaction_type` 为 `clarification` 时，前端应允许填写自由文本。规划完成后的字段复核先使用不可自由输入的 `confirmation` 交互：
+业务对齐确认选择“修正需求”后，服务端会紧接着创建一次允许自由文本的 `clarification`，询问“请说明需要如何修正刚才整理的查询需求。”。用户回答会返回原业务对齐上下文，模型生成修正版并再次发起确认；该过程不会把查询标记为取消。需要终止整个任务时仍使用取消查询接口。`修正需求` 与 Planning 使用的 `修正查询` 刻意区分，前后端据此不会把业务需求确认误识别为结果字段复核。
 
-```json
-{
-  "interaction_id": "45dd68d9c84544b286368289981141d2",
-  "interaction_type": "confirmation",
-  "question": "查询方案已准备好。\n每行代表：每行一名用户\n结果字段：用户 ID、部门名称\n返回范围：返回全部符合条件的数据\n请选择‘确认并继续’或‘修正查询’。",
-  "options": ["确认并继续", "修正查询"],
-  "allow_free_text": false
-}
-```
-
-选择“确认并继续”后进入 SQL 阶段；选择“修正查询”后，后端紧接着创建第二条自由文本澄清：
+`interaction_type` 为 `clarification` 时，前端应允许填写自由文本。该交互只用于补充无法由业务规则、表结构和数据库事实消除的真实业务歧义，例如：
 
 ```json
 {
   "interaction_id": "736a87269c8842e0a0263bdcde282001",
   "interaction_type": "clarification",
-  "question": "请说明需要怎样修正查询。您可以说明需要增加、删除或改名的字段，也可以调整结果布局或返回范围。",
+  "question": "您所说的‘当前积分’是指用户最新积分余额，还是本赛季结算积分？",
   "options": [],
   "allow_free_text": true
 }
 ```
 
-前端在第一步只展示两个选择按钮，在第二步展示自由文本输入框。提交“修正查询”的回答接口可能先返回短暂的 `running` 状态；前端应继续监听 SSE 或查询状态，直到收到下一条 `interaction_required`。提交“增加用户名”等修正内容后，查询恢复到原规划上下文；修订完成会重新产生第一类字段确认交互。会话不存在或终态保留时间已过时返回 `404`。
+提交回答后，查询恢复原对齐或 Planning 上下文。SQL 与塑形在 Planning 内部通过工具执行，成功结果只以本轮结果 ID 在后台缓存；前端会收到业务对齐确认、必要澄清和最终表格复核，但不会收到 SQL、内部结果 ID、工具参数或模型看到的前 `5` 行预览。会话不存在或终态保留时间已过时返回 `404`。
+
+服务端可能在现有 `pending_interaction.question` 字符串中加入换行、空格和缩进，以改善较长问题的阅读层次；字段类型、选项和值均不改变。该整理只允许产生空白差异，程序校验任何其他字符都与模型整理前完全一致，失败时返回原文。前端应按纯文本使用 `white-space: pre-wrap` 展示，不解析 Markdown 或 HTML。
 
 ---
 
@@ -149,7 +141,7 @@ Last-Event-ID: 3
 ```text
 id: 4
 event: interaction_required
-data: {"stage":"confirmation","event_type":"interaction_required","status":"waiting","title":"请确认查询需求","message":"我将按以下需求继续查询：...","payload":{"interaction_id":"...","interaction_type":"confirmation","options":["确认并继续","取消查询"],"allow_free_text":false},"query_id":"...","sequence":4,"occurred_at":"2026-08-20T10:00:02+08:00"}
+data: {"stage":"confirmation","event_type":"interaction_required","status":"waiting","title":"请确认查询需求","message":"我将按以下需求继续查询：...","payload":{"interaction_id":"...","interaction_type":"confirmation","options":["确认并继续","修正需求"],"allow_free_text":false},"query_id":"...","sequence":4,"occurred_at":"2026-08-20T10:00:02+08:00"}
 
 ```
 
@@ -169,6 +161,8 @@ data: {"stage":"confirmation","event_type":"interaction_required","status":"wait
 服务器还会发送 `: heartbeat` 注释维持连接。响应禁止缓存并设置 `X-Accel-Buffering: no`。
 
 最终结果审计成功时，`stage = result` 的 `stage_completed` 与最终 `query_completed` 事件的 `message` 都是受约束的 `result_summary`，用于直接向操作员说明完整结果的行数、类别分布或数值极值。审计不可用时，事件改为说明结果表已生成但摘要暂不可用。
+
+这些用户可见的 `message` 可以包含用于排版的换行与连续空格，但接口仍返回普通 JSON 字符串。SSE、轨迹和结果接口中的同一终态摘要保持一致。
 
 > **前端接入**
 >
@@ -190,7 +184,7 @@ Content-Type: application/json
 }
 ```
 
-`answer` 长度为 `1～1000` 个字符。成功返回 `200` 和最新会话状态。字段复核的第一步只提交“确认并继续”或“修正查询”；第二步再提交具体修正内容，修订后的字段会再次请求确认。每次交互从请求发出起最多等待 `5` 分钟；超时后查询转为 `failed`，SSE 发布 `query_failed`，轨迹保留交互问题和失败终态。错误 `interaction_id`、已结束交互、纯空白答案或重复回答返回 `409`；会话不存在返回 `404`；缺少字段或长度不合法等请求 Schema 错误返回 `422`。
+`answer` 长度为 `1～1000` 个字符。成功返回 `200` 和最新会话状态。需求确认应提交页面提供的确认或取消选项；澄清交互提交能够回答当前业务歧义的自由文本。每次交互从请求发出起最多等待 `5` 分钟；超时后查询转为 `failed`，SSE 发布 `query_failed`，轨迹保留交互问题和失败终态。错误 `interaction_id`、已结束交互、纯空白答案或重复回答返回 `409`；会话不存在返回 `404`；缺少字段或长度不合法等请求 Schema 错误返回 `422`。
 
 ---
 
@@ -201,7 +195,7 @@ GET /dev/flame/admin/api/agent/queries/<query_id>/trace
 Authorization: Bearer <admin-token>
 ```
 
-状态码：`200 OK`。接口返回当前内存保留期内的原始问题、已对齐问题、用户交互问答和面向操作员的关键阶段时间线；不会返回表格、SQL、模型原始响应、隐藏推理或工具参数。业务对齐尚未完成时，`aligned_question` 为 `null`，但对应阶段事件仍会出现在 `entries` 中。成功查询的最终 `result` 阶段记录包含与 SSE 一致的 `result_summary`；表格与完整审计字段仍由 `result` 接口单独返回。
+状态码：`200 OK`。接口返回当前内存保留期内的原始问题、已对齐问题、用户交互问答和面向操作员的关键阶段时间线；不会返回表格、SQL、模型原始响应、隐藏推理或工具参数。业务对齐尚未完成时，`aligned_question` 为 `null`，但对应阶段事件仍会出现在 `entries` 中。成功查询的最终 `result` 阶段记录包含与 SSE 一致的 `result_summary`；表格与完整审计字段仍由 `result` 接口单独返回。后台按 `query_id` 记录的模型请求与响应消息队列只写入受控服务日志，不通过本接口或其他查询智能体 HTTP 接口返回。
 
 ```json
 {
@@ -337,4 +331,4 @@ Authorization: Bearer <admin-token>
 
 ## 11. 验证方式与已知限制
 
-自动化接口测试覆盖认证、创建、需求确认、规划字段复核与修订、提交回答、历史轨迹、完成、SSE 历史重放和表格结果读取。当前会话仅存于单进程内存，服务重启后旧 `query_id` 不再可用；当前部署不得启用多 Worker。
+自动化接口测试覆盖认证、创建、需求确认、必要业务澄清、提交回答、历史轨迹、完成、SSE 历史重放和表格结果读取。当前会话仅存于单进程内存，服务重启后旧 `query_id` 不再可用；当前部署不得启用多 Worker。

@@ -80,3 +80,82 @@ class AgentProgressReporter:
                 message="正在根据您对结果字段的意见调整查询方案。",
             )
         )
+
+    # 在规划模型调用原料查询工具前发布 SQL 生成阶段，确保完成事件之前一定存在对应开始事件。
+    def material_query_started(self) -> None:
+        self.emit(
+            AgentProgressUpdate(
+                stage="sql_generation",
+                event_type="stage_started",
+                status="running",
+                title="正在生成安全查询",
+                message="正在把原料要求转换为只读查询并执行安全检查。",
+            )
+        )
+
+    # 原料读取成功后报告完整结果行数，模型仅观察受限预览而完整数据留在后台。
+    def material_query_completed(self, row_count: int) -> None:
+        self.emit(
+            AgentProgressUpdate(
+                stage="execution",
+                event_type="stage_completed",
+                status="success",
+                title="数据读取完成",
+                message=f"共读取到 {row_count} 条原料，正在核对是否满足查询需求。",
+            )
+        )
+
+    # 原料查询失败时关闭当前执行阶段，后续是否修正由规划模型根据工具反馈决定。
+    def material_query_failed(self) -> None:
+        self.emit(
+            AgentProgressUpdate(
+                stage="execution",
+                event_type="stage_completed",
+                status="failure",
+                title="本轮数据读取未完成",
+                message="正在根据安全错误提示调整查询要求。",
+            )
+        )
+
+    # 在规划模型调用塑形工具前发布真实阶段进度，避免 Pipeline 事后补发已完成动作。
+    def material_shaping_started(self) -> None:
+        self.emit(
+            AgentProgressUpdate(
+                stage="shaping",
+                event_type="stage_started",
+                status="running",
+                title="正在整理表格结构",
+                message="正在基于完整原料按目标行列布局生成表格。",
+            )
+        )
+
+    # 塑形成功后报告输入与输出规模，前台无需接触内部结果 ID 或模型工具参数。
+    def material_shaping_completed(
+        self,
+        source_row_count: int,
+        result_row_count: int,
+    ) -> None:
+        self.emit(
+            AgentProgressUpdate(
+                stage="shaping",
+                event_type="stage_completed",
+                status="success",
+                title="表格结构整理完成",
+                message=(
+                    f"已将 {source_row_count} 条原料整理为 "
+                    f"{result_row_count} 行结果，正在核对表格。"
+                ),
+            )
+        )
+
+    # 塑形失败时给操作员稳定提示，具体技术错误仅通过内部工具反馈和诊断轨迹处理。
+    def material_shaping_failed(self) -> None:
+        self.emit(
+            AgentProgressUpdate(
+                stage="shaping",
+                event_type="stage_completed",
+                status="failure",
+                title="本轮表格整理未完成",
+                message="正在根据结果布局反馈调整整理方式。",
+            )
+        )

@@ -1,4 +1,4 @@
-"""将 Pydantic 参数模型转换为标准 OpenAI Function Calling 工具定义。"""
+"""将子图本地 Pydantic 参数模型转换为标准 OpenAI Function Calling 定义。"""
 
 from __future__ import annotations
 

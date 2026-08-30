@@ -1,4 +1,4 @@
-"""为 Text-to-SQL 查询链路复用成功表结构读取结果。"""
+"""为规划子图及其下游消费者复用成功表结构读取结果。"""
 
 from collections.abc import Callable
 import threading

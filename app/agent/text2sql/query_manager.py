@@ -6,6 +6,10 @@ from collections.abc import AsyncIterator
 from uuid import uuid4
 
 from app.agent.text2sql.diagnostics import AgentQueryDiagnosticLogger
+from app.agent.text2sql.model_messages import ModelMessageTraceQueue
+from app.agent.text2sql.subgraphs.message_formatting import (
+    SettingsBackedUserMessageFormatter,
+)
 from app.agent.text2sql.domains.registry import get_query_domain_profile
 from app.agent.text2sql.pipeline import AgentQueryPipeline, AgentQueryPipelineResult
 from app.agent.text2sql.events.models import AgentProgressEvent, AgentProgressUpdate
@@ -15,8 +19,8 @@ from app.agent.text2sql.interaction.session import (
     AgentQuerySession,
     TERMINAL_QUERY_STATUSES,
 )
-from app.agent.text2sql.shared.table_schema_cache import CachingTableSchemaReader
-from app.agent.text2sql.shared.table_schema_reader import InformationSchemaTableSchemaReader
+from app.agent.text2sql.subgraphs.planning.tools.table_schema_cache import CachingTableSchemaReader
+from app.agent.text2sql.subgraphs.planning.tools.table_schema_reader import InformationSchemaTableSchemaReader
 from app.agent.text2sql.shared.model_options import resolve_model_provider_connection
 from app.core.config import Settings
 
@@ -218,13 +222,23 @@ class AgentQueryManager:
         def publish_progress(update: AgentProgressUpdate) -> None:
             self._publish_progress(session, diagnostics, update)
 
+        message_trace_queue = ModelMessageTraceQueue(
+            writer=diagnostics.model_message_trace,
+            enabled=diagnostics.model_message_trace_enabled(),
+        )
+        message_formatter = SettingsBackedUserMessageFormatter(
+            settings=self._settings,
+            message_trace_queue=message_trace_queue,
+        )
         pipeline = AgentQueryPipeline(
             domain_profile=profile,
             interaction_requester=session.request_interaction,
             progress_emitter=publish_progress,
             settings=self._settings,
             trace_writer=None,
+            message_trace_queue=message_trace_queue,
             schema_reader=schema_cache.read,
+            user_message_formatter=message_formatter.format,
         )
         try:
             result = await pipeline.run(session.question)

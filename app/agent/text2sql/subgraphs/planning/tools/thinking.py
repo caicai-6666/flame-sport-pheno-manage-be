@@ -4,10 +4,10 @@ from typing import Final
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.agent.text2sql.shared.tools.argument_compatibility import (
+from app.agent.text2sql.function_calling.arguments import (
     validate_tool_arguments_with_embedded_json_fallback,
 )
-from app.agent.text2sql.shared.tools.pydantic_schema import (
+from app.agent.text2sql.function_calling.schema import (
     build_pydantic_tool_definition,
 )
 
@@ -20,10 +20,10 @@ class ThinkingToolArguments(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reason: str = Field(
-        max_length=240,
+        max_length=350,
         description=(
-            "仅记录影响下一步工具调用的一条关键判断，最多240个字符；"
-            "不能复述问题、表结构或备选方案"
+            "在本轮写清已经确认的事实、仍需判断的问题和倾向的下一步工具动作，"
+            "最多350个字符；不得复述问题或表结构，也不得重复上一轮已有结论"
         ),
     )
 
@@ -33,8 +33,8 @@ def build_thinking_tool_definition() -> dict[str, object]:
     return build_pydantic_tool_definition(
         tool_name=THINKING_TOOL_NAME,
         description=(
-            "记录本轮下一步工具调用所必需的一条关键判断，不是推理日志；"
-            "不得复述问题、表结构或反复比较备选方案。"
+            "记录本轮已确认事实、仍需判断的问题和倾向的下一步动作，不是长篇推理日志；"
+            "只有尚有会改变下一步动作的新问题时才继续调用，不得重复已有结论。"
         ),
         arguments_model=ThinkingToolArguments,
     )

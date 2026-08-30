@@ -1,4 +1,4 @@
-# 燃动现象项目文档地图
+# 燃动现象智能管理平台后端项目文档地图
 
 > **地图定位**
 >
@@ -146,6 +146,9 @@ description/
 | [Python 运行依赖](infrastructure/python-dependencies.md) | Python 环境基线、依赖用途、安装、验证和安全要求 |
 | [管理端 Docker Compose 部署](infrastructure/docker-compose-deployment.md) | 管理端后端镜像、Compose 服务拓扑、根环境变量、启动顺序和生产入口 |
 | [查询智能体运行时与业务域扩展](infrastructure/query-agent-runtime.md) | 通用工作流、表概述契约、业务域配置、模型与只读 SQL 安全、SSE 和扩展方法 |
+| [纯文本原料查询规划契约](infrastructure/material-query-planning-contract.md) | Planning 内部查询、观察、塑形、最终选择、结果 ID 缓存与失败反馈 |
+| [原料 SQL 查询子图](infrastructure/material-sql-query-subgraph.md) | `query_material_data` 到参数化 SQL 的生成、静态校验、有限修复和只读执行 |
+| [原料结果塑形子图](infrastructure/material-result-shaping-subgraph.md) | `shape_material_data` 的受限布局编译、确定性透传与动态转列、列来源追踪和失败边界 |
 
 ### 5.3 应用服务文档
 
@@ -153,7 +156,7 @@ description/
 | --- | --- |
 | [应用服务层设计](application/service-layer.md) | 路由、服务、仓储与客户端的职责边界，事务和异常编排规则 |
 | [赛季结算应用编排](application/season-settlement.md) | 状态初始化、遗留初审、资格、定分、发放及手动或自动收口的事务边界 |
-| [查询智能体应用编排](application/query-agent.md) | 六子图查询流水线、双计划、用户交互、SSE 进度、确定性塑形、表格结果、并发和失败处理 |
+| [查询智能体应用编排](application/query-agent.md) | Planning 内部查询与塑形闭环、最终表格复核、SSE 进度、翻译审计、并发和失败处理 |
 | [查询结果表项意图路由设计](application/query-result-intent-routing.md) | 以对齐问题和单条表项无状态选择详情工具、补查参数及处理歧义的设计草案 |
 | [积分与奖品查询业务域](application/rewards-query.md) | 积分余额、积分流水、赛季结算积分、商品目录和奖品履约查询口径 |
 

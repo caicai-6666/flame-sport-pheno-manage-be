@@ -1,5 +1,8 @@
-"""声明确定性结果塑形子图不使用模型 Prompt。"""
+"""公开原料查询后结果塑形提示词。"""
 
-from app.agent.text2sql.subgraphs.shaping.prompt.prompt import USES_MODEL_PROMPT
+from app.agent.text2sql.subgraphs.shaping.prompt.prompt import (
+    MATERIAL_SHAPING_SYSTEM_PROMPT,
+    build_material_shaping_messages,
+)
 
-__all__ = ["USES_MODEL_PROMPT"]
+__all__ = ["MATERIAL_SHAPING_SYSTEM_PROMPT", "build_material_shaping_messages"]

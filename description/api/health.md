@@ -22,7 +22,7 @@
 ```json
 {
   "status": "ok",
-  "service": "燃动现象管理端后端",
+  "service": "燃动现象智能管理平台后端",
   "environment": "development"
 }
 ```

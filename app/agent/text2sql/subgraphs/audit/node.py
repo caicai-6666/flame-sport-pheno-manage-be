@@ -12,6 +12,10 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.agent.text2sql.domains.base import QueryDomainProfile
+from app.agent.text2sql.model_messages import (
+    ModelMessageTraceQueue,
+    create_traced_chat_completion,
+)
 from app.core.config import Settings, get_settings
 from app.agent.text2sql.subgraphs.alignment.node import BusinessAlignmentResult
 from app.agent.text2sql.subgraphs.planning.node import QueryPlanningAgentResult
@@ -25,8 +29,7 @@ from app.agent.text2sql.shared.tool_tag_template import (
     load_tool_tag_template,
     resolve_query_tool_tag_template_filename,
 )
-from app.agent.text2sql.shared.yaml_context import render_yaml_context
-from app.agent.text2sql.shared.tools.argument_feedback import (
+from app.agent.text2sql.function_calling.feedback import (
     build_tool_argument_error_message,
 )
 from app.agent.text2sql.subgraphs.sql.node import SqlQuerySubgraphResult
@@ -35,9 +38,9 @@ from app.agent.text2sql.subgraphs.audit.tool import (
     build_query_result_audit_tool_definition,
     parse_query_result_audit_tool_arguments,
 )
+from app.agent.text2sql.subgraphs.audit.prompt import build_audit_messages
 
 
-AUDIT_RESULT_PREVIEW_ROWS: Final[int] = 5
 MAX_AUDIT_ARGUMENT_REPAIR_COUNT: Final[int] = 1
 MAX_CATEGORY_DISTINCT_VALUES: Final[int] = 20
 MAX_CATEGORY_VALUE_COUNTS: Final[int] = 10
@@ -245,12 +248,16 @@ def _is_proof_record_id_field(field_expression: str) -> bool:
     ) is not None
 
 
-# 根据查询计划的字段用途生成表头标签；无法确认映射时保留实际列名。
+# 根据旧查询计划的字段用途生成表头标签；新原料协议始终由塑形结果提供表头。
 def _build_display_headers(
     result_columns: list[str],
     planning_result: QueryPlanningAgentResult,
 ) -> list[QueryResultHeader]:
-    assert planning_result.query_plan is not None
+    if planning_result.query_plan is None:
+        return [
+            QueryResultHeader(key=column_name, label=column_name)
+            for column_name in result_columns
+        ]
     select_fields = planning_result.query_plan.select_fields
     headers: list[QueryResultHeader] = []
     for index, column_name in enumerate(result_columns):
@@ -517,111 +524,6 @@ def _build_audit_request_retry_message() -> dict[str, str]:
     }
 
 
-# 构造稳定审计提示词，限制模型只解释程序统计和受限样本与用户问题的对应关系。
-def _build_audit_system_prompt(domain_display_name: str) -> str:
-    return f"""你是{domain_display_name}查询的末端结果审计器。你需要判断返回表是否能够回答用户问题，并用简洁中文解释表结构、相关性和程序统计结果。
-
-严格规则：
-1. 必须且只能调用一次 submit_query_result_audit 工具提交结论，禁止输出普通文本或调用其他工具。
-2. rows_preview 只用于理解一行含义和检查字段对应关系；其中状态、类型或布尔编码可能已经由程序按数据库字段注释转换为展示值。禁止反推原始编码，也禁止在 result_summary 中引用样本具体值、按样本计数或比较，或根据总行数猜测未展示行。
-3. statistics 是程序基于完整结果计算的唯一统计事实。只能复述或解释其中的行数、类别分布和数值极值，不得自行重新统计或补充不存在的指标。
-4. relevance_explanation 说明结果粒度、主要字段和筛选口径为何能或不能回答用户问题。
-5. table_description 只说明一行代表什么及主要列分为哪些业务信息，不逐列复述字段，也不描述数据库实现。
-6. result_summary 只能复述 statistics 已明确提供的行数、类别分布和数值极值；不得从 rows_preview 生成任何额外统计。没有可用类别或极值时只说明行数和结果范围。
-7. 结论保持简洁，不提供操作建议，不生成 SQL，不重复用户原问题，不讨论模型或工作流阶段。
-
-输入是合法 YAML，字段含义固定如下：
-- `original_question` 是用户原始问题，`aligned_question` 是已完成业务对齐的查询需求。
-- `query_plan` 是查询口径摘要；`query_goal` 是目标，`root_block_id` 是最终结果块。`query_blocks` 按依赖顺序列出每块的行粒度、筛选、量词、聚合后筛选和输出字段；非根块负责资格或聚合，根块决定最终每行含义。`business_caliber` 是业务口径。
-- `executed_sql` 是已通过安全校验并实际执行的只读 SQL，只用于核对查询实现。
-- `result_table.headers` 是表头列表；`key` 是实际结果字段，`label` 是中文展示名；`rows_preview` 只包含前 5 行样本，状态类值可能已经按字段注释翻译。
-- `result_table.statistics.row_count` 是完整结果行数，`planned_limit` 是规划上限或 null，`limit_reached` 表示结果是否达到该上限。
-- `result_table.statistics.category_fields` 是完整结果的类别统计；`field` 是字段，`distinct_count` 是非空不同值数量，`null_count` 是空值数，`value_counts` 中 `value` 与 `count` 是类别值及次数。
-- `result_table.statistics.numeric_extremes` 是完整结果的数值极值；`field` 是字段，`non_null_count` 与 `null_count` 是非空和空值数，`minimum` 与 `maximum` 是最小值和最大值。
-
-只能使用上述 YAML 字段的固定含义，样本行不能替代完整统计。"""
-
-
-# 将问题、查询口径、最终 SQL、程序统计和受限样本组成审计模型的唯一动态上下文。
-def _build_audit_messages(
-    domain_display_name: str,
-    original_question: str,
-    alignment_result: BusinessAlignmentResult,
-    planning_result: QueryPlanningAgentResult,
-    sql_result: SqlQuerySubgraphResult,
-    display_result: QueryDisplayResult,
-    statistics: QueryResultStatistics,
-    tool_tag_template: str | None = None,
-) -> list[dict[str, str]]:
-    assert alignment_result.aligned_request is not None
-    assert planning_result.query_plan is not None
-    context = {
-        "original_question": original_question,
-        "aligned_question": alignment_result.aligned_request.aligned_question,
-        "query_plan": {
-            "query_goal": planning_result.query_plan.query_goal,
-            "root_block_id": planning_result.query_plan.root_block_id,
-            "query_blocks": [
-                {
-                    "block_id": block.block_id,
-                    "role": block.role,
-                    "row_granularity": block.row_granularity,
-                    "filters": [item.model_dump() for item in block.filters],
-                    "quantified_conditions": [
-                        item.model_dump() for item in block.quantified_conditions
-                    ],
-                    "having": [item.model_dump() for item in block.having],
-                    "select_fields": [
-                        item.model_dump() for item in block.select_fields
-                    ],
-                }
-                for block in planning_result.query_plan.query_blocks
-            ],
-            "business_caliber": [
-                item.model_dump()
-                for item in planning_result.query_plan.business_caliber
-            ],
-        },
-        "result_shape_plan": (
-            planning_result.result_shape_plan.model_dump()
-            if planning_result.result_shape_plan is not None
-            else None
-        ),
-        "executed_sql": sql_result.sql,
-        "result_table": {
-            "headers": [header.model_dump() for header in display_result.headers],
-            "statistics": statistics.model_dump(),
-            "rows_preview": display_result.rows[:AUDIT_RESULT_PREVIEW_ROWS],
-        },
-    }
-    messages = [
-        {
-            "role": "system",
-            "content": _build_audit_system_prompt(domain_display_name),
-        }
-    ]
-    if tool_tag_template is not None:
-        messages.append(
-            {
-                "role": "user",
-                "content": (
-                    "# 工具调用标签语法\n\n"
-                    "以下模板只说明服务端要求的标签语法，不定义任何具体工具或"
-                    "业务参数；必须根据本轮 Function Calling Schema 替换全部占位符，"
-                    "严禁原样输出占位符。\n\n"
-                    f"{tool_tag_template}"
-                ),
-            }
-        )
-    messages.append(
-        {
-            "role": "user",
-            "content": render_yaml_context(context),
-        }
-    )
-    return messages
-
-
 class QueryResultAuditSubgraph:
     """先确定性格式化和统计，再让模型审计受限结果表的末端 LangGraph 子图。"""
 
@@ -635,6 +537,7 @@ class QueryResultAuditSubgraph:
         request_profile: str = "deepseek",
         tool_tag_template: str | None = None,
         trace_writer: Callable[[str], None] | None = None,
+        message_trace_queue: ModelMessageTraceQueue | None = None,
         close_client_after_run: bool = False,
     ) -> None:
         self._client = client
@@ -644,6 +547,7 @@ class QueryResultAuditSubgraph:
         self._request_profile = get_model_request_profile(request_profile)
         self._tool_tag_template = tool_tag_template
         self._trace_writer = trace_writer
+        self._message_trace_queue = message_trace_queue
         self._close_client_after_run = close_client_after_run
         workflow = StateGraph(_QueryResultAuditState)
         workflow.add_node("analyze_result", self._analyze_result)
@@ -660,6 +564,7 @@ class QueryResultAuditSubgraph:
         domain_profile: QueryDomainProfile,
         settings: Settings | None = None,
         trace_writer: Callable[[str], None] | None = None,
+        message_trace_queue: ModelMessageTraceQueue | None = None,
     ) -> "QueryResultAuditSubgraph":
         resolved_settings = settings or get_settings()
         connection = resolve_model_provider_connection(resolved_settings)
@@ -678,6 +583,7 @@ class QueryResultAuditSubgraph:
                 resolve_query_tool_tag_template_filename(resolved_settings)
             ),
             trace_writer=trace_writer,
+            message_trace_queue=message_trace_queue,
             close_client_after_run=True,
         )
 
@@ -702,7 +608,7 @@ class QueryResultAuditSubgraph:
 
     # 使用 auto Function Calling 提交唯一审计结论，并分类反馈协议、参数及临时请求错误。
     async def _audit_result(self, state: _QueryResultAuditState) -> dict[str, Any]:
-        messages: list[Any] = _build_audit_messages(
+        messages: list[Any] = build_audit_messages(
             self._domain_profile.display_name,
             state["original_question"],
             state["alignment_result"],
@@ -722,7 +628,10 @@ class QueryResultAuditSubgraph:
                 f"[结果审计层] 第 {attempt + 1} 次模型调用：核对结果相关性和摘要"
             )
             try:
-                response = await self._client.chat.completions.create(
+                response = await create_traced_chat_completion(
+                    client=self._client,
+                    message_queue=self._message_trace_queue,
+                    node="audit",
                     model=self._model,
                     messages=[*messages],
                     tools=[audit_tool],
@@ -879,7 +788,10 @@ class QueryResultAuditSubgraph:
             raise ValueError("用户原问题不能为空")
         if alignment_result.status != "success" or alignment_result.aligned_request is None:
             raise ValueError("只有成功的业务对齐结果可以进入末端审计")
-        if planning_result.status != "success" or planning_result.query_plan is None:
+        if planning_result.status != "success" or (
+            planning_result.material_plan is None
+            and planning_result.query_plan is None
+        ):
             raise ValueError("只有成功的查询规划结果可以进入末端审计")
         if sql_result.status != "success":
             raise ValueError("只有成功执行的 SQL 结果可以进入末端审计")

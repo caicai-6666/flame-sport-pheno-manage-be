@@ -11,10 +11,12 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from app.agent.text2sql.domains.base import AlignmentPolicyIssue, QueryDomainProfile
 from app.agent.text2sql.events.publisher import AgentProgressReporter, ProgressEmitter
-from app.core.config import Settings, get_settings
-from app.agent.text2sql.shared.tools.ask_user import (
-    UserInteraction,
+from app.agent.text2sql.model_messages import (
+    ModelMessageTraceQueue,
+    create_traced_chat_completion,
 )
+from app.core.config import Settings, get_settings
+from app.agent.text2sql.interaction.models import UserInteraction
 from app.agent.text2sql.subgraphs.alignment.prompt.prompt import (
     build_business_alignment_prompt,
 )
@@ -23,16 +25,16 @@ from app.agent.text2sql.shared.model_options import (
     get_model_request_profile,
     resolve_model_provider_connection,
 )
+from app.agent.text2sql.shared.system_guidance import (
+    build_system_guidance_message,
+)
 from app.agent.text2sql.shared.tool_tag_template import (
     build_tool_tag_prefixed_task_content,
     load_tool_tag_template,
     resolve_query_tool_tag_template_filename,
 )
-from app.agent.text2sql.shared.yaml_context import (
-    parse_tagged_context_records,
-    render_yaml_context,
-)
-from app.agent.text2sql.shared.tools.argument_feedback import (
+from app.agent.text2sql.shared.yaml_context import render_yaml_context
+from app.agent.text2sql.function_calling.feedback import (
     build_tool_argument_error_message,
 )
 from app.agent.text2sql.subgraphs.alignment.tool import (
@@ -40,10 +42,7 @@ from app.agent.text2sql.subgraphs.alignment.tool import (
     ASK_USER_TOOL_NAME,
     SUBMIT_ALIGNED_QUERY_TOOL_NAME,
     THINKING_TOOL_NAME,
-    AlignedLogicalConstraint,
-    AlignedPresentationRequirement,
     AlignmentAbandonment,
-    ResolvedBusinessConcept,
     ThinkingToolArguments,
     build_abandon_alignment_tool_definition,
     build_ask_user_tool_definition,
@@ -59,89 +58,37 @@ from app.agent.text2sql.subgraphs.alignment.tool import (
 DEFAULT_MAX_ALIGNMENT_GENERATION_COUNT: Final[int] = 4
 MAX_TERMINAL_ARGUMENT_REPAIR_COUNT: Final[int] = 1
 ALIGNMENT_TOOL_CHOICE: Final[str] = "auto"
-TraceWriter = Callable[[str], None]
+ALIGNMENT_REPEATED_THINK_GUIDANCE: Final[str] = (
+    "你已经进行了多轮业务判断。请先检查是否仍有新的、会改变下一步动作的信息"
+    "需要分析：如果有，请聚焦该问题继续判断；如果没有，请根据现有结论询问用户、"
+    "提交对齐结果，或说明无法继续的原因，避免重复已有内容。"
+)
+ALIGNMENT_REVIEW_APPROVAL_ANSWERS: Final[frozenset[str]] = frozenset(
+    {"确认并继续", "确认", "继续", "是", "没问题", "yes", "y"}
+)
+ALIGNMENT_REVISION_QUESTION: Final[str] = "请说明需要如何修正刚才整理的查询需求。"
 UserInputReader = Callable[[str], Awaitable[str]]
 
 
 class AlignedQueryRequest(BaseModel):
-    """业务对齐子图输出给查询规划阶段的无数据库实现查询需求。"""
+    """保存业务对齐依据、自然语言结果和工作流注入的原始事实。"""
 
     model_config = ConfigDict(extra="forbid")
 
     original_question: str = Field(description="未经改写的用户原问题")
-    aligned_question: str = Field(description="只使用标准业务概念改写后的查询需求")
-    resolved_concepts: list[ResolvedBusinessConcept] = Field(
-        description="已经由词汇表确认的用户词汇与标准概念"
-    )
-    business_constraints: list[str] = Field(
-        description="为后续规划保留的稳定业务规则，不包含数据库实现"
-    )
-    applied_business_rules: list[str] = Field(
-        default_factory=list,
-        description="本次对齐实际采用的 core rules.rule 稳定标识",
-    )
-    logical_constraints: list[AlignedLogicalConstraint] = Field(
-        default_factory=list,
-        description="从用户问题和业务规则提取的集合量化或数量约束",
-    )
-    requested_outputs: list[str] = Field(
-        default_factory=list,
-        description="用户明确要求返回的业务信息",
-    )
-    presentation_requirements: list[AlignedPresentationRequirement] = Field(
-        default_factory=list,
-        description="用户明确要求的最终行粒度和表格布局",
-    )
-    result_scope: Literal["complete", "bounded", "unspecified"] = Field(
-        default="unspecified",
-        description="完整导出、明确数量范围或未指定结果范围",
-    )
-    requested_limit: int | None = Field(
-        default=None,
-        ge=1,
-        description="用户明确要求的结果数量；未明确指定时传 null",
-    )
+    reason: str = Field(description="模型提交的业务对齐依据")
+    aligned_question: str = Field(description="只使用标准业务语言改写后的完整查询需求")
     user_clarifications: list[UserInteraction] = Field(
         description="本轮对齐中实际向用户确认并得到的事实；无提问时为空列表"
     )
 
-    # 保证传入规划层的结果范围已经闭合，不让规划模型猜测完整导出是否允许 LIMIT。
-    @model_validator(mode="after")
-    def validate_result_scope(self) -> "AlignedQueryRequest":
-        if self.result_scope == "bounded" and self.requested_limit is None:
-            raise ValueError("result_scope 为 bounded 时 requested_limit 不能为空")
-        if self.result_scope != "bounded" and self.requested_limit is not None:
-            raise ValueError(
-                "result_scope 为 complete 或 unspecified 时 requested_limit 必须为 null"
-            )
-        return self
-
-    # 将已校验的业务语义渲染为规划阶段的唯一上游输入，保留必要约束但不泄漏模型轨迹或数据库实现。
+    # 将完整自然语言需求和可核验依据渲染为规划输入，不重新拆解模型已经对齐的语义。
     def render_for_query_planning(self) -> str:
         return render_yaml_context(
             {
                 "aligned_query": {
                     "question": self.aligned_question,
-                    "resolved_concepts": [
-                        {
-                            "user_term": concept.user_term,
-                            "canonical_term": concept.canonical_term,
-                        }
-                        for concept in self.resolved_concepts
-                    ],
-                    "business_constraints": self.business_constraints,
-                    "applied_business_rules": self.applied_business_rules,
-                    "logical_constraints": [
-                        constraint.model_dump()
-                        for constraint in self.logical_constraints
-                    ],
-                    "requested_outputs": self.requested_outputs,
-                    "presentation_requirements": [
-                        requirement.model_dump()
-                        for requirement in self.presentation_requirements
-                    ],
-                    "result_scope": self.result_scope,
-                    "requested_limit": self.requested_limit,
+                    "reason": self.reason,
                     "user_clarifications": [
                         {
                             "question": interaction.question,
@@ -418,35 +365,6 @@ class _BusinessAlignmentState(TypedDict):
     result: BusinessAlignmentResult
 
 
-# 在真实联调中显示对齐模型的文本和工具调用，便于观察词汇命中与歧义判断是否合理。
-def _format_alignment_trace(
-    generation_index: int,
-    max_generation_count: int,
-    message: Any,
-    tool_calls: list[Any],
-) -> str:
-    sections = [
-        "\n" + "=" * 14 + f" 业务对齐第 {generation_index} / {max_generation_count} 次模型调用 " + "=" * 14
-    ]
-    reasoning_content = getattr(message, "reasoning_content", None)
-    if reasoning_content:
-        sections.append(f"【模型思考】\n{reasoning_content}")
-    content = getattr(message, "content", None)
-    if content:
-        sections.append(f"【模型输出】\n{content}")
-    if tool_calls:
-        sections.append(
-            "【工具调用】\n"
-            + "\n".join(
-                f"- `{tool_call.function.name}`（{tool_call.id}）\n{tool_call.function.arguments}"
-                for tool_call in tool_calls
-            )
-        )
-    else:
-        sections.append("【工具调用】\n模型未调用工具。")
-    return "\n\n".join(sections)
-
-
 # 将 OpenAI 兼容响应完整序列化为内部诊断信息，避免摘要掩盖模型实际返回内容。
 def _serialize_raw_response(response: Any) -> str:
     model_dump_json = getattr(response, "model_dump_json", None)
@@ -460,6 +378,50 @@ async def _raise_missing_user_interaction(_: str) -> str:
     raise RuntimeError("业务对齐需要用户回答，但未配置用户交互出口")
 
 
+# 让独立子图测试默认认可已对齐需求，正式 Pipeline 会注入真实的用户复核出口。
+async def _approve_alignment_review(_: str) -> str:
+    return "确认并继续"
+
+
+# 判断用户是否认可当前对齐结果；其他回答都进入修正闭环而不是终止查询。
+def _is_alignment_review_approved(answer: str) -> bool:
+    return answer.strip().lower() in ALIGNMENT_REVIEW_APPROVAL_ANSWERS
+
+
+# 构造不暴露工具或数据库细节的对齐复核问题，供前端展示固定选项。
+def _build_alignment_review_question(aligned_question: str) -> str:
+    return (
+        f"我将按以下需求继续查询：{aligned_question}\n"
+        "请选择‘确认并继续’或‘修正需求’。"
+    )
+
+
+# 把用户修正作为原提交工具的正常反馈，使模型在同一上下文中重新对齐。
+def _build_alignment_revision_feedback(
+    tool_call_id: str,
+    aligned_question: str,
+    revision: UserInteraction,
+) -> dict[str, str]:
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call_id,
+        "content": render_yaml_context(
+            {
+                "status": "revision_required",
+                "result": {
+                    "previous_aligned_question": aligned_question,
+                    "revision_question": revision.question,
+                    "user_revision": revision.answer,
+                },
+                "repair_action": (
+                    "根据用户修正重新判断业务需求；必要时可以继续 think 或 ask_user，"
+                    "完成后重新调用 submit_aligned_query。"
+                ),
+            }
+        ),
+    }
+
+
 class BusinessAlignmentSubgraph:
     """仅使用业务词汇表和四个受限函数调用的独立 LangGraph 业务对齐子图。"""
 
@@ -470,12 +432,13 @@ class BusinessAlignmentSubgraph:
         model: str,
         domain_profile: QueryDomainProfile,
         user_input_reader: UserInputReader = _raise_missing_user_interaction,
-        trace_writer: TraceWriter | None = None,
+        message_trace_queue: ModelMessageTraceQueue | None = None,
         progress_emitter: ProgressEmitter | None = None,
         max_tokens: int = DEFAULT_ALIGNMENT_MAX_TOKENS,
         close_client_after_run: bool = False,
         request_profile: str = "deepseek",
         tool_tag_template: str | None = None,
+        alignment_review_reader: UserInputReader = _approve_alignment_review,
     ) -> None:
         self._client = client
         self._model = model
@@ -484,15 +447,9 @@ class BusinessAlignmentSubgraph:
         self._database_identifier_pattern = _build_database_identifier_pattern(
             domain_profile
         )
-        self._allowed_business_rule_ids = frozenset(
-            str(record["rule"])
-            for record in parse_tagged_context_records(
-                domain_profile.core_rules_path.read_text(encoding="utf-8").strip()
-            )
-            if "rule" in record
-        )
         self._user_input_reader = user_input_reader
-        self._trace_writer = trace_writer
+        self._alignment_review_reader = alignment_review_reader
+        self._message_trace_queue = message_trace_queue
         self._progress_reporter = AgentProgressReporter(
             domain_profile,
             progress_emitter,
@@ -515,8 +472,9 @@ class BusinessAlignmentSubgraph:
         domain_profile: QueryDomainProfile,
         settings: Settings | None = None,
         user_input_reader: UserInputReader = _raise_missing_user_interaction,
-        trace_writer: TraceWriter | None = None,
+        message_trace_queue: ModelMessageTraceQueue | None = None,
         progress_emitter: ProgressEmitter | None = None,
+        alignment_review_reader: UserInputReader = _approve_alignment_review,
     ) -> "BusinessAlignmentSubgraph":
         resolved_settings = settings or get_settings()
         connection = resolve_model_provider_connection(resolved_settings)
@@ -530,7 +488,8 @@ class BusinessAlignmentSubgraph:
             model=connection.model,
             domain_profile=domain_profile,
             user_input_reader=user_input_reader,
-            trace_writer=trace_writer,
+            alignment_review_reader=alignment_review_reader,
+            message_trace_queue=message_trace_queue,
             progress_emitter=progress_emitter,
             max_tokens=resolved_settings.deepseek_query_alignment_max_tokens,
             close_client_after_run=True,
@@ -540,12 +499,7 @@ class BusinessAlignmentSubgraph:
             ),
         )
 
-    # 在显式启用内部追踪时记录对齐响应和问答结果，默认不向标准输出泄漏模型轨迹。
-    def _write_trace(self, content: str) -> None:
-        if self._trace_writer is not None:
-            self._trace_writer(content)
-
-    # 循环处理四类工具并反馈可修复协议错误，修正后清除临时错误上下文但保留诊断轨迹。
+    # 循环处理四类工具；连续思考时只向下一轮注入温和系统指导，精确错误仍使用原校验反馈。
     async def _run_alignment_loop(
         self,
         state: _BusinessAlignmentState,
@@ -563,6 +517,8 @@ class BusinessAlignmentSubgraph:
         terminal_argument_repair_count = 0
         repair_context_start: int | None = None
         initial_think_completed = False
+        consecutive_think_count = 0
+        pending_system_guidance: dict[str, str] | None = None
         max_generation_count = state["max_generation_count"]
         tools = [
             build_thinking_tool_definition(),
@@ -573,7 +529,10 @@ class BusinessAlignmentSubgraph:
 
         for generation_count in range(1, max_generation_count + 1):
             current_turn_start = len(messages)
-            response = await self._client.chat.completions.create(
+            response = await create_traced_chat_completion(
+                client=self._client,
+                message_queue=self._message_trace_queue,
+                node="alignment",
                 model=self._model,
                 messages=messages,
                 tools=tools,
@@ -582,17 +541,15 @@ class BusinessAlignmentSubgraph:
                     self._max_tokens
                 ),
             )
+            if pending_system_guidance is not None:
+                if messages[-1] is not pending_system_guidance:
+                    raise RuntimeError("系统指导消息上下文位置异常")
+                messages.pop()
+                current_turn_start -= 1
+                pending_system_guidance = None
             raw_responses.append(_serialize_raw_response(response))
             message = response.choices[0].message
             tool_calls = getattr(message, "tool_calls", None) or []
-            self._write_trace(
-                _format_alignment_trace(
-                    generation_count,
-                    max_generation_count,
-                    message,
-                    tool_calls,
-                )
-            )
             if not tool_calls:
                 if repair_context_start is None:
                     repair_context_start = current_turn_start
@@ -600,11 +557,6 @@ class BusinessAlignmentSubgraph:
                     self._tool_tag_template
                 )
                 messages.extend((message, feedback_message))
-                self._write_trace(
-                    "\n----- 业务对齐工具协议校验结果 -----\n"
-                    "error_code: alignment_tool_call_missing\n"
-                    f"result: {feedback_message['content']}"
-                )
                 continue
             messages.append(message)
             if len(tool_calls) != 1:
@@ -619,12 +571,6 @@ class BusinessAlignmentSubgraph:
                         "重新生成本轮响应，并且只调用一个符合当前状态的工具。",
                     )
                     messages.append(error_message)
-                    self._write_trace(
-                        "\n----- 业务对齐工具协议校验结果 -----\n"
-                        f"tool_call_id: {tool_call.id}\n"
-                        f"tool_name: {tool_call.function.name}\n"
-                        f"result: {error_message['content']}"
-                    )
                 continue
 
             tool_call = tool_calls[0]
@@ -640,12 +586,6 @@ class BusinessAlignmentSubgraph:
                     "只调用 think 提交一条简短的业务对齐关键判断。",
                 )
                 messages.append(error_message)
-                self._write_trace(
-                    "\n----- 业务对齐工具顺序校验结果 -----\n"
-                    f"tool_call_id: {tool_call.id}\n"
-                    f"tool_name: {tool_name}\n"
-                    f"result: {error_message['content']}"
-                )
                 continue
 
             registered_tool_names = {
@@ -665,13 +605,10 @@ class BusinessAlignmentSubgraph:
                     "从本轮提供的工具列表中选择并且只调用一个工具。",
                 )
                 messages.append(error_message)
-                self._write_trace(
-                    "\n----- 业务对齐工具协议校验结果 -----\n"
-                    f"tool_call_id: {tool_call.id}\n"
-                    f"tool_name: {tool_name}\n"
-                    f"result: {error_message['content']}"
-                )
                 continue
+
+            if tool_name != THINKING_TOOL_NAME:
+                consecutive_think_count = 0
 
             terminal_tool_calls = (
                 [tool_call]
@@ -687,6 +624,7 @@ class BusinessAlignmentSubgraph:
                         )
                         thoughts.append(thought)
                         initial_think_completed = True
+                        consecutive_think_count += 1
                         self._progress_reporter.reasoning_progress("alignment")
                         tool_result: dict[str, Any] = {
                             "status": "success",
@@ -714,12 +652,6 @@ class BusinessAlignmentSubgraph:
                         error,
                     )
                     messages.append(error_message)
-                    self._write_trace(
-                        "\n----- 业务对齐工具参数校验结果 -----\n"
-                        f"tool_call_id: {tool_call.id}\n"
-                        f"tool_name: {tool_name}\n"
-                        f"result: {error_message['content']}"
-                    )
                     continue
                 messages.append(
                     {
@@ -728,22 +660,20 @@ class BusinessAlignmentSubgraph:
                         "content": render_yaml_context(tool_result),
                     }
                 )
-                self._write_trace(
-                    "\n----- 业务对齐工具执行结果 -----\n"
-                    f"tool_call_id: {tool_call.id}\n"
-                    f"tool_name: {tool_name}\n"
-                    f"result: {json.dumps(tool_result, ensure_ascii=False, indent=2)}"
-                )
                 if _remove_repaired_context(
                     messages,
                     repair_context_start,
                     current_turn_start,
                 ):
                     repair_context_start = None
-                    self._write_trace(
-                        "\n----- 业务对齐修复上下文清理 -----\n"
-                        "模型已完成协议或参数修正；此前无效响应及错误反馈已从后续模型上下文移除。"
+                if (
+                    tool_name == THINKING_TOOL_NAME
+                    and consecutive_think_count >= 2
+                ):
+                    pending_system_guidance = build_system_guidance_message(
+                        ALIGNMENT_REPEATED_THINK_GUIDANCE
                     )
+                    messages.append(pending_system_guidance)
                 continue
 
             if terminal_tool_calls:
@@ -777,12 +707,6 @@ class BusinessAlignmentSubgraph:
                                 )
                             )
                             messages.append(error_message)
-                            self._write_trace(
-                                "\n----- 业务对齐终止工具参数修复 -----\n"
-                                f"tool_call_id: {terminal_tool_call.id}\n"
-                                f"tool_name: {ABANDON_ALIGNMENT_TOOL_NAME}\n"
-                                f"result: {error_message['content']}"
-                            )
                             continue
                         raise BusinessAlignmentExecutionError(
                             "业务对齐放弃工具参数不符合约束",
@@ -802,86 +726,28 @@ class BusinessAlignmentSubgraph:
                 try:
                     submitted_alignment = parse_submit_aligned_query_arguments(
                         terminal_tool_call.function.arguments
-                    ).aligned_request
+                    )
                     # 工作流注入不可由模型改写的原问题和实际问答，保证审计事实来源唯一。
                     aligned_request = AlignedQueryRequest(
                         original_question=state["user_question"],
                         user_clarifications=user_interactions,
-                        **submitted_alignment.model_dump(),
+                        reason=submitted_alignment.reason,
+                        aligned_question=submitted_alignment.aligned_question,
                     )
                     _validate_business_only_texts(
                         self._database_identifier_pattern,
                         [
+                            aligned_request.reason,
                             aligned_request.aligned_question,
-                            *aligned_request.business_constraints,
-                            *aligned_request.requested_outputs,
-                            *(
-                                constraint.subject
-                                for constraint in aligned_request.logical_constraints
-                            ),
-                            *(
-                                constraint.collection
-                                for constraint in aligned_request.logical_constraints
-                            ),
-                            *(
-                                constraint.predicate
-                                for constraint in aligned_request.logical_constraints
-                            ),
-                            *(
-                                requirement.result_row_granularity
-                                for requirement in aligned_request.presentation_requirements
-                            ),
-                            *(
-                                requirement.dynamic_column_subject or ""
-                                for requirement in aligned_request.presentation_requirements
-                            ),
-                            *(
-                                requirement.dynamic_value_subject or ""
-                                for requirement in aligned_request.presentation_requirements
-                            ),
-                            *(
-                                requirement.column_label_pattern or ""
-                                for requirement in aligned_request.presentation_requirements
-                            ),
-                            *(
-                                concept.canonical_term
-                                for concept in aligned_request.resolved_concepts
-                            ),
-                            *(
-                                concept.alignment_reason
-                                for concept in aligned_request.resolved_concepts
-                            ),
                         ],
                         "业务对齐输出",
                     )
-                    unknown_rule_ids = sorted(
-                        set(aligned_request.applied_business_rules)
-                        - self._allowed_business_rule_ids
-                    )
-                    if unknown_rule_ids:
-                        raise BusinessAlignmentPolicyError(
-                            (
-                                AlignmentPolicyIssue(
-                                    field_path=(
-                                        "aligned_request.applied_business_rules"
-                                    ),
-                                    message=(
-                                        "存在核心规则文件中未定义的 rule 标识："
-                                        + "、".join(unknown_rule_ids)
-                                    ),
-                                    repair_action=(
-                                        "删除上述未定义标识；只保留输入 rules 中"
-                                        "实际用于本次对齐的 rule 值。"
-                                    ),
-                                ),
-                            )
-                        )
                     alignment_issues = self._domain_profile.validate_alignment(
                         state["user_question"],
                         aligned_request.aligned_question,
-                        tuple(aligned_request.business_constraints),
-                        tuple(aligned_request.applied_business_rules),
-                        tuple(aligned_request.logical_constraints),
+                        (aligned_request.reason,),
+                        (),
+                        (),
                     )
                     if alignment_issues:
                         raise BusinessAlignmentPolicyError(alignment_issues)
@@ -910,17 +776,32 @@ class BusinessAlignmentSubgraph:
                             )
                         )
                         messages.append(error_message)
-                        self._write_trace(
-                            "\n----- 业务对齐终止工具参数修复 -----\n"
-                            f"tool_call_id: {terminal_tool_call.id}\n"
-                            f"tool_name: {SUBMIT_ALIGNED_QUERY_TOOL_NAME}\n"
-                            f"result: {error_message['content']}"
-                        )
                         continue
                     raise BusinessAlignmentExecutionError(
                         "业务对齐最终工具参数不符合约束",
                         raw_responses,
                     ) from error
+                terminal_argument_repair_count = 0
+                review_question = _build_alignment_review_question(
+                    aligned_request.aligned_question
+                )
+                review_answer = await self._alignment_review_reader(review_question)
+                if not _is_alignment_review_approved(review_answer):
+                    revision_interaction = UserInteraction(
+                        question=ALIGNMENT_REVISION_QUESTION,
+                        answer=await self._user_input_reader(
+                            ALIGNMENT_REVISION_QUESTION
+                        ),
+                    )
+                    user_interactions.append(revision_interaction)
+                    messages.append(
+                        _build_alignment_revision_feedback(
+                            terminal_tool_call.id,
+                            aligned_request.aligned_question,
+                            revision_interaction,
+                        )
+                    )
+                    continue
                 return {
                     "result": BusinessAlignmentResult(
                         status="success",

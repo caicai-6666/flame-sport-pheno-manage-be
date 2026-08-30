@@ -17,8 +17,6 @@ from pydantic import (
     ConfigDict,
     Field,
     ValidationError,
-    field_validator,
-    model_validator,
 )
 from sqlglot import exp, parse, parse_one
 from sqlglot.errors import ParseError
@@ -26,6 +24,10 @@ from sqlglot.errors import ParseError
 from app.agent.text2sql.domains.base import QueryDomainProfile
 from app.agent.text2sql.events.models import AgentProgressUpdate
 from app.agent.text2sql.events.publisher import AgentProgressReporter, ProgressEmitter
+from app.agent.text2sql.model_messages import (
+    ModelMessageTraceQueue,
+    create_traced_chat_completion,
+)
 from app.core.config import Settings, get_settings
 from app.agent.text2sql.shared.model_options import (
     DEFAULT_SQL_MAX_TOKENS,
@@ -43,32 +45,36 @@ from app.agent.text2sql.subgraphs.planning.tools.query_plan import (
     QueryPlanJoin,
     QueryPlanQuantifiedCondition,
 )
-from app.agent.text2sql.shared.table_schema_cache import CachingTableSchemaReader
-from app.agent.text2sql.shared.table_schema_reader import InformationSchemaTableSchemaReader
+from app.agent.text2sql.subgraphs.planning.tools.table_schema_cache import CachingTableSchemaReader
+from app.agent.text2sql.subgraphs.planning.tools.table_schema_reader import InformationSchemaTableSchemaReader
 from app.agent.text2sql.shared.yaml_context import parse_yaml_context, render_yaml_context
 from app.agent.text2sql.subgraphs.planning.tools.table_schema import TableSchemaToolResponse
-from app.agent.text2sql.shared.tools.argument_feedback import (
+from app.agent.text2sql.function_calling.feedback import (
     build_tool_argument_error_message,
 )
 from app.agent.text2sql.subgraphs.sql.tool import (
     SUBMIT_SQL_QUERY_TOOL_NAME,
+    SqlQueryDraft,
+    SqlQueryParameter,
+    SqlScalar,
     build_sql_execution_error_message,
     build_sql_protocol_retry_message,
     build_sql_query_tool_definition,
     build_sql_validation_error_message,
     parse_sql_query_tool_arguments,
 )
+from app.agent.text2sql.subgraphs.sql.models import MaterialSqlQueryPlan
 
 
 QUERY_EXECUTION_TIMEOUT_SECONDS: Final[float] = 10.0
 DEFAULT_SQL_GENERATION_COUNT: Final[int] = 2
 TraceWriter = Callable[[str], None]
 SchemaReader = Callable[[str], TableSchemaToolResponse]
-SqlScalar = str | int | float | bool | None
 SqlExecutor = Callable[
     [str, tuple[SqlScalar, ...]],
     list[dict[str, Any]] | Awaitable[list[dict[str, Any]]],
 ]
+SqlInputPlan = NaturalLanguageQueryPlan | MaterialSqlQueryPlan
 FORBIDDEN_FUNCTION_NAMES: Final[frozenset[str]] = frozenset(
     {
         "BENCHMARK",
@@ -84,53 +90,6 @@ FORBIDDEN_FUNCTION_NAMES: Final[frozenset[str]] = frozenset(
         "UUID_SHORT",
     }
 )
-
-
-class SqlQueryParameter(BaseModel):
-    """SQL 提交工具中一个固定结构的命名参数。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    name: str = Field(
-        pattern=r"^[A-Za-z_][A-Za-z0-9_]*$",
-        description="不含冒号的命名占位符名称，例如 user_id",
-    )
-    value: SqlScalar = Field(description="该命名占位符对应的 JSON 标量值")
-
-
-class SqlQueryDraft(BaseModel):
-    """SQL 生成模型一次性返回的待校验查询草稿。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    sql: str = Field(description="MySQL 只读查询，仅允许一条 SELECT 或 WITH ... SELECT")
-    parameters: list[SqlQueryParameter] = Field(
-        default_factory=list,
-        description="SQL 中命名占位符及其值组成的列表；无参数时传空列表",
-    )
-    result_columns: list[str] = Field(
-        min_length=1,
-        description="结果集返回列名或别名，按 SQL SELECT 顺序排列",
-    )
-
-    # 兼容内部调用直接传入的参数字典，但远端 Function Schema 只暴露封闭参数列表。
-    @field_validator("parameters", mode="before")
-    @classmethod
-    def normalize_legacy_parameter_mapping(cls, value: Any) -> Any:
-        if isinstance(value, dict):
-            return [
-                {"name": parameter_name, "value": parameter_value}
-                for parameter_name, parameter_value in value.items()
-            ]
-        return value
-
-    # 拒绝重复参数名，避免列表转换为执行字典时发生静默覆盖。
-    @model_validator(mode="after")
-    def validate_unique_parameter_names(self) -> "SqlQueryDraft":
-        parameter_names = [parameter.name for parameter in self.parameters]
-        if len(parameter_names) != len(set(parameter_names)):
-            raise ValueError("parameters 不能包含重复的命名参数")
-        return self
 
 
 class SqlValidationError(ValueError):
@@ -245,7 +204,7 @@ class SqlQuerySubgraphResult(BaseModel):
 class _SqlQueryState(TypedDict, total=False):
     """独立子图在生成、校验和执行节点间传递的最小状态。"""
 
-    query_plan: NaturalLanguageQueryPlan
+    query_plan: SqlInputPlan
     provided_schema_results: list[TableSchemaToolResponse] | None
     schema_results: list[TableSchemaToolResponse]
     messages: list[Any]
@@ -415,26 +374,30 @@ def _build_sql_generation_messages(
 
 # 校验计划中的表名属于当前业务域白名单，并在保持计划顺序的同时去重。
 def _get_plan_table_names(
-    query_plan: NaturalLanguageQueryPlan,
+    query_plan: SqlInputPlan,
     allowed_table_names: frozenset[str],
 ) -> list[str]:
+    if isinstance(query_plan, MaterialSqlQueryPlan):
+        declared_table_names = query_plan.required_tables
+    else:
+        declared_table_names = [table.table_name for table in query_plan.tables]
     table_names: list[str] = []
     seen_table_names: set[str] = set()
-    for table in query_plan.tables:
-        if table.table_name not in allowed_table_names:
+    for table_name in declared_table_names:
+        if table_name not in allowed_table_names:
             raise SqlValidationError(
                 code="query_plan_table_forbidden",
-                message=f"查询计划包含不允许读取的表：{table.table_name}",
+                message=f"查询计划包含不允许读取的表：{table_name}",
                 repair_action=(
-                    f"从查询计划中删除表 `{table.table_name}` 及所有引用该表的"
+                    f"从查询计划中删除表 `{table_name}` 及所有引用该表的"
                     "关联、筛选、返回、分组、聚合和排序表达式。"
                 ),
                 retry_target="query_planning",
-                details={"table_name": table.table_name},
+                details={"table_name": table_name},
             )
-        if table.table_name not in seen_table_names:
-            seen_table_names.add(table.table_name)
-            table_names.append(table.table_name)
+        if table_name not in seen_table_names:
+            seen_table_names.add(table_name)
+            table_names.append(table_name)
     return table_names
 
 
@@ -612,6 +575,14 @@ def _validate_ast_safety(
 
 # 判断字面量最近所属的是筛选谓词还是 SELECT 投影，避免把 EXISTS 的 SELECT 1 误判为外部值。
 def _is_filter_predicate_literal(literal: exp.Literal) -> bool:
+    if (
+        isinstance(literal.parent, exp.If)
+        and literal.arg_key == "true"
+    ) or (
+        isinstance(literal.parent, exp.Case)
+        and literal.arg_key == "default"
+    ):
+        return False
     current = literal.parent
     while current is not None:
         if isinstance(current, (exp.Where, exp.Having, exp.Join)):
@@ -2616,11 +2587,209 @@ def _compile_named_parameters(
     return "".join(compiled_parts), tuple(ordered_values)
 
 
+# 校验三字段原料计划下的最终结果列，仅约束真实 SQL 输出而不恢复旧查询块 AST。
+def _validate_material_result_columns(
+    expression: exp.Expression,
+    result_columns: list[str],
+) -> None:
+    duplicate_columns = sorted(
+        {
+            column_name
+            for column_name in result_columns
+            if result_columns.count(column_name) > 1
+        }
+    )
+    if duplicate_columns:
+        raise SqlValidationError(
+            code="duplicate_result_columns",
+            message="result_columns 不能包含重复列名",
+            repair_action=(
+                f"为重复列 {duplicate_columns} 设置不同的 AS 别名，并按最外层 SELECT "
+                "顺序重写 result_columns。"
+            ),
+            details={"duplicate_columns": duplicate_columns},
+        )
+    actual_result_columns = [
+        selected_expression.output_name
+        for selected_expression in expression.expressions
+    ]
+    if actual_result_columns != result_columns:
+        raise SqlValidationError(
+            code="result_columns_mismatch",
+            message="result_columns 必须与最外层 SELECT 输出列名按顺序完全一致",
+            repair_action=(
+                "保持 SQL 不变，把 result_columns 精确改为："
+                f"{actual_result_columns}；若其中存在空名称或重复名称，先为对应 SELECT "
+                "表达式补充唯一 AS 别名。"
+            ),
+            details={
+                "actual_result_columns": actual_result_columns,
+                "declared_result_columns": result_columns,
+            },
+        )
+
+
+# 从真实结构响应建立字段集合，供原料 SQL 在执行前拦截已限定的虚构字段。
+def _build_material_schema_fields(
+    schema_results: list[TableSchemaToolResponse],
+) -> dict[str, frozenset[str]]:
+    schema_fields: dict[str, frozenset[str]] = {}
+    for schema_result in schema_results:
+        if schema_result.status != "success" or schema_result.table_name is None:
+            continue
+        payload = parse_yaml_context(schema_result.result)
+        columns = payload.get("columns") if isinstance(payload, dict) else None
+        if not isinstance(columns, list):
+            continue
+        schema_fields[schema_result.table_name] = frozenset(
+            str(column["field_name"])
+            for column in columns
+            if isinstance(column, dict) and "field_name" in column
+        )
+    return schema_fields
+
+
+# 提取规划层已经用真实原名声明的字段，未写原名的业务描述继续由 SQL 模型结合结构解析。
+def _extract_material_plan_field_references(
+    material_plan: MaterialSqlQueryPlan,
+) -> set[tuple[str, str]]:
+    required_tables = set(material_plan.required_tables)
+    return {
+        (table_name, field_name)
+        for table_name, field_name in re.findall(
+            r"\b([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)\b",
+            material_plan.guidance,
+        )
+        if table_name in required_tables
+    }
+
+
+# 在调用模型前确认规划显式字段真实存在，使错误回到规划层而不是诱导 SQL 猜测替代字段。
+def _validate_material_plan_schema_references(
+    material_plan: MaterialSqlQueryPlan,
+    schema_results: list[TableSchemaToolResponse],
+) -> None:
+    schema_fields = _build_material_schema_fields(schema_results)
+    invalid_references = sorted(
+        f"{table_name}.{field_name}"
+        for table_name, field_name in _extract_material_plan_field_references(
+            material_plan
+        )
+        if field_name not in schema_fields.get(table_name, frozenset())
+    )
+    if invalid_references:
+        raise SqlValidationError(
+            code="material_plan_unknown_field",
+            message="原料查询计划引用了真实表结构中不存在的字段",
+            repair_action=(
+                f"返回查询规划层，删除或改正字段 {invalid_references}；"
+                "重新读取对应表结构后再提交原料计划。"
+            ),
+            retry_target="query_planning",
+            details={"invalid_field_references": invalid_references},
+        )
+
+
+# 核对基础表字段引用；CTE 和派生表输出继续交由 MySQL 解析，避免把合法中间列误判为物理字段。
+def _validate_material_field_references(
+    expression: exp.Expression,
+    material_plan: MaterialSqlQueryPlan,
+    schema_results: list[TableSchemaToolResponse],
+    expected_table_names: set[str],
+) -> None:
+    schema_fields = _build_material_schema_fields(schema_results)
+    missing_schemas = sorted(expected_table_names - set(schema_fields))
+    if missing_schemas:
+        raise SqlValidationError(
+            code="material_schema_missing",
+            message="SQL 校验缺少查询计划所需表结构",
+            repair_action="停止 SQL 修复，由系统重新读取缺失表结构后再生成查询。",
+            retry_target="none",
+            details={"missing_tables": missing_schemas},
+        )
+
+    cte_names = {cte.alias_or_name for cte in expression.find_all(exp.CTE)}
+    physical_alias_sources: dict[str, set[str]] = {}
+    for table in expression.find_all(exp.Table):
+        if table.name in cte_names:
+            continue
+        physical_alias_sources.setdefault(table.alias_or_name, set()).add(table.name)
+    physical_aliases = {
+        alias: next(iter(table_names))
+        for alias, table_names in physical_alias_sources.items()
+        if len(table_names) == 1
+    }
+    invalid_references: list[str] = []
+    actual_physical_references: set[tuple[str, str]] = set()
+    physical_table_set = set(physical_aliases.values())
+    can_resolve_unqualified_columns = (
+        len(physical_table_set) == 1 and not cte_names
+    )
+    for column in expression.find_all(exp.Column):
+        source_table: str | None = None
+        if column.table in physical_aliases:
+            source_table = physical_aliases[column.table]
+        elif not column.table and can_resolve_unqualified_columns:
+            source_table = next(iter(physical_table_set))
+        if source_table is None:
+            continue
+        actual_physical_references.add((source_table, column.name))
+        if column.name not in schema_fields[source_table]:
+            invalid_references.append(
+                f"{column.table + '.' if column.table else ''}{column.name}"
+            )
+    if invalid_references:
+        unique_references = sorted(set(invalid_references))
+        raise SqlValidationError(
+            code="unknown_schema_field",
+            message="SQL 引用了真实表结构中不存在的字段",
+            repair_action=(
+                f"删除或改正字段 {unique_references}；只能使用 allowed_table_schemas "
+                "中对应表实际列出的 field_name。"
+            ),
+            details={"invalid_field_references": unique_references},
+        )
+    missing_plan_references = sorted(
+        f"{table_name}.{field_name}"
+        for table_name, field_name in _extract_material_plan_field_references(
+            material_plan
+        )
+        if (table_name, field_name) not in actual_physical_references
+    )
+    if missing_plan_references:
+        raise SqlValidationError(
+            code="material_plan_field_not_implemented",
+            message="SQL 没有落实原料查询计划明确声明的真实字段",
+            repair_action=(
+                f"在保持原业务口径不变的前提下，让 SQL 实际引用字段 "
+                f"{missing_plan_references}；不得用固定参数、相似字段或其他表字段替代。"
+            ),
+            details={"missing_field_references": missing_plan_references},
+        )
+
+
+# 读取三字段计划 SQL 自己声明的顶层分页，不推测自然语言中的数值口径。
+def _resolve_material_effective_limit(expression: exp.Expression) -> int | None:
+    limit_clause = expression.args.get("limit")
+    if limit_clause is None:
+        if expression.args.get("offset") is not None:
+            raise SqlValidationError(
+                code="offset_without_limit",
+                message="SQL 不能在没有 LIMIT 时单独使用 OFFSET",
+                repair_action="删除 OFFSET，或按原料查询指导同时提供明确的 LIMIT 整数。",
+            )
+        return None
+    actual_limit = _get_integer_clause_value(limit_clause, "LIMIT", 0)
+    _get_integer_clause_value(expression.args.get("offset"), "OFFSET", 0)
+    return actual_limit
+
+
 # 对模型草稿执行 AST 安全校验、分页约束和参数编译，返回可传给 asyncmy 的 SQL 与参数序列。
 def validate_sql_draft(
     draft: SqlQueryDraft,
-    query_plan: NaturalLanguageQueryPlan,
+    query_plan: SqlInputPlan,
     allowed_table_names: frozenset[str],
+    schema_results: list[TableSchemaToolResponse] | None = None,
 ) -> tuple[str, tuple[SqlScalar, ...]]:
     sql = draft.sql.strip()
     if not sql:
@@ -2652,11 +2821,23 @@ def validate_sql_draft(
         set(_get_plan_table_names(query_plan, allowed_table_names)),
     )
     resolved_expression = _resolve_draft_parameter_ast(expression, draft.parameters)
-    _validate_query_block_implementation(resolved_expression, query_plan)
-    _validate_quantified_condition_implementation(expression, draft, query_plan)
+    if isinstance(query_plan, MaterialSqlQueryPlan):
+        _validate_material_field_references(
+            expression,
+            query_plan,
+            schema_results or [],
+            set(_get_plan_table_names(query_plan, allowed_table_names)),
+        )
+    else:
+        _validate_query_block_implementation(resolved_expression, query_plan)
+        _validate_quantified_condition_implementation(expression, draft, query_plan)
     _validate_external_filter_values_parameterized(expression)
-    _validate_result_columns(expression, draft.result_columns, query_plan)
-    _resolve_effective_limit(expression, query_plan)
+    if isinstance(query_plan, MaterialSqlQueryPlan):
+        _validate_material_result_columns(expression, draft.result_columns)
+        _resolve_material_effective_limit(expression)
+    else:
+        _validate_result_columns(expression, draft.result_columns, query_plan)
+        _resolve_effective_limit(expression, query_plan)
     normalized_sql = expression.sql(dialect="mysql")
     return _compile_named_parameters(normalized_sql, draft.parameters)
 
@@ -2667,6 +2848,29 @@ class AsyncMyReadOnlySqlExecutor:
     # 保存开发数据库配置，执行器只接收已校验的 SQL 和绑定参数而不接触模型输出对象。
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
+
+    # 按 MySQL 错误码区分可由模型修复的查询问题，并为聚合错误提供唯一、无歧义的修复方向。
+    @staticmethod
+    def _resolve_query_repair(mysql_code: int | None) -> tuple[bool, str]:
+        if mysql_code in {1055, 1140}:
+            return (
+                True,
+                "当前 SQL 同时输出聚合表达式和非聚合列，但分组关系不完整。"
+                "请为最外层 SELECT 的全部非聚合输出列补充 GROUP BY，"
+                "或先在独立 CTE/子查询中按计划要求的主体粒度完成聚合后再关联明细；"
+                "不得删除计划要求的结果列、放宽筛选条件或改变结果行粒度。",
+            )
+        repairable_codes = {1052, 1054, 1064, 1111, 1146, 1241, 1242}
+        if mysql_code in repairable_codes:
+            return (
+                True,
+                "依据数据库错误和已提供表结构修正 SQL 语法、字段限定或子查询写法，"
+                "保持查询计划的筛选条件、结果列和结果行粒度不变。",
+            )
+        return (
+            False,
+            "无需修改 SQL；由系统检查数据库连接、权限或服务状态。",
+        )
 
     # 异步执行受超时保护的只读查询，并把数据库异常归一为可判定的重试语义。
     async def execute(
@@ -2694,8 +2898,7 @@ class AsyncMyReadOnlySqlExecutor:
                 "[REDACTED]",
                 raw_message,
             )[:500]
-            repairable_codes = {1052, 1054, 1055, 1064, 1111, 1146, 1241, 1242}
-            retryable = mysql_code in repairable_codes
+            retryable, repair_action = self._resolve_query_repair(mysql_code)
             raise SqlExecutionError(
                 code=(
                     f"mysql_query_error_{mysql_code}"
@@ -2703,12 +2906,7 @@ class AsyncMyReadOnlySqlExecutor:
                     else "mysql_query_error"
                 ),
                 message=f"数据库拒绝执行当前只读 SQL：{safe_message}",
-                repair_action=(
-                    "依据数据库错误和已提供表结构修正 SQL 语法、字段限定、"
-                    "分组或子查询写法，保持查询计划业务口径不变。"
-                    if retryable
-                    else "无需修改 SQL；由系统检查数据库连接、权限或服务状态。"
-                ),
+                repair_action=repair_action,
                 retryable=retryable,
                 details={"mysql_error_code": mysql_code},
             ) from error
@@ -2757,6 +2955,7 @@ class SqlQuerySubgraph:
         schema_reader: SchemaReader,
         sql_executor: SqlExecutor,
         trace_writer: TraceWriter | None = None,
+        message_trace_queue: ModelMessageTraceQueue | None = None,
         progress_emitter: ProgressEmitter | None = None,
         max_tokens: int = DEFAULT_SQL_MAX_TOKENS,
         request_profile: str = "deepseek",
@@ -2770,6 +2969,7 @@ class SqlQuerySubgraph:
         self._schema_reader = schema_reader
         self._sql_executor = sql_executor
         self._trace_writer = trace_writer
+        self._message_trace_queue = message_trace_queue
         self._progress_reporter = AgentProgressReporter(
             domain_profile,
             progress_emitter,
@@ -2820,6 +3020,7 @@ class SqlQuerySubgraph:
         settings: Settings | None = None,
         schema_reader: SchemaReader | None = None,
         trace_writer: TraceWriter | None = None,
+        message_trace_queue: ModelMessageTraceQueue | None = None,
         progress_emitter: ProgressEmitter | None = None,
     ) -> "SqlQuerySubgraph":
         resolved_settings = settings or get_settings()
@@ -2843,6 +3044,7 @@ class SqlQuerySubgraph:
             schema_reader=schema_reader,
             sql_executor=sql_executor.execute,
             trace_writer=trace_writer,
+            message_trace_queue=message_trace_queue,
             progress_emitter=progress_emitter,
             max_tokens=resolved_settings.deepseek_query_sql_max_tokens,
             request_profile=connection.provider,
@@ -2860,7 +3062,7 @@ class SqlQuerySubgraph:
     # 异步桥接现有结构缓存读取器；任何表结构读取失败都会在调用模型前停止。
     async def _read_plan_schemas(
         self,
-        query_plan: NaturalLanguageQueryPlan,
+        query_plan: SqlInputPlan,
     ) -> list[TableSchemaToolResponse]:
         schema_results: list[TableSchemaToolResponse] = []
         for table_name in _get_plan_table_names(
@@ -2876,7 +3078,7 @@ class SqlQuerySubgraph:
     # 按计划顺序优先采用上游成功结构，缺失时异步桥接共享缓存按需读取。
     async def _resolve_plan_schemas(
         self,
-        query_plan: NaturalLanguageQueryPlan,
+        query_plan: SqlInputPlan,
         provided_schema_results: list[TableSchemaToolResponse],
     ) -> list[TableSchemaToolResponse]:
         schema_by_table_name = {
@@ -2923,15 +3125,34 @@ class SqlQuerySubgraph:
                         state["query_plan"],
                         provided_schema_results,
                     )
-                messages = _build_sql_generation_messages(
-                    state["query_plan"],
-                    schema_results,
-                    self._tool_tag_template,
-                )
+                if isinstance(state["query_plan"], MaterialSqlQueryPlan):
+                    _validate_material_plan_schema_references(
+                        state["query_plan"],
+                        schema_results,
+                    )
+                if isinstance(state["query_plan"], MaterialSqlQueryPlan):
+                    from app.agent.text2sql.subgraphs.sql.prompt.material_prompt import (
+                        build_material_sql_generation_messages,
+                    )
+
+                    messages = build_material_sql_generation_messages(
+                        state["query_plan"],
+                        schema_results,
+                        self._tool_tag_template,
+                    )
+                else:
+                    messages = _build_sql_generation_messages(
+                        state["query_plan"],
+                        schema_results,
+                        self._tool_tag_template,
+                    )
             sql_tool = build_sql_query_tool_definition()
             generation_count += 1
             current_turn_start = len(messages)
-            response = await self._client.chat.completions.create(
+            response = await create_traced_chat_completion(
+                client=self._client,
+                message_queue=self._message_trace_queue,
+                node="sql",
                 model=self._model,
                 messages=list(messages),
                 tools=[sql_tool],
@@ -3089,13 +3310,12 @@ class SqlQuerySubgraph:
                     tool_call.function.arguments
                 )
             except ValidationError as error:
-                messages.append(
-                    build_tool_argument_error_message(
-                        tool_call.id,
-                        SUBMIT_SQL_QUERY_TOOL_NAME,
-                        error,
-                    )
+                argument_feedback = build_tool_argument_error_message(
+                    tool_call.id,
+                    SUBMIT_SQL_QUERY_TOOL_NAME,
+                    error,
                 )
+                messages.append(argument_feedback)
                 error_message = f"SQL 工具参数校验失败：{error}"
                 can_retry = generation_count < max_generation_count
                 if repair_context_start is None:
@@ -3137,7 +3357,13 @@ class SqlQuerySubgraph:
                 "\n================ SQL 子图：生成 ================\n"
                 f"第 {generation_count}/{max_generation_count} 次生成\n"
                 f"模型工具参数：\n{tool_call.function.arguments}\n"
-                f"计划表：{', '.join(table.table_name for table in state['query_plan'].tables)}"
+                "计划表："
+                + ", ".join(
+                    _get_plan_table_names(
+                        state["query_plan"],
+                        self._allowed_table_names,
+                    )
+                )
             )
             return {
                 "schema_results": schema_results,
@@ -3215,6 +3441,7 @@ class SqlQuerySubgraph:
                 state["draft"],
                 state["query_plan"],
                 self._allowed_table_names,
+                state.get("schema_results"),
             )
             original_expression = parse(state["draft"].sql, read="mysql")[0]
             analysis_sql = original_expression.sql(dialect="mysql")
@@ -3227,9 +3454,13 @@ class SqlQuerySubgraph:
                     message="查询只会读取当前业务域允许的数据，正在准备执行。",
                 )
             )
-            effective_limit = _resolve_effective_limit(
-                original_expression,
-                state["query_plan"],
+            effective_limit = (
+                _resolve_material_effective_limit(original_expression)
+                if isinstance(state["query_plan"], MaterialSqlQueryPlan)
+                else _resolve_effective_limit(
+                    original_expression,
+                    state["query_plan"],
+                )
             )
             messages = list(state.get("messages", []))
             current_turn_start = state.get(
@@ -3362,7 +3593,11 @@ class SqlQuerySubgraph:
                 analysis_sql=state["analysis_sql"],
                 result_columns=state["draft"].result_columns,
                 rows=rows,
-                planned_limit=state["query_plan"].pagination.limit,
+                planned_limit=(
+                    effective_limit
+                    if isinstance(state["query_plan"], MaterialSqlQueryPlan)
+                    else state["query_plan"].pagination.limit
+                ),
                 effective_limit=effective_limit,
                 returned_row_count=len(rows),
                 limit_reached=limit_reached,
@@ -3471,7 +3706,7 @@ class SqlQuerySubgraph:
     # 异步运行独立子图并校验预算；Pipeline 可复用规划结构，缺项由共享缓存按需补齐。
     async def run(
         self,
-        query_plan: NaturalLanguageQueryPlan,
+        query_plan: SqlInputPlan,
         schema_results: list[TableSchemaToolResponse] | None = None,
         max_generation_count: int = DEFAULT_SQL_GENERATION_COUNT,
     ) -> SqlQuerySubgraphResult:

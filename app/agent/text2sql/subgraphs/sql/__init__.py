@@ -6,9 +6,11 @@ from app.agent.text2sql.subgraphs.sql.node import (
     SqlQuerySubgraphResult,
     SqlValidationError,
 )
+from app.agent.text2sql.subgraphs.sql.models import MaterialSqlQueryPlan
 
 __all__ = [
     "SqlExecutionError",
+    "MaterialSqlQueryPlan",
     "SqlQuerySubgraph",
     "SqlQuerySubgraphResult",
     "SqlValidationError",

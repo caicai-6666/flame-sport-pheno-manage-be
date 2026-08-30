@@ -5,15 +5,14 @@ from typing import Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from app.agent.text2sql.shared.tools.argument_compatibility import (
+from app.agent.text2sql.function_calling.arguments import (
     validate_tool_arguments_with_embedded_json_fallback,
 )
-from app.agent.text2sql.shared.tools.pydantic_schema import (
+from app.agent.text2sql.function_calling.schema import (
     build_pydantic_tool_definition,
 )
 
 
-NATURAL_LANGUAGE_QUERY_TOOL_NAME: Final[str] = "execute_natural_language_query"
 ABANDON_QUERY_PLANNING_TOOL_NAME: Final[str] = "abandon_query_planning"
 
 
@@ -369,7 +368,7 @@ class QueryPlanPagination(BaseModel):
 
 
 class ResultShapePlan(BaseModel):
-    """SQL 和状态翻译完成后，由本地程序执行的确定性展示塑形计划。"""
+    """SQL 执行完成后、状态翻译前，由本地程序执行的历史兼容塑形计划。"""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -1294,52 +1293,6 @@ class NaturalLanguageQueryPlan(BaseModel):
         ]
 
 
-class NaturalLanguageQueryToolArguments(BaseModel):
-    """规划结束时同时提交相互独立的数据获取计划和结果塑形计划。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    query_plan: NaturalLanguageQueryPlan = Field(
-        description=(
-            "只供 SQL 查询执行层消费的数据获取计划；"
-            "所有字段均必须提供，不适用的列表字段传空列表"
-        )
-    )
-    result_shape_plan: ResultShapePlan = Field(
-        default_factory=ResultShapePlan,
-        description=(
-            "只供翻译后的确定性结果塑形层消费；"
-            "普通结果使用 passthrough，需要动态按列展开时使用 pivot"
-        ),
-    )
-
-    # 校验塑形字段全部来自 SQL 计划声明的稳定结果列，防止两份计划拆分后失去依赖闭包。
-    @model_validator(mode="after")
-    def validate_shape_dependencies(self) -> "NaturalLanguageQueryToolArguments":
-        available_fields = {
-            select_field.result_field for select_field in self.query_plan.select_fields
-        }
-        shape_plan = self.result_shape_plan
-        referenced_fields = set(shape_plan.group_fields)
-        referenced_fields.update(shape_plan.passthrough_fields)
-        referenced_fields.update(shape_plan.hidden_fields)
-        if shape_plan.pivot_value_field is not None:
-            referenced_fields.add(shape_plan.pivot_value_field)
-        if shape_plan.pivot_order_field is not None:
-            referenced_fields.add(shape_plan.pivot_order_field)
-        unknown_fields = sorted(referenced_fields - available_fields)
-        if unknown_fields:
-            raise ValueError(
-                "result_shape_plan 引用了 query_plan.select_fields 未声明的 "
-                "result_field：" + ", ".join(unknown_fields)
-            )
-        if shape_plan.shape_type == "passthrough" and not shape_plan.passthrough_fields:
-            shape_plan.passthrough_fields = [
-                select_field.result_field for select_field in self.query_plan.select_fields
-            ]
-        return self
-
-
 class QueryPlanningAbandonment(BaseModel):
     """查询规划无法产生可靠 SQL 计划时面向用户的结构化放弃说明。"""
 
@@ -1373,25 +1326,6 @@ class AbandonQueryPlanningArguments(BaseModel):
     )
 
 
-# 基于 Pydantic 参数模型生成函数调用定义，强制模型提供可验证的完整查询计划。
-def build_natural_language_query_tool_definition() -> dict[str, object]:
-    return build_pydantic_tool_definition(
-        tool_name=NATURAL_LANGUAGE_QUERY_TOOL_NAME,
-        description=(
-            "同时提交结构化的只读 SQL 数据获取计划和确定性结果塑形计划。"
-            "query_plan 必须由拓扑有序 query_blocks 组成，并由 root_block_id 指向根块；"
-            "资格判断与最终明细粒度不同时必须拆成独立查询块。"
-            "每块必须明确 FROM 起点、有序 JOIN 右侧/类型/基数/右键、完整 ON "
-            "与 DISTINCT 口径；所有关联、筛选、返回字段、分组和排序"
-            "均须保留原始标识符；"
-            "query_plan 只供 SQL 查询执行层使用，result_shape_plan 不得改变查询口径；"
-            "pagination.limit 是规划层确定的结果行上限；"
-            "为 null 时后续 SQL 将按筛选条件完整执行。"
-        ),
-        arguments_model=NaturalLanguageQueryToolArguments,
-    )
-
-
 # 基于 Pydantic 放弃模型生成函数调用定义，区分业务无法继续和模型、数据库等技术失败。
 def build_abandon_query_planning_tool_definition(
     query_scope: str = "当前只读数据查询范围",
@@ -1404,16 +1338,6 @@ def build_abandon_query_planning_tool_definition(
             "提交放弃原因并结束规划。不得把最终 SQL 返回空行的正常查询结果当作放弃。"
         ),
         arguments_model=AbandonQueryPlanningArguments,
-    )
-
-
-# 严格校验失败后递归还原兼容接口偶发的嵌套 JSON 字符串，不放宽任何查询计划约束。
-def parse_natural_language_query_tool_arguments(
-    arguments_json: str,
-) -> NaturalLanguageQueryToolArguments:
-    return validate_tool_arguments_with_embedded_json_fallback(
-        arguments_json,
-        NaturalLanguageQueryToolArguments,
     )
 
 

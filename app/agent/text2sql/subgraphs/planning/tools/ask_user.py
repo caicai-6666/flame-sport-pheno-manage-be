@@ -4,10 +4,10 @@ from typing import Final
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.agent.text2sql.shared.tools.argument_compatibility import (
+from app.agent.text2sql.function_calling.arguments import (
     validate_tool_arguments_with_embedded_json_fallback,
 )
-from app.agent.text2sql.shared.tools.pydantic_schema import (
+from app.agent.text2sql.function_calling.schema import (
     build_pydantic_tool_definition,
 )
 
@@ -22,13 +22,6 @@ class AskUserToolArguments(BaseModel):
     question: str = Field(
         description="需要用户回答的一个简洁、具体且无法通过现有工具确认的问题"
     )
-
-
-class UserInteraction(BaseModel):
-    """一次由规划流程发起、并由当前查询用户完成的澄清或复核问答。"""
-
-    question: str = Field(description="规划流程提出的澄清或复核问题")
-    answer: str = Field(description="用户通过交互接口提交的回答")
 
 
 # 基于 Pydantic 参数模型生成函数调用定义，使模型能在关键事实不足时向用户反问。

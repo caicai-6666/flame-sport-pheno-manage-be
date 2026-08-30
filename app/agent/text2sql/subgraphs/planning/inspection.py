@@ -16,6 +16,10 @@ from sqlglot import exp, parse
 from sqlglot.errors import ParseError
 
 from app.agent.text2sql.domains.base import QueryDomainProfile
+from app.agent.text2sql.model_messages import (
+    ModelMessageTraceQueue,
+    create_traced_chat_completion,
+)
 from app.core.config import Settings
 from app.agent.text2sql.subgraphs.planning.entity_lookup import (
     EntityLookupConfig,
@@ -31,22 +35,22 @@ from app.agent.text2sql.shared.tool_tag_template import (
     build_tool_tag_prefixed_task_content,
 )
 from app.agent.text2sql.shared.yaml_context import parse_yaml_context, render_yaml_context
-from app.agent.text2sql.shared.tools.argument_compatibility import (
+from app.agent.text2sql.function_calling.arguments import (
     validate_tool_arguments_with_embedded_json_fallback,
 )
-from app.agent.text2sql.shared.tools.pydantic_schema import (
+from app.agent.text2sql.function_calling.schema import (
     build_pydantic_tool_definition,
 )
 from app.agent.text2sql.subgraphs.planning.tools.table_inspection import (
     DataInspectionPurpose,
     TableDataInspectionResponse,
 )
-from app.agent.text2sql.shared.table_schema_reader import InformationSchemaTableSchemaReader
+from app.agent.text2sql.subgraphs.planning.tools.table_schema_reader import InformationSchemaTableSchemaReader
 from app.agent.text2sql.subgraphs.planning.tools.table_schema import (
     TableSchemaToolResponse,
     ensure_allowed_table_name,
 )
-from app.agent.text2sql.shared.tools.argument_feedback import (
+from app.agent.text2sql.function_calling.feedback import (
     build_tool_argument_error_message,
 )
 
@@ -504,6 +508,7 @@ class SingleTableDataInspector:
         domain_profile: QueryDomainProfile,
         schema_reader: SchemaReader | None = None,
         trace_writer: TraceWriter | None = None,
+        message_trace_queue: ModelMessageTraceQueue | None = None,
         max_tokens: int = DEFAULT_INSPECTION_MAX_TOKENS,
         request_profile: str = "deepseek",
         tool_tag_template: str | None = None,
@@ -524,6 +529,7 @@ class SingleTableDataInspector:
             domain_profile.allowed_tables,
         ).read
         self._trace_writer = trace_writer
+        self._message_trace_queue = message_trace_queue
         self._max_tokens = max_tokens
         self._request_profile = get_model_request_profile(request_profile)
         self._tool_tag_template = tool_tag_template
@@ -577,7 +583,10 @@ class SingleTableDataInspector:
 
         for attempt_index in range(max_attempt_count):
             current_turn_start = len(messages)
-            response = await self._client.chat.completions.create(
+            response = await create_traced_chat_completion(
+                client=self._client,
+                message_queue=self._message_trace_queue,
+                node="planning.table_inspection",
                 model=self._model,
                 messages=messages,
                 tools=[_build_single_table_select_tool_definition()],

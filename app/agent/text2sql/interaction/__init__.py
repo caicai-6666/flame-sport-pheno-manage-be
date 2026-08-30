@@ -1,14 +1,12 @@
-"""Text-to-SQL 查询会话与用户交互管理。"""
+"""公开不依赖 Pipeline 的 Text-to-SQL 用户交互模型。"""
 
 from app.agent.text2sql.interaction.models import (
     AgentInteraction,
     AgentQuerySessionSnapshot,
+    UserInteraction,
 )
-from app.agent.text2sql.interaction.session import AgentQueryCancelled, AgentQuerySession
-
 __all__ = [
     "AgentInteraction",
-    "AgentQueryCancelled",
-    "AgentQuerySession",
     "AgentQuerySessionSnapshot",
+    "UserInteraction",
 ]

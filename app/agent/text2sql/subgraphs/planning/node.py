@@ -6,7 +6,9 @@ import inspect
 import re
 from collections import Counter
 from collections.abc import Awaitable, Callable
-from typing import Any, Literal, TypedDict
+from dataclasses import dataclass
+from typing import Any, Final, Literal, TypedDict
+from uuid import uuid4
 
 from langgraph.graph import END, START, StateGraph
 from openai import AsyncOpenAI
@@ -14,20 +16,27 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from app.agent.text2sql.domains.base import QueryDomainProfile, QueryPlanPolicyIssue
 from app.agent.text2sql.events.publisher import AgentProgressReporter, ProgressEmitter
+from app.agent.text2sql.model_messages import (
+    ModelMessageTraceQueue,
+    create_traced_chat_completion,
+)
 from app.core.config import Settings, get_settings
 from app.agent.text2sql.shared.model_options import (
     DEFAULT_PLANNING_MAX_TOKENS,
     get_model_request_profile,
     resolve_model_provider_connection,
 )
+from app.agent.text2sql.shared.system_guidance import (
+    build_system_guidance_message,
+)
 from app.agent.text2sql.shared.tool_tag_template import (
     build_tool_tag_prefixed_task_content,
     load_tool_tag_template,
     resolve_query_tool_tag_template_filename,
 )
-from app.agent.text2sql.shared.tools.ask_user import (
+from app.agent.text2sql.interaction.models import UserInteraction
+from app.agent.text2sql.subgraphs.planning.tools.ask_user import (
     ASK_USER_TOOL_NAME,
-    UserInteraction,
     build_ask_user_tool_definition,
     parse_ask_user_tool_arguments,
 )
@@ -47,19 +56,38 @@ from app.agent.text2sql.subgraphs.planning.tools.table_inspection import (
 )
 from app.agent.text2sql.subgraphs.planning.tools.query_plan import (
     ABANDON_QUERY_PLANNING_TOOL_NAME,
-    NATURAL_LANGUAGE_QUERY_TOOL_NAME,
     NaturalLanguageQueryPlan,
     QueryPlanningAbandonment,
     ResultShapePlan,
     build_abandon_query_planning_tool_definition,
-    build_natural_language_query_tool_definition,
     parse_abandon_query_planning_arguments,
-    parse_natural_language_query_tool_arguments,
-    render_natural_language_query_plan,
 )
-from app.agent.text2sql.subgraphs.planning.prompt.prompt import build_base_planning_prompt
-from app.agent.text2sql.shared.table_schema_reader import InformationSchemaTableSchemaReader
-from app.agent.text2sql.shared.table_schema_cache import CachingTableSchemaReader
+from app.agent.text2sql.subgraphs.planning.tools.material_plan import (
+    MaterialQueryPlan,
+    render_material_query_plan,
+)
+from app.agent.text2sql.subgraphs.planning.tools.material_data import (
+    QUERY_MATERIAL_DATA_TOOL_NAME,
+    SHAPE_MATERIAL_DATA_TOOL_NAME,
+    SUBMIT_FINAL_QUERY_RESULT_TOOL_NAME,
+    QueryMaterialDataArguments,
+    ShapeMaterialDataArguments,
+    build_query_material_data_tool_definition,
+    build_shape_material_data_tool_definition,
+    build_submit_final_query_result_tool_definition,
+    parse_query_material_data_tool_arguments,
+    parse_shape_material_data_tool_arguments,
+    parse_submit_final_query_result_tool_arguments,
+)
+from app.agent.text2sql.subgraphs.planning.markdown_preview import (
+    MARKDOWN_PREVIEW_ROW_LIMIT,
+    render_markdown_table_preview,
+)
+from app.agent.text2sql.subgraphs.planning.prompt import (
+    build_query_planning_prompt,
+)
+from app.agent.text2sql.subgraphs.planning.tools.table_schema_reader import InformationSchemaTableSchemaReader
+from app.agent.text2sql.subgraphs.planning.tools.table_schema_cache import CachingTableSchemaReader
 from app.agent.text2sql.shared.yaml_context import parse_yaml_context, render_yaml_context
 from app.agent.text2sql.subgraphs.planning.tools.table_schema import (
     TABLE_SCHEMA_TOOL_NAME,
@@ -68,20 +96,33 @@ from app.agent.text2sql.subgraphs.planning.tools.table_schema import (
     ensure_allowed_table_name,
     parse_table_schema_tool_arguments,
 )
-from app.agent.text2sql.shared.tools.thinking import (
+from app.agent.text2sql.subgraphs.planning.tools.thinking import (
     THINKING_TOOL_NAME,
     ThinkingToolArguments,
     build_thinking_tool_definition,
     parse_thinking_tool_arguments,
 )
-from app.agent.text2sql.shared.tools.argument_feedback import (
+from app.agent.text2sql.function_calling.feedback import (
     build_tool_argument_error_message,
-    build_tool_policy_error_message,
+)
+from app.agent.text2sql.subgraphs.shaping.node import (
+    MaterialResultShapingSubgraph,
+    ResultShapingSubgraphResult,
+)
+from app.agent.text2sql.subgraphs.sql.models import MaterialSqlQueryPlan
+from app.agent.text2sql.subgraphs.sql.node import (
+    SqlQuerySubgraph,
+    SqlQuerySubgraphResult,
 )
 
 DEFAULT_MAX_GENERATION_COUNT = 6
 DEFAULT_MAX_TOOL_CALL_COUNT = 12
 PLANNING_TOOL_CHOICE: Literal["auto"] = "auto"
+PLANNING_REPEATED_THINK_GUIDANCE: Final[str] = (
+    "你已经连续进行了两轮查询规划思考。请先判断是否仍有新的、会改变下一步动作的"
+    "问题需要分析：如果有，请聚焦该问题继续思考；如果没有，请根据现有判断读取事实、"
+    "询问用户、查询原料、塑形、提交最终结果或说明无法继续的原因，避免重复已有结论。"
+)
 PLAN_REVIEW_APPROVAL_ANSWERS = frozenset(
     {"确认并继续", "确认", "继续", "是", "没问题", "yes", "y"}
 )
@@ -104,6 +145,14 @@ DataInspector = Callable[
 ]
 InspectionPageReader = Callable[
     [str], TableDataInspectionResponse | Awaitable[TableDataInspectionResponse]
+]
+MaterialQueryRunner = Callable[
+    [QueryMaterialDataArguments, list[TableSchemaToolResponse]],
+    SqlQuerySubgraphResult | Awaitable[SqlQuerySubgraphResult],
+]
+MaterialShapingRunner = Callable[
+    [ShapeMaterialDataArguments, SqlQuerySubgraphResult],
+    ResultShapingSubgraphResult | Awaitable[ResultShapingSubgraphResult],
 ]
 
 
@@ -364,8 +413,36 @@ def _validate_query_plan_contract(
     return tuple(issues)
 
 
+class PlanningFinalQueryResult(BaseModel):
+    """保存 Planning 最终选中的完整查询与塑形结果，供翻译层继续处理。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    material_result_id: str = Field(description="被选中原料查询结果的唯一 ID")
+    shaped_result_id: str = Field(description="被选中塑形结果的唯一 ID")
+    selection_reason: str = Field(description="模型确认该塑形结果满足用户需求的理由")
+    material_plan: MaterialQueryPlan = Field(
+        description="由最终查询参数和塑形指导重建的兼容审计计划"
+    )
+    sql_result: SqlQuerySubgraphResult = Field(
+        description="最终选中的完整 SQL 查询结果"
+    )
+    shaping_result: ResultShapingSubgraphResult = Field(
+        description="最终选中的完整塑形结果"
+    )
+
+    # 最终载荷只能引用成功的 SQL 与塑形结果，避免失败或半成品进入翻译层。
+    @model_validator(mode="after")
+    def validate_successful_results(self) -> "PlanningFinalQueryResult":
+        if self.sql_result.status != "success":
+            raise ValueError("最终查询结果必须来自成功的原料查询")
+        if self.shaping_result.status != "success":
+            raise ValueError("最终塑形结果必须来自成功的塑形调用")
+        return self
+
+
 class QueryPlanningAgentResult(BaseModel):
-    """一次查询规划产生的关键判断、结构读取结果和最终联合查询自然语言。"""
+    """一次查询规划产生的关键判断、事实读取结果和原料查询计划。"""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -383,11 +460,19 @@ class QueryPlanningAgentResult(BaseModel):
     user_interactions: list[UserInteraction] = Field(
         description="规划阶段通过交互出口完成的事实澄清和结果字段复核"
     )
+    material_plan: MaterialQueryPlan | None = Field(
+        default=None,
+        description="兼容审计使用的最终查询与塑形指导投影",
+    )
+    final_result: PlanningFinalQueryResult | None = Field(
+        default=None,
+        description="新运行时最终选中的完整查询与塑形结果",
+    )
     query_plan: NaturalLanguageQueryPlan | None = Field(
-        default=None, description="成功时只供 SQL 查询执行层消费的数据获取计划"
+        default=None, description="兼容历史运行结果的结构化查询计划；新规划不会再生成"
     )
     result_shape_plan: ResultShapePlan | None = Field(
-        default=None, description="成功时只供翻译后本地塑形层消费的确定性计划"
+        default=None, description="兼容历史运行结果的结构化塑形计划；新规划不会再生成"
     )
     query_request: str | None = Field(
         default=None, description="成功时可交给后续 SQL 执行器的联合查询自然语言"
@@ -398,25 +483,51 @@ class QueryPlanningAgentResult(BaseModel):
     tool_call_count: int = Field(description="本次规划实际处理的工具调用次数")
     max_tool_call_count: int = Field(description="本次规划允许的最大工具调用次数")
 
-    # 保证放弃终态没有可执行查询计划，防止下游 SQL 子图在业务无法继续时被意外调用。
+    # 区分新原料计划与历史双计划，保证每个成功结果只有一种规划协议。
     @model_validator(mode="after")
     def validate_terminal_payload(self) -> "QueryPlanningAgentResult":
         if self.status == "success":
-            if self.result_shape_plan is None and self.query_plan is not None:
+            if (
+                self.material_plan is None
+                and self.result_shape_plan is None
+                and self.query_plan is not None
+            ):
                 self.result_shape_plan = ResultShapePlan(
                     passthrough_fields=[
                         field.result_field for field in self.query_plan.select_fields
                     ]
                 )
-            if (
-                self.query_plan is None
-                or self.result_shape_plan is None
-                or self.query_request is None
-                or self.abandonment is not None
+            has_interactive_result = self.final_result is not None
+            has_material_plan = (
+                self.material_plan is not None and not has_interactive_result
+            )
+            has_legacy_plan = (
+                self.query_plan is not None and self.result_shape_plan is not None
+            )
+            if sum(
+                (has_interactive_result, has_material_plan, has_legacy_plan)
+            ) != 1:
+                raise ValueError("查询规划成功结果必须且只能包含一种查询计划")
+            if has_interactive_result:
+                assert self.final_result is not None
+                if self.material_plan is None:
+                    self.material_plan = self.final_result.material_plan
+                elif self.material_plan != self.final_result.material_plan:
+                    raise ValueError("顶层原料计划必须与最终选中结果一致")
+            if has_material_plan and (
+                self.query_plan is not None or self.result_shape_plan is not None
             ):
+                raise ValueError("原料查询计划不能同时包含历史双计划")
+            if has_interactive_result and (
+                self.query_plan is not None or self.result_shape_plan is not None
+            ):
+                raise ValueError("交互式最终结果不能同时包含历史双计划")
+            if self.query_request is None or self.abandonment is not None:
                 raise ValueError("查询规划成功结果必须且只能包含查询计划")
         elif (
             self.abandonment is None
+            or self.final_result is not None
+            or self.material_plan is not None
             or self.query_plan is not None
             or self.result_shape_plan is not None
             or self.query_request is not None
@@ -472,6 +583,8 @@ def _parse_nonterminal_tool_arguments(tool_name: str, arguments_json: str) -> An
             parse_clear_table_data_inspection_context_tool_arguments
         ),
         ASK_USER_TOOL_NAME: parse_ask_user_tool_arguments,
+        QUERY_MATERIAL_DATA_TOOL_NAME: parse_query_material_data_tool_arguments,
+        SHAPE_MATERIAL_DATA_TOOL_NAME: parse_shape_material_data_tool_arguments,
     }
     parser = parsers.get(tool_name)
     if parser is None:
@@ -664,16 +777,16 @@ def _remove_repaired_planning_context(
     return True
 
 
-# 判断本轮工具组合是否完成指定错误的修复，防止无关 think 清除终止工具错误上下文。
-def _matches_required_repair_tools(
+# 仅判断当前成功调用是否解决了原失败工具，用于清理上下文而不限制模型的工具选择。
+def _resolves_planning_repair_origin(
     tool_calls: list[Any],
-    required_tool_names: Counter[str] | None,
+    repair_origin_tool_names: Counter[str] | None,
 ) -> bool:
-    if required_tool_names is None:
+    if repair_origin_tool_names is None:
         return True
     return Counter(
         tool_call.function.name for tool_call in tool_calls
-    ) == required_tool_names
+    ) == repair_origin_tool_names
 
 
 # 按塑形计划解析最终可见表头，隐藏技术字段并把动态转列标题转换为用户可理解的范围。
@@ -727,32 +840,6 @@ def _render_bounded_result_labels(visible_labels: list[str]) -> str:
     return "、".join(retained_labels) + f"……（另有 {omitted_count} 个字段）"
 
 
-# 将已通过校验的双计划转换为短小的用户复核说明，只展示最终行粒度、可见字段和返回范围。
-def _build_query_plan_review_question(
-    query_plan: NaturalLanguageQueryPlan,
-    result_shape_plan: ResultShapePlan,
-) -> str:
-    field_text = _render_bounded_result_labels(
-        _build_visible_result_labels(query_plan, result_shape_plan)
-    )
-
-    row_granularity = result_shape_plan.result_row_granularity.strip()
-    if len(row_granularity) > 80:
-        row_granularity = row_granularity[:77] + "……"
-    result_scope = (
-        f"最多返回 {query_plan.pagination.limit} 行"
-        if query_plan.pagination.limit is not None
-        else "返回全部符合条件的数据"
-    )
-    return (
-        "查询方案已准备好。\n"
-        f"每行代表：{row_granularity}\n"
-        f"结果字段：{field_text}\n"
-        f"返回范围：{result_scope}\n"
-        "请选择‘确认并继续’或‘修正查询’。"
-    )
-
-
 # 判断规划复核答案是否为受支持的肯定表达，避免把快捷确认再次交给模型消耗生成次数。
 def _is_query_plan_review_approved(answer: str) -> bool:
     return answer.strip().lower() in PLAN_REVIEW_APPROVAL_ANSWERS
@@ -768,7 +855,7 @@ def _is_query_plan_revision_requested(answer: str) -> bool:
     return answer.strip().lower() in PLAN_REVIEW_REVISION_ANSWERS
 
 
-# 把用户的字段修改意见作为原终止工具的正常结果回传，使模型在完整原上下文中修订双计划。
+# 把用户的修改意见作为最终选择工具的正常结果回传，使模型按反馈重新查询或塑形。
 def _build_query_plan_revision_message(
     tool_call_id: str,
     review_question: str,
@@ -785,14 +872,186 @@ def _build_query_plan_revision_message(
                     "previous_result_preview": review_question,
                     "user_feedback": user_feedback,
                     "next_action": (
-                        "保留未被反馈否定的既有查询口径，根据用户反馈修订 query_plan "
-                        "和 result_shape_plan；必要时继续读取表结构或澄清事实，"
-                        "然后重新调用 execute_natural_language_query。"
+                        "保留未被反馈否定的查询口径。若反馈涉及筛选或缺少原料，重新调用 "
+                        "query_material_data；若仅涉及行列布局，使用合适的原料结果重新调用 "
+                        "shape_material_data。观察新结果后，再调用 submit_final_query_result。"
                     ),
                 },
             }
         ),
     }
+
+
+@dataclass(frozen=True, slots=True)
+class _MaterialResultEntry:
+    """关联一次成功原料查询的参数和后台完整 SQL 结果。"""
+
+    arguments: QueryMaterialDataArguments
+    sql_result: SqlQuerySubgraphResult
+
+
+@dataclass(frozen=True, slots=True)
+class _ShapedResultEntry:
+    """关联一次成功塑形的来源原料、指导和后台完整结果。"""
+
+    material_result_id: str
+    shaping_guidance: str
+    shaping_result: ResultShapingSubgraphResult
+
+
+# 为当前 Planning 会话创建不可猜测的结果引用，避免不同查询之间误用顺序编号。
+def _create_planning_result_id(prefix: str) -> str:
+    return f"{prefix}_{uuid4().hex}"
+
+
+# 将成功原料查询的真实表头和前五行渲染为模型可直接观察的 Markdown 表格。
+def _render_material_query_success(
+    material_result_id: str,
+    sql_result: SqlQuerySubgraphResult,
+) -> str:
+    preview = render_markdown_table_preview(
+        sql_result.result_columns,
+        sql_result.rows,
+    )
+    preview_count = min(
+        sql_result.returned_row_count,
+        MARKDOWN_PREVIEW_ROW_LIMIT,
+    )
+    return (
+        "【查询状态】成功\n\n"
+        f"- 原料结果 ID：`{material_result_id}`\n"
+        f"- 完整结果行数：{sql_result.returned_row_count}\n"
+        f"- 当前展示：前 {preview_count} 行\n"
+        f"- 是否达到查询上限：{'是' if sql_result.limit_reached else '否'}\n\n"
+        f"{preview}\n\n"
+        "完整结果未写入模型上下文。后续塑形必须使用上述原料结果 ID。"
+    )
+
+
+# 把 SQL 子图的安全错误摘要转换为 Planning 可修正下一轮调用的友好工具反馈。
+def _render_material_query_failure(sql_result: SqlQuerySubgraphResult) -> str:
+    if sql_result.retry_target == "query_planning":
+        repair_action = (
+            "根据错误补全或修正查询指导与所需表，再使用更精确的参数重新查询。"
+        )
+    elif sql_result.retry_target == "sql_generation":
+        repair_action = (
+            "保留正确业务口径，进一步明确必取字段、筛选和关联要求后重新查询。"
+        )
+    else:
+        repair_action = (
+            "该问题未必能通过修改业务指导解决；不要原样重试，必要时结束本次查询。"
+        )
+    return (
+        "【查询状态】失败\n\n"
+        f"- 错误代码：{sql_result.error_code or 'material_query_failed'}\n"
+        f"- 失败原因：{sql_result.error or '原料查询未产生可用结果。'}\n"
+        f"- 修正提示：{repair_action}\n\n"
+        "本次失败未生成原料结果 ID，不能进入塑形。"
+    )
+
+
+# 将原料工具调用前即可确定的业务域或运行配置错误转换为不会产生结果 ID 的反馈。
+def _render_material_query_request_failure(
+    reason: str,
+    repair_action: str,
+) -> str:
+    return (
+        "【查询状态】失败\n\n"
+        f"- 失败原因：{reason}\n"
+        f"- 修正提示：{repair_action}\n\n"
+        "本次失败未执行数据库查询，也未生成原料结果 ID。"
+    )
+
+
+# 将成功塑形后的中文表头和前五行渲染为模型可直接复核的 Markdown 表格。
+def _render_material_shaping_success(
+    shaped_result_id: str,
+    material_result_id: str,
+    shaping_result: ResultShapingSubgraphResult,
+) -> str:
+    headers = [column.label for column in shaping_result.columns]
+    column_keys = [column.key for column in shaping_result.columns]
+    preview = render_markdown_table_preview(
+        headers,
+        shaping_result.rows,
+        column_keys=column_keys,
+    )
+    preview_count = min(
+        shaping_result.result_row_count,
+        MARKDOWN_PREVIEW_ROW_LIMIT,
+    )
+    return (
+        "【塑形状态】成功\n\n"
+        f"- 塑形结果 ID：`{shaped_result_id}`\n"
+        f"- 来源原料结果 ID：`{material_result_id}`\n"
+        f"- 完整结果行数：{shaping_result.result_row_count}\n"
+        f"- 当前展示：前 {preview_count} 行\n\n"
+        f"{preview}\n\n"
+        "完整塑形结果未写入模型上下文。确认满足需求后可选择上述塑形结果 ID。"
+    )
+
+
+# 把塑形子图失败转换为可重试提示，并明确失败调用不会产生塑形结果引用。
+def _render_material_shaping_failure(
+    material_result_id: str,
+    shaping_result: ResultShapingSubgraphResult,
+) -> str:
+    return (
+        "【塑形状态】失败\n\n"
+        f"- 来源原料结果 ID：`{material_result_id}`\n"
+        f"- 失败原因：{shaping_result.error or '塑形工具未产生可用结果。'}\n"
+        "- 修正提示：若原料列完整，请更精确地说明最终行粒度、字段、分组、"
+        "排序和动态列后重新塑形；若反馈指出缺少原料，请重新查询。\n\n"
+        "本次失败未生成塑形结果 ID，不能提交为最终结果。"
+    )
+
+
+# 将无效原料引用或塑形运行配置错误转换为可定位且不会泄露完整数据的反馈。
+def _render_material_shaping_request_failure(
+    material_result_id: str,
+    reason: str,
+    repair_action: str,
+) -> str:
+    return (
+        "【塑形状态】失败\n\n"
+        f"- 来源原料结果 ID：`{material_result_id}`\n"
+        f"- 失败原因：{reason}\n"
+        f"- 修正提示：{repair_action}\n\n"
+        "本次失败未生成塑形结果 ID，不能提交为最终结果。"
+    )
+
+
+# 将无效最终结果引用作为终止工具的普通失败结果返回，使模型仍可选择真实成功结果。
+def _render_final_result_reference_failure(
+    shaped_result_id: str,
+    available_result_ids: list[str],
+) -> str:
+    available_text = (
+        "、".join(f"`{result_id}`" for result_id in available_result_ids)
+        if available_result_ids
+        else "当前还没有成功的塑形结果"
+    )
+    return (
+        "【最终选择状态】失败\n\n"
+        f"- 失败原因：塑形结果 ID `{shaped_result_id}` 不存在或并非本轮成功结果。\n"
+        f"- 当前可选结果：{available_text}\n"
+        "- 修正提示：只能提交本轮 shape_material_data 成功返回且已经观察过的结果 ID；"
+        "若没有可选结果，请先完成原料查询和塑形。"
+    )
+
+
+# 使用已经生成的真实塑形表头构造用户复核问题，不暴露 SQL 或内部模型轨迹。
+def _build_final_result_review_question(
+    shaping_result: ResultShapingSubgraphResult,
+) -> str:
+    labels = [column.label for column in shaping_result.columns]
+    return (
+        "最终查询表格已准备好。\n"
+        f"结果行数：{shaping_result.result_row_count}\n"
+        f"结果字段：{_render_bounded_result_labels(labels)}\n"
+        "请选择‘确认并继续’或‘修正查询’。"
+    )
 
 
 class DeepSeekQueryPlanningAgent:
@@ -808,8 +1067,11 @@ class DeepSeekQueryPlanningAgent:
         user_input_reader: UserInputReader = _raise_missing_user_interaction,
         plan_review_reader: UserInputReader | None = None,
         trace_writer: TraceWriter | None = None,
+        message_trace_queue: ModelMessageTraceQueue | None = None,
         data_inspector: DataInspector | None = None,
         inspection_page_reader: InspectionPageReader | None = None,
+        material_query_runner: MaterialQueryRunner | None = None,
+        material_shaping_runner: MaterialShapingRunner | None = None,
         progress_emitter: ProgressEmitter | None = None,
         max_tokens: int = DEFAULT_PLANNING_MAX_TOKENS,
         request_profile: str = "deepseek",
@@ -824,8 +1086,11 @@ class DeepSeekQueryPlanningAgent:
         self._user_input_reader = user_input_reader
         self._plan_review_reader = plan_review_reader or user_input_reader
         self._trace_writer = trace_writer
+        self._message_trace_queue = message_trace_queue
         self._data_inspector = data_inspector
         self._inspection_page_reader = inspection_page_reader
+        self._material_query_runner = material_query_runner
+        self._material_shaping_runner = material_shaping_runner
         self._progress_reporter = AgentProgressReporter(
             domain_profile,
             progress_emitter,
@@ -834,7 +1099,7 @@ class DeepSeekQueryPlanningAgent:
         self._request_profile = get_model_request_profile(request_profile)
         self._tool_tag_template = tool_tag_template
         self._close_client_after_run = close_client_after_run
-        self._base_prompt = build_base_planning_prompt(domain_profile)
+        self._base_prompt = build_query_planning_prompt(domain_profile)
 
         workflow = StateGraph(_QueryAgentState)
         workflow.add_node("run_tool_loop", self._run_tool_loop)
@@ -852,6 +1117,7 @@ class DeepSeekQueryPlanningAgent:
         user_input_reader: UserInputReader = _raise_missing_user_interaction,
         plan_review_reader: UserInputReader | None = None,
         trace_writer: TraceWriter | None = None,
+        message_trace_queue: ModelMessageTraceQueue | None = None,
         progress_emitter: ProgressEmitter | None = None,
     ) -> "DeepSeekQueryPlanningAgent":
         resolved_settings = settings or get_settings()
@@ -874,12 +1140,55 @@ class DeepSeekQueryPlanningAgent:
             domain_profile=domain_profile,
             schema_reader=schema_reader,
             trace_writer=trace_writer,
+            message_trace_queue=message_trace_queue,
             max_tokens=resolved_settings.deepseek_query_inspection_max_tokens,
             request_profile=connection.provider,
             tool_tag_template=load_tool_tag_template(
                 resolve_query_tool_tag_template_filename(resolved_settings)
             ),
         )
+
+        # 每次工具调用创建独立 SQL 子图，使其有限重试和客户端生命周期互不干扰。
+        async def run_material_query(
+            arguments: QueryMaterialDataArguments,
+            schema_results: list[TableSchemaToolResponse],
+        ) -> SqlQuerySubgraphResult:
+            sql_subgraph = SqlQuerySubgraph.from_settings(
+                domain_profile,
+                settings=resolved_settings,
+                schema_reader=schema_reader,
+                trace_writer=trace_writer,
+                message_trace_queue=message_trace_queue,
+                progress_emitter=progress_emitter,
+            )
+            return await sql_subgraph.run(
+                MaterialSqlQueryPlan(
+                    guidance=arguments.guidance,
+                    required_tables=arguments.required_tables,
+                ),
+                schema_results,
+                max_generation_count=(
+                    resolved_settings.agent_query_sql_max_generations
+                ),
+            )
+
+        # 每次工具调用创建独立塑形子图，并始终使用指定原料 ID 对应的完整查询结果。
+        async def run_material_shaping(
+            arguments: ShapeMaterialDataArguments,
+            sql_result: SqlQuerySubgraphResult,
+        ) -> ResultShapingSubgraphResult:
+            shaping_subgraph = MaterialResultShapingSubgraph.from_settings(
+                domain_profile,
+                settings=resolved_settings,
+                trace_writer=trace_writer,
+                message_trace_queue=message_trace_queue,
+            )
+            return await shaping_subgraph.run(
+                arguments.shaping_guidance,
+                sql_result.result_columns,
+                sql_result.rows,
+            )
+
         return cls(
             client=client,
             model=connection.model,
@@ -888,8 +1197,11 @@ class DeepSeekQueryPlanningAgent:
             user_input_reader=user_input_reader,
             plan_review_reader=plan_review_reader,
             trace_writer=trace_writer,
+            message_trace_queue=message_trace_queue,
             data_inspector=data_inspector.inspect,
             inspection_page_reader=data_inspector.get_next_page,
+            material_query_runner=run_material_query,
+            material_shaping_runner=run_material_shaping,
             progress_emitter=progress_emitter,
             max_tokens=resolved_settings.deepseek_query_planning_max_tokens,
             request_profile=connection.provider,
@@ -925,7 +1237,9 @@ class DeepSeekQueryPlanningAgent:
             build_next_table_data_inspection_page_tool_definition(),
             build_clear_table_data_inspection_context_tool_definition(),
             build_ask_user_tool_definition(),
-            build_natural_language_query_tool_definition(),
+            build_query_material_data_tool_definition(),
+            build_shape_material_data_tool_definition(),
+            build_submit_final_query_result_tool_definition(),
             build_abandon_query_planning_tool_definition(
                 self._domain_profile.query_scope
             ),
@@ -935,6 +1249,8 @@ class DeepSeekQueryPlanningAgent:
         data_inspections: list[TableDataInspectionResponse] = []
         user_interactions: list[UserInteraction] = []
         raw_responses: list[str] = []
+        material_results: dict[str, _MaterialResultEntry] = {}
+        shaped_results: dict[str, _ShapedResultEntry] = {}
         inspection_page_tool_call_ids_by_id: dict[str, dict[str, str]] = {}
         inspection_has_more_by_id: dict[str, bool] = {}
         cleared_inspection_tool_call_ids: set[str] = set()
@@ -944,19 +1260,31 @@ class DeepSeekQueryPlanningAgent:
         tool_call_count = 0
         generation_count = 0
         initial_think_completed = False
+        consecutive_think_count = 0
+        pending_system_guidance: dict[str, str] | None = None
         repair_context_start: int | None = None
-        required_repair_tool_names: Counter[str] | None = None
+        repair_origin_tool_names: Counter[str] | None = None
         while generation_count < max_generation_count:
             generation_count += 1
             generation_index = generation_count
             current_turn_start = len(messages)
-            response = await self._client.chat.completions.create(
+            response = await create_traced_chat_completion(
+                client=self._client,
+                message_queue=self._message_trace_queue,
+                node="planning",
                 model=self._model,
                 messages=messages,
                 tools=tools,
                 tool_choice=PLANNING_TOOL_CHOICE,
                 **self._request_profile.build_non_thinking_options(self._max_tokens),
             )
+            # 系统指导只作用于紧邻的一次模型请求，响应返回后立即移除以免污染长期上下文。
+            if pending_system_guidance is not None:
+                if messages[-1] is not pending_system_guidance:
+                    raise RuntimeError("系统指导消息上下文位置异常")
+                messages.pop()
+                current_turn_start -= 1
+                pending_system_guidance = None
             raw_responses.append(_serialize_raw_response(response))
             message = response.choices[0].message
             tool_calls = getattr(message, "tool_calls", None) or []
@@ -971,7 +1299,7 @@ class DeepSeekQueryPlanningAgent:
             if not tool_calls:
                 if repair_context_start is None:
                     repair_context_start = current_turn_start
-                    required_repair_tool_names = (
+                    repair_origin_tool_names = (
                         Counter({THINKING_TOOL_NAME: 1})
                         if not initial_think_completed
                         else None
@@ -979,7 +1307,7 @@ class DeepSeekQueryPlanningAgent:
                 feedback_message = _build_missing_planning_tool_call_feedback(
                     initial_think_completed,
                     self._tool_tag_template,
-                    required_repair_tool_names,
+                    None,
                 )
                 messages.extend((message, feedback_message))
                 self._write_trace(
@@ -1003,7 +1331,9 @@ class DeepSeekQueryPlanningAgent:
                 NEXT_TABLE_DATA_INSPECTION_PAGE_TOOL_NAME,
                 CLEAR_TABLE_DATA_INSPECTION_CONTEXT_TOOL_NAME,
                 ASK_USER_TOOL_NAME,
-                NATURAL_LANGUAGE_QUERY_TOOL_NAME,
+                QUERY_MATERIAL_DATA_TOOL_NAME,
+                SHAPE_MATERIAL_DATA_TOOL_NAME,
+                SUBMIT_FINAL_QUERY_RESULT_TOOL_NAME,
                 ABANDON_QUERY_PLANNING_TOOL_NAME,
             }
             tool_name_counts = Counter(
@@ -1014,29 +1344,14 @@ class DeepSeekQueryPlanningAgent:
                 for tool_call in tool_calls
                 if tool_call.function.name
                 in {
-                    NATURAL_LANGUAGE_QUERY_TOOL_NAME,
+                    SUBMIT_FINAL_QUERY_RESULT_TOOL_NAME,
                     ABANDON_QUERY_PLANNING_TOOL_NAME,
                 }
             ]
             protocol_error: tuple[str, str, str] | None = None
-            next_required_tools: Counter[str] | None = None
+            protocol_repair_origin: Counter[str] | None = None
             unknown_tool_names = sorted(set(tool_name_counts) - registered_tool_names)
-            if repair_context_start is not None and not _matches_required_repair_tools(
-                tool_calls,
-                required_repair_tool_names,
-            ):
-                expected_tools = (
-                    "、".join(required_repair_tool_names.elements())
-                    if required_repair_tool_names is not None
-                    else "一个当前状态允许的已注册工具"
-                )
-                protocol_error = (
-                    "planning_wrong_repair_tool",
-                    f"当前仍需修复此前失败的工具调用，本轮工具组合不是：{expected_tools}。",
-                    f"不要调用其他工具；按原错误反馈修正后调用：{expected_tools}。",
-                )
-                next_required_tools = required_repair_tool_names
-            elif unknown_tool_names:
+            if unknown_tool_names:
                 protocol_error = (
                     "planning_unknown_tool",
                     "本轮包含未注册工具：" + "、".join(unknown_tool_names) + "。",
@@ -1050,7 +1365,7 @@ class DeepSeekQueryPlanningAgent:
                     "首个有效工具调用必须且只能是一次 think，本轮调用未执行。",
                     "只调用 think，提交一条影响下一步工具选择的简短关键判断。",
                 )
-                next_required_tools = Counter({THINKING_TOOL_NAME: 1})
+                protocol_repair_origin = Counter({THINKING_TOOL_NAME: 1})
             elif terminal_tool_calls and len(tool_calls) != 1:
                 protocol_error = (
                     "planning_terminal_tool_must_be_single",
@@ -1058,7 +1373,7 @@ class DeepSeekQueryPlanningAgent:
                     "重新生成本轮响应，并且只调用一个所需的终止工具。",
                 )
                 if len(terminal_tool_calls) == 1:
-                    next_required_tools = Counter(
+                    protocol_repair_origin = Counter(
                         {terminal_tool_calls[0].function.name: 1}
                     )
             elif THINKING_TOOL_NAME in tool_name_counts and len(tool_calls) != 1:
@@ -1067,39 +1382,56 @@ class DeepSeekQueryPlanningAgent:
                     "think 必须单独调用，不能与事实查询或终止工具并行。",
                     "本轮只调用 think；收到结果后再调用下一项工具。",
                 )
-                next_required_tools = Counter({THINKING_TOOL_NAME: 1})
+                protocol_repair_origin = Counter({THINKING_TOOL_NAME: 1})
             elif ASK_USER_TOOL_NAME in tool_name_counts and len(tool_calls) != 1:
                 protocol_error = (
                     "planning_ask_user_must_be_single",
                     "ask_user 必须单独调用，不能在同一响应中执行其他工具。",
                     "本轮只调用 ask_user 提出一个明确问题。",
                 )
-                next_required_tools = Counter({ASK_USER_TOOL_NAME: 1})
+                protocol_repair_origin = Counter({ASK_USER_TOOL_NAME: 1})
+            elif (
+                QUERY_MATERIAL_DATA_TOOL_NAME in tool_name_counts
+                or SHAPE_MATERIAL_DATA_TOOL_NAME in tool_name_counts
+            ) and len(tool_calls) != 1:
+                protocol_error = (
+                    "planning_data_tool_must_be_single",
+                    "原料查询和塑形工具必须单独调用，不能与任何其他工具并行。",
+                    "重新生成本轮响应，并且只调用一个所需的数据处理工具。",
+                )
 
             if protocol_error is not None:
                 if repair_context_start is None:
                     repair_context_start = current_turn_start
-                    required_repair_tool_names = next_required_tools
+                    repair_origin_tool_names = protocol_repair_origin
+                protocol_failures: list[tuple[Any, dict[str, str]]] = []
                 for tool_call in tool_calls:
                     error_message = _build_planning_protocol_tool_error(
                         tool_call.id,
                         tool_call.function.name,
                         *protocol_error,
                     )
-                    messages.append(error_message)
+                    protocol_failures.append((tool_call, error_message))
                     self._write_trace(
                         "\n----- 查询规划工具协议校验结果 -----\n"
                         f"tool_call_id: {tool_call.id}\n"
                         f"tool_name: {tool_call.function.name}\n"
                         f"result: {error_message['content']}"
                     )
+                messages.extend(
+                    error_message for _, error_message in protocol_failures
+                )
                 continue
 
-            final_query_call = next(
+            # 任一协议合法的非 think 动作都会结束本段连续思考，后续重新从零计数。
+            if THINKING_TOOL_NAME not in tool_name_counts:
+                consecutive_think_count = 0
+
+            final_result_call = next(
                 (
                     tool_call
                     for tool_call in tool_calls
-                    if tool_call.function.name == NATURAL_LANGUAGE_QUERY_TOOL_NAME
+                    if tool_call.function.name == SUBMIT_FINAL_QUERY_RESULT_TOOL_NAME
                 ),
                 None,
             )
@@ -1107,7 +1439,7 @@ class DeepSeekQueryPlanningAgent:
             nonterminal_argument_errors: dict[str, ValidationError] = {}
             for tool_call in tool_calls:
                 if tool_call.function.name in {
-                    NATURAL_LANGUAGE_QUERY_TOOL_NAME,
+                    SUBMIT_FINAL_QUERY_RESULT_TOOL_NAME,
                     ABANDON_QUERY_PLANNING_TOOL_NAME,
                 }:
                     continue
@@ -1123,7 +1455,8 @@ class DeepSeekQueryPlanningAgent:
             if nonterminal_argument_errors:
                 if repair_context_start is None:
                     repair_context_start = current_turn_start
-                    required_repair_tool_names = tool_name_counts
+                    repair_origin_tool_names = tool_name_counts
+                argument_failures: list[tuple[Any, dict[str, str]]] = []
                 for tool_call in tool_calls:
                     validation_error = nonterminal_argument_errors.get(tool_call.id)
                     if validation_error is not None:
@@ -1140,18 +1473,21 @@ class DeepSeekQueryPlanningAgent:
                             "同一响应中的另一项工具参数不合法，因此本轮全部工具均未执行。",
                             "保留本轮原意，修正错误参数后重新提交完整工具组合。",
                         )
-                    messages.append(error_message)
+                    argument_failures.append((tool_call, error_message))
                     self._write_trace(
                         f"\n----- 第 {generation_index} 次模型调用的工具参数校验结果 -----\n"
                         f"tool_call_id: {tool_call.id}\n"
                         f"tool_name: {tool_call.function.name}\n"
                         f"result: {error_message['content']}"
                     )
+                messages.extend(
+                    error_message for _, error_message in argument_failures
+                )
                 continue
             for tool_call in tool_calls:
                 tool_name = tool_call.function.name
                 if tool_name in {
-                    NATURAL_LANGUAGE_QUERY_TOOL_NAME,
+                    SUBMIT_FINAL_QUERY_RESULT_TOOL_NAME,
                     ABANDON_QUERY_PLANNING_TOOL_NAME,
                 }:
                     continue
@@ -1161,6 +1497,7 @@ class DeepSeekQueryPlanningAgent:
                     thought = arguments
                     thoughts.append(thought)
                     initial_think_completed = True
+                    consecutive_think_count += 1
                     self._progress_reporter.reasoning_progress("planning")
                     tool_result = {
                         "status": "success",
@@ -1298,26 +1635,212 @@ class DeepSeekQueryPlanningAgent:
                     )
                     user_interactions.append(interaction)
                     tool_result = {"status": "success", "result": interaction.model_dump()}
+                elif tool_name == QUERY_MATERIAL_DATA_TOOL_NAME:
+                    unknown_tables = sorted(
+                        set(arguments.required_tables) - self._allowed_tables
+                    )
+                    duplicate_tables = len(arguments.required_tables) != len(
+                        set(arguments.required_tables)
+                    )
+                    if unknown_tables:
+                        tool_result = _render_material_query_request_failure(
+                            "所需数据表包含当前业务域不允许的表："
+                            + "、".join(unknown_tables),
+                            "删除这些表，并只使用当前业务域表概述中列出的真实表名。",
+                        )
+                    elif duplicate_tables:
+                        tool_result = _render_material_query_request_failure(
+                            "required_tables 中存在重复表名。",
+                            "删除重复项，并保留各表首次出现的依赖顺序。",
+                        )
+                    elif self._material_query_runner is None:
+                        tool_result = _render_material_query_request_failure(
+                            "当前运行未配置原料查询能力。",
+                            "这是运行配置问题，不能通过重复调用或修改查询口径解决；结束本次查询。",
+                        )
+                    else:
+                        self._progress_reporter.material_query_started()
+                        try:
+                            sql_result = await _resolve_maybe_awaitable(
+                                self._material_query_runner(arguments, schema_results)
+                            )
+                        except Exception as error:
+                            self._write_trace(
+                                "\n----- 原料查询工具内部异常 -----\n"
+                                f"exception_type: {type(error).__name__}\n"
+                                f"message: {str(error)[:500]}"
+                            )
+                            tool_result = _render_material_query_request_failure(
+                                "原料查询服务本轮未能完成执行。",
+                                "这是执行环境错误，不要原样重复调用；可稍后重试本次查询。",
+                            )
+                            self._progress_reporter.material_query_failed()
+                        else:
+                            if sql_result.status == "success":
+                                if (
+                                    sql_result.sql is None
+                                    or sql_result.analysis_sql is None
+                                    or not sql_result.result_columns
+                                    or sql_result.returned_row_count
+                                    != len(sql_result.rows)
+                                ):
+                                    tool_result = _render_material_query_request_failure(
+                                        "原料查询返回了不完整的内部结果结构。",
+                                        "这是执行器结果契约错误，不能通过修改查询指导解决；结束本次查询。",
+                                    )
+                                    self._progress_reporter.material_query_failed()
+                                else:
+                                    material_result_id = _create_planning_result_id(
+                                        "material"
+                                    )
+                                    material_results[material_result_id] = (
+                                        _MaterialResultEntry(
+                                            arguments=arguments,
+                                            sql_result=sql_result,
+                                        )
+                                    )
+                                    tool_result = _render_material_query_success(
+                                        material_result_id,
+                                        sql_result,
+                                    )
+                                    self._progress_reporter.material_query_completed(
+                                        sql_result.returned_row_count
+                                    )
+                            else:
+                                tool_result = _render_material_query_failure(sql_result)
+                                self._progress_reporter.material_query_failed()
+                elif tool_name == SHAPE_MATERIAL_DATA_TOOL_NAME:
+                    material_entry = material_results.get(
+                        arguments.material_result_id
+                    )
+                    if material_entry is None:
+                        available_ids = list(material_results)
+                        available_text = (
+                            "、".join(f"`{item}`" for item in available_ids)
+                            if available_ids
+                            else "当前还没有成功的原料结果"
+                        )
+                        tool_result = _render_material_shaping_request_failure(
+                            arguments.material_result_id,
+                            "指定的原料结果 ID 不存在或并非本轮成功结果。",
+                            "只能使用 query_material_data 成功返回的 ID。"
+                            f"当前可用结果：{available_text}。",
+                        )
+                    elif self._material_shaping_runner is None:
+                        tool_result = _render_material_shaping_request_failure(
+                            arguments.material_result_id,
+                            "当前运行未配置原料塑形能力。",
+                            "这是运行配置问题，不能通过修改塑形指导解决；结束本次查询。",
+                        )
+                    else:
+                        self._progress_reporter.material_shaping_started()
+                        try:
+                            shaping_result = await _resolve_maybe_awaitable(
+                                self._material_shaping_runner(
+                                    arguments,
+                                    material_entry.sql_result,
+                                )
+                            )
+                        except Exception as error:
+                            self._write_trace(
+                                "\n----- 原料塑形工具内部异常 -----\n"
+                                f"exception_type: {type(error).__name__}\n"
+                                f"message: {str(error)[:500]}"
+                            )
+                            tool_result = _render_material_shaping_request_failure(
+                                arguments.material_result_id,
+                                "原料塑形服务本轮未能完成执行。",
+                                "这是执行环境错误，不要原样重复调用；可稍后重试本次查询。",
+                            )
+                            self._progress_reporter.material_shaping_failed()
+                        else:
+                            if shaping_result.status == "success":
+                                if (
+                                    not shaping_result.columns
+                                    or shaping_result.source_row_count
+                                    != len(material_entry.sql_result.rows)
+                                    or shaping_result.result_row_count
+                                    != len(shaping_result.rows)
+                                ):
+                                    tool_result = (
+                                        _render_material_shaping_request_failure(
+                                            arguments.material_result_id,
+                                            "塑形工具返回了不完整的内部结果结构。",
+                                            "这是塑形器结果契约错误，不能通过修改布局指导解决；结束本次查询。",
+                                        )
+                                    )
+                                    self._progress_reporter.material_shaping_failed()
+                                else:
+                                    shaped_result_id = _create_planning_result_id(
+                                        "shaped"
+                                    )
+                                    shaped_results[shaped_result_id] = (
+                                        _ShapedResultEntry(
+                                            material_result_id=(
+                                                arguments.material_result_id
+                                            ),
+                                            shaping_guidance=(
+                                                arguments.shaping_guidance
+                                            ),
+                                            shaping_result=shaping_result,
+                                        )
+                                    )
+                                    tool_result = _render_material_shaping_success(
+                                        shaped_result_id,
+                                        arguments.material_result_id,
+                                        shaping_result,
+                                    )
+                                    self._progress_reporter.material_shaping_completed(
+                                        shaping_result.source_row_count,
+                                        shaping_result.result_row_count,
+                                    )
+                            else:
+                                tool_result = _render_material_shaping_failure(
+                                    arguments.material_result_id,
+                                    shaping_result,
+                                )
+                                self._progress_reporter.material_shaping_failed()
+                tool_content = (
+                    tool_result
+                    if isinstance(tool_result, str)
+                    else render_yaml_context(tool_result)
+                )
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": render_yaml_context(tool_result),
+                        "content": tool_content,
                     }
                 )
+                # 连续两次成功思考后，为下一轮临时追加温和的系统级动作指导。
+                if (
+                    tool_name == THINKING_TOOL_NAME
+                    and consecutive_think_count >= 2
+                ):
+                    pending_system_guidance = build_system_guidance_message(
+                        PLANNING_REPEATED_THINK_GUIDANCE
+                    )
+                    messages.append(pending_system_guidance)
                 self._write_trace(
                     f"\n----- 第 {generation_index} 次模型调用的工具执行结果 -----\n"
                     f"tool_call_id: {tool_call.id}\n"
                     f"tool_name: {tool_name}\n"
-                    f"result: {json.dumps(tool_result, ensure_ascii=False, indent=2)}"
+                    f"result: {tool_content}"
                 )
-            if not terminal_tool_calls and _remove_repaired_planning_context(
-                messages,
-                repair_context_start,
-                current_turn_start,
+            if (
+                not terminal_tool_calls
+                and _resolves_planning_repair_origin(
+                    tool_calls,
+                    repair_origin_tool_names,
+                )
+                and _remove_repaired_planning_context(
+                    messages,
+                    repair_context_start,
+                    current_turn_start,
+                )
             ):
                 repair_context_start = None
-                required_repair_tool_names = None
+                repair_origin_tool_names = None
                 self._write_trace(
                     "\n----- 查询规划修复上下文清理 -----\n"
                     "模型已修正协议或参数错误；此前无效调用及错误反馈已从后续上下文移除。"
@@ -1332,7 +1855,7 @@ class DeepSeekQueryPlanningAgent:
                     except ValidationError as error:
                         if repair_context_start is None:
                             repair_context_start = current_turn_start
-                            required_repair_tool_names = Counter(
+                            repair_origin_tool_names = Counter(
                                 {ABANDON_QUERY_PLANNING_TOOL_NAME: 1}
                             )
                         error_message = build_tool_argument_error_message(
@@ -1340,13 +1863,13 @@ class DeepSeekQueryPlanningAgent:
                             ABANDON_QUERY_PLANNING_TOOL_NAME,
                             error,
                         )
-                        messages.append(error_message)
                         self._write_trace(
                             "\n----- 查询规划终止工具参数校验结果 -----\n"
                             f"tool_call_id: {terminal_tool_call.id}\n"
                             f"tool_name: {ABANDON_QUERY_PLANNING_TOOL_NAME}\n"
                             f"result: {error_message['content']}"
                         )
+                        messages.append(error_message)
                         continue
                     _remove_repaired_planning_context(
                         messages,
@@ -1368,75 +1891,86 @@ class DeepSeekQueryPlanningAgent:
                             max_tool_call_count=max_tool_call_count,
                         )
                     }
-            if final_query_call is not None:
+            if final_result_call is not None:
                 try:
-                    query_arguments = parse_natural_language_query_tool_arguments(
-                        final_query_call.function.arguments
+                    final_selection = parse_submit_final_query_result_tool_arguments(
+                        final_result_call.function.arguments
                     )
                 except ValidationError as error:
                     if repair_context_start is None:
                         repair_context_start = current_turn_start
-                        required_repair_tool_names = Counter(
-                            {NATURAL_LANGUAGE_QUERY_TOOL_NAME: 1}
+                        repair_origin_tool_names = Counter(
+                            {SUBMIT_FINAL_QUERY_RESULT_TOOL_NAME: 1}
                         )
                     error_message = build_tool_argument_error_message(
-                        final_query_call.id,
-                        NATURAL_LANGUAGE_QUERY_TOOL_NAME,
+                        final_result_call.id,
+                        SUBMIT_FINAL_QUERY_RESULT_TOOL_NAME,
                         error,
                     )
-                    messages.append(error_message)
                     self._write_trace(
                         "\n----- 查询规划终止工具参数校验结果 -----\n"
-                        f"tool_call_id: {final_query_call.id}\n"
-                        f"tool_name: {NATURAL_LANGUAGE_QUERY_TOOL_NAME}\n"
+                        f"tool_call_id: {final_result_call.id}\n"
+                        f"tool_name: {SUBMIT_FINAL_QUERY_RESULT_TOOL_NAME}\n"
                         f"result: {error_message['content']}"
-                    )
-                    continue
-                policy_issues = (
-                    _validate_query_plan_contract(
-                        state["user_question"],
-                        query_arguments.query_plan,
-                        query_arguments.result_shape_plan,
-                    )
-                    + self._domain_profile.validate_query_plan(
-                        state["user_question"],
-                        query_arguments.query_plan,
-                        query_arguments.result_shape_plan,
-                    )
-                )
-                if policy_issues:
-                    if repair_context_start is None:
-                        repair_context_start = current_turn_start
-                        required_repair_tool_names = Counter(
-                            {NATURAL_LANGUAGE_QUERY_TOOL_NAME: 1}
-                        )
-                    error_message = build_tool_policy_error_message(
-                        final_query_call.id,
-                        NATURAL_LANGUAGE_QUERY_TOOL_NAME,
-                        policy_issues,
                     )
                     messages.append(error_message)
+                    continue
+
+                shaped_entry = shaped_results.get(final_selection.shaped_result_id)
+                if shaped_entry is None:
+                    reference_failure = _render_final_result_reference_failure(
+                        final_selection.shaped_result_id,
+                        list(shaped_results),
+                    )
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": final_result_call.id,
+                            "content": reference_failure,
+                        }
+                    )
                     self._write_trace(
-                        "\n----- 查询规划业务规则校验结果 -----\n"
-                        f"tool_call_id: {final_query_call.id}\n"
-                        f"tool_name: {NATURAL_LANGUAGE_QUERY_TOOL_NAME}\n"
-                        f"result: {error_message['content']}"
+                        "\n----- 查询规划最终结果引用校验 -----\n"
+                        f"tool_call_id: {final_result_call.id}\n"
+                        f"result: {reference_failure}"
                     )
                     continue
+
+                material_entry = material_results.get(
+                    shaped_entry.material_result_id
+                )
+                if material_entry is None:
+                    reference_failure = _render_final_result_reference_failure(
+                        final_selection.shaped_result_id,
+                        [],
+                    )
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": final_result_call.id,
+                            "content": reference_failure,
+                        }
+                    )
+                    self._write_trace(
+                        "\n----- 查询规划最终结果内部引用校验 -----\n"
+                        f"tool_call_id: {final_result_call.id}\n"
+                        "result: 塑形结果对应的原料缓存不存在"
+                    )
+                    continue
+
                 if _remove_repaired_planning_context(
                     messages,
                     repair_context_start,
                     current_turn_start,
                 ):
                     repair_context_start = None
-                    required_repair_tool_names = None
+                    repair_origin_tool_names = None
                     self._write_trace(
                         "\n----- 查询规划修复上下文清理 -----\n"
                         "终止工具已按错误反馈修正；此前无效调用及反馈已从上下文移除。"
                     )
-                review_question = _build_query_plan_review_question(
-                    query_arguments.query_plan,
-                    query_arguments.result_shape_plan,
+                review_question = _build_final_result_review_question(
+                    shaped_entry.shaping_result,
                 )
                 review_interaction = UserInteraction(
                     question=review_question,
@@ -1477,7 +2011,7 @@ class DeepSeekQueryPlanningAgent:
                         user_interactions.append(revision_interaction)
                         revision_feedback = revision_interaction.answer
                     revision_message = _build_query_plan_revision_message(
-                        final_query_call.id,
+                        final_result_call.id,
                         review_question,
                         revision_feedback,
                     )
@@ -1485,10 +2019,26 @@ class DeepSeekQueryPlanningAgent:
                     self._progress_reporter.plan_revision_started()
                     self._write_trace(
                         "\n----- 查询规划用户复核结果 -----\n"
-                        f"tool_call_id: {final_query_call.id}\n"
-                        "result: 用户要求修订已通过校验的查询方案"
+                        f"tool_call_id: {final_result_call.id}\n"
+                        "result: 用户要求修订已生成的最终表格"
                     )
                     continue
+
+                material_plan = MaterialQueryPlan(
+                    guidance=material_entry.arguments.guidance,
+                    required_tables=material_entry.arguments.required_tables,
+                    raw_material_shaping_guidance=(
+                        shaped_entry.shaping_guidance
+                    ),
+                )
+                final_result = PlanningFinalQueryResult(
+                    material_result_id=shaped_entry.material_result_id,
+                    shaped_result_id=final_selection.shaped_result_id,
+                    selection_reason=final_selection.reason,
+                    material_plan=material_plan,
+                    sql_result=material_entry.sql_result,
+                    shaping_result=shaped_entry.shaping_result,
+                )
                 return {
                     "result": QueryPlanningAgentResult(
                         status="success",
@@ -1496,12 +2046,9 @@ class DeepSeekQueryPlanningAgent:
                         schema_results=schema_results,
                         data_inspections=data_inspections,
                         user_interactions=user_interactions,
-                        query_plan=query_arguments.query_plan,
-                        result_shape_plan=query_arguments.result_shape_plan,
-                        query_request=render_natural_language_query_plan(
-                            query_arguments.query_plan,
-                            query_arguments.result_shape_plan,
-                        ),
+                        material_plan=material_plan,
+                        final_result=final_result,
+                        query_request=render_material_query_plan(material_plan),
                         raw_responses=raw_responses,
                         generation_count=generation_count,
                         max_generation_count=max_generation_count,

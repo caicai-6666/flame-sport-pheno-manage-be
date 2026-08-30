@@ -12,9 +12,10 @@ app/agent/
 └── text2sql/
 │   ├── domains/   # 业务域 Profile、词汇、规则、表概述和实体检索配置
 │   ├── events/    # 结构化进度模型、友好文案和 SSE 编码
+│   ├── function_calling/ # Function Calling Schema、参数解析与错误反馈算法
 │   ├── interaction/ # 会话状态、交互暂停恢复和事件订阅
-│   ├── shared/    # 模型选项、YAML 上下文、表结构读取缓存和共享工具
-│   ├── subgraphs/ # 对齐、规划、SQL、翻译、塑形和审计六个独立子图包
+│   ├── shared/    # 模型选项、工具标签、系统指导和 YAML 上下文
+│   ├── subgraphs/ # 对齐、规划、SQL、塑形、翻译和审计六个独立子图包
 │   ├── diagnostics.py
 │   ├── pipeline.py
 │   └── query_manager.py
@@ -24,12 +25,13 @@ app/agent/
 
 ```text
 HTTP router → application service → query manager → pipeline
-                                               ├── text2sql shared
+                                               ├── Function Calling 基础设施
+                                               ├── text2sql shared 上下文能力
                                                ├── selected subgraphs
                                                └── selected domain profile
 ```
 
-当前查询会话、SSE 事件、交互等待、诊断日志和后台任务管理都直接依赖 Text-to-SQL 流水线，因此与业务域、共享能力和六个子图一起收口于 `app/agent/text2sql/`。`app/agent/` 根目录只保留智能体类型的命名空间，后续新增其他智能体业务时应建立新的同级业务包，不得把其运行时混入 `text2sql/`。通用工具不导入运动业务包；业务域通过 `QueryDomainProfile` 注入允许表、资源路径、展示名称和禁止在对齐结果中泄漏的数据库标识符。
+当前查询会话、SSE 事件、交互等待、诊断日志和后台任务管理都直接依赖 Text-to-SQL 流水线，因此与业务域、稳定上下文能力和六个子图一起收口于 `app/agent/text2sql/`。`shared/` 只保留模型请求选项、工具标签模板、系统指导消息和 YAML 上下文；它不保存具体工具、表结构执行器或跨阶段塑形协议。`app/agent/` 根目录只保留智能体类型的命名空间，后续新增其他智能体业务时应建立新的同级业务包，不得把其运行时混入 `text2sql/`。业务域通过 `QueryDomainProfile` 注入允许表、资源路径、展示名称和禁止在对齐结果中泄漏的数据库标识符。
 
 ### 1.1 子图包契约
 
@@ -45,9 +47,9 @@ HTTP router → application service → query manager → pipeline
 └── __init__.py      # 装配并公开稳定的子图入口
 ```
 
-调用方必须从子图包的 `__init__.py` 导入子图运行类，不得从 `node.py` 拼装节点，也不得跨子图直接复用私有 Prompt。`pipeline.py` 只依赖六个子图包的公开入口。`prompt/` 可以按上下文职责继续拆分其他 Python 文件，但对外统一经由其 `__init__.py` 暴露。
+调用方必须从子图包的 `__init__.py` 导入子图运行类，不得从 `node.py` 拼装节点，也不得跨子图直接复用私有 Prompt。`pipeline.py` 通过公开入口编排对齐、Planning、翻译和审计；Planning 再通过自身工具调用 SQL 与塑形子图的公开入口。`prompt/` 可以按上下文职责继续拆分其他 Python 文件，但对外统一经由其 `__init__.py` 暴露。
 
-`tool.py` 是子图工具的公开边界。业务对齐、SQL、翻译和审计的终止工具由各自 `tool.py` 定义；规划子图的计划、表结构和单表检查协议由 `tool.py` 聚合，具体 Pydantic 模型可继续按工具规模拆分；确定性塑形子图不调用模型，因此显式声明空工具集合。跨子图都需要的 `ask_user`、`think`、Pydantic Schema、嵌套 JSON 参数兼容和参数错误反馈位于 `text2sql/shared/tools/`，由使用它们的子图 `tool.py` 重新组织，而不是复制实现。
+`tool.py` 是子图工具的公开边界。业务对齐、SQL、新原料塑形、翻译和审计的终止工具由各自 `tool.py` 定义；规划子图的 `ask_user`、`think`、计划、表结构和单表检查协议位于自身 `tools/`，再由 `tool.py` 聚合。表结构读取与进程缓存归规划工具所有，下游只复用该公开能力；动态列文本契约归塑形子图所有。跨子图复用的 Pydantic Schema 生成、嵌套 JSON 参数兼容和参数错误反馈只是 Function Calling 协议算法，位于 `text2sql/function_calling/`，不被定义成共享业务工具。历史结构化塑形兼容分支仍不调用模型。
 
 旧的 `app/agent/engine/`、`app/agent/runtime/`、`app/agent/tools/` 和 `app/agent/domains/` 已移除，不再提供兼容导入。应用代码、测试和实验脚本必须使用 `app.agent.text2sql` 下的公开入口，避免重新形成并行目录结构。
 
@@ -138,7 +140,7 @@ Profile 加载时会检查允许表非空且不重复、表标签完整、每张
 
 模型统一通过 OpenAI 兼容 SDK 调用。`AGENT_QUERY_MODEL_PROVIDER` 为整条查询流水线选择唯一供应商，所有子图必须共享对应的地址、密钥、模型和超时，禁止形成阶段间混用。业务对齐、查询规划、单表候选检索、SQL 生成、结果翻译和结果审计的工具用途与参数均由 Pydantic 类说明及 `Field.description` 生成标准 Function Calling JSON Schema，不启用供应商 strict 模式，模型返回参数继续由相同 Pydantic 模型在本地校验。全部阶段按供应商协议关闭隐藏思考，并分别设置 `max_tokens`。生成轮次和工具次数另由 `AGENT_QUERY_*` 配置限制。
 
-业务对齐层、查询规划层、单表候选检索、SQL 子图、结果翻译和结果审计使用 `AsyncOpenAI`、异步 LangGraph 节点和 `ainvoke`，公开 `run` 返回可等待结果。由 `from_settings` 创建的子图拥有对应 SDK 客户端，并在运行成功、失败或取消后关闭客户端连接池；调用方自行注入的客户端默认仍由调用方管理。表结构缓存未命中时通过工作线程桥接现有同步读取器，候选数据和最终 SQL 则直接使用异步 MySQL 驱动。`AgentQueryPipeline.run` 直接等待上述异步子图；不调用模型的确定性塑形仍通过 `asyncio.to_thread` 隔离同步计算。
+业务对齐层、查询规划层、单表候选检索、SQL 子图、新原料塑形、结果翻译和结果审计使用 `AsyncOpenAI`、异步 LangGraph 节点和 `ainvoke`，公开 `run` 返回可等待结果。由 `from_settings` 创建的子图拥有对应 SDK 客户端，并在运行成功、失败或取消后关闭客户端连接池；调用方自行注入的客户端默认仍由调用方管理。表结构缓存未命中时通过工作线程桥接现有同步读取器，候选数据和最终 SQL 则直接使用异步 MySQL 驱动。`AgentQueryPipeline.run` 直接等待上述异步子图；历史结构化塑形兼容分支继续通过 `asyncio.to_thread` 隔离同步计算。
 
 ### 3.1 全局模型供应商与工具标签模板
 
@@ -151,23 +153,24 @@ Profile 加载时会检查允许表非空且不重复、表标签完整、每张
 
 供应商选择同时决定连接信息和关闭思考的请求参数，但不自动决定模型的工具标签格式。vLLM 可以承载 DeepSeek、Qwen、Kimi 等不同模型，其工具解析器和 Chat Template 必须在服务端正确配置，并与 `VLLM_MODEL` 公开的模型标识一致。新增供应商时，在 `shared/model_options.py` 增加连接解析和独立 `ModelRequestProfile`，不得在各子图内重复判断供应商。
 
-`AGENT_QUERY_TOOL_TAG_TEMPLATE` 可以填写 `data/tool-tag/` 下的单个 `.txt` 文件名，是整条查询流水线的唯一模板配置源；业务对齐、查询规划、单表候选检索、SQL 生成、结果翻译和结果审计均复用该变量，不提供阶段专用覆盖配置。默认使用为 `deepseek-v4-flash` 提供的 `deepseek-v4.txt`，通过 vLLM 承载 Qwen3.6 时应改为 `qwen3.6.txt`，留空时不注入模板。模板只描述供应商标签语法，使用 `TOOL_NAME`、`PARAMETER_NAME` 和 `PARAMETER_VALUE` 等显式占位符，不得写入 `think`、`submit_sql_query` 等具体工具或任何业务内容；真实工具名和参数只以当轮 Function Calling Schema 为准。Qwen3.6 模板依据其[官方 `tokenizer_config.json`](https://huggingface.co/Qwen/Qwen3.6-27B/blob/main/tokenizer_config.json)使用 `<tool_call>`、`<function=...>` 和 `<parameter=...>` 标签，不得替换成 DeepSeek DSML 或早期 Qwen3 Hermes JSON 格式。运行时拒绝目录分隔符、非 `.txt` 文件、缺失文件、空文件及超过 `16000` 字符的内容，避免环境变量形成任意文件读取或无界 Prompt 注入。Docker 镜像会复制该受控目录。
+`AGENT_QUERY_TOOL_TAG_TEMPLATE` 可以填写 `data/tool-tag/` 下的单个 `.txt` 文件名，是整条查询流水线的唯一模板配置源；业务对齐、查询规划、单表候选检索、SQL 生成、结果塑形、结果翻译和结果审计均复用该变量，不提供阶段专用覆盖配置。默认使用为 `deepseek-v4-flash` 提供的 `deepseek-v4.txt`，通过 vLLM 承载 Qwen3.6 时应改为 `qwen3.6.txt`，留空时不注入模板。模板只描述供应商标签语法，使用 `TOOL_NAME`、`PARAMETER_NAME` 和 `PARAMETER_VALUE` 等显式占位符，不得写入 `think`、`submit_sql_query` 等具体工具或任何业务内容；真实工具名和参数只以当轮 Function Calling Schema 为准。Qwen3.6 模板依据其[官方 `tokenizer_config.json`](https://huggingface.co/Qwen/Qwen3.6-27B/blob/main/tokenizer_config.json)使用 `<tool_call>`、`<function=...>` 和 `<parameter=...>` 标签，不得替换成 DeepSeek DSML 或早期 Qwen3 Hermes JSON 格式。运行时拒绝目录分隔符、非 `.txt` 文件、缺失文件、空文件及超过 `16000` 字符的内容，避免环境变量形成任意文件读取或无界 Prompt 注入。Docker 镜像会复制该受控目录。
 
 工具标签模板会作为稳定格式提醒追加在原始用户任务末尾。模型返回普通文本、没有形成 OpenAI `tool_calls` 时，同一模板还会随精确协议错误再次加入紧邻重试上下文，明确要求使用标签结构而非正文模拟工具调用。模型修正后，运行时移除无效响应和临时错误反馈，但保留原始任务中的常驻提醒；参数 Schema 错误仍使用精确字段反馈，不重复增加模板。模板必须与实际模型版本以及 vLLM 的 `--tool-call-parser`、`--chat-template` 配置一致，不能仅根据 `deepseek` 或 `vllm` 请求体系自动猜测。
 
 | 阶段 | 主要输出 | 工具策略 |
 | --- | --- | --- |
 | 业务对齐 | 标准业务需求或放弃理由 | Pydantic 标准工具 Schema；API 使用 `tool_choice=auto`，Prompt 要求每轮唯一工具调用且首轮使用 `think` |
-| 查询规划 | 独立 SQL 数据获取计划、结果塑形计划或放弃理由 | Pydantic 标准工具 Schema；API 使用 `tool_choice=auto`，程序校验首轮 `think`、工具组合和修复顺序 |
+| 查询规划 | 最终塑形结果选择或放弃理由 | Pydantic 标准工具 Schema；API 使用 `tool_choice=auto`，程序校验首轮 `think`、查询与塑形工具参数、结果 ID 归属、最终提交和修复顺序 |
 | 单表候选 | 一条单表 SELECT | Pydantic 标准工具 Schema；API 使用 `tool_choice=auto`，程序要求唯一 `execute_single_table_select` |
-| SQL 生成 | 参数化 SQL 草稿 | Pydantic 标准工具 Schema；API 使用 `tool_choice=auto`，程序要求唯一 `submit_sql_query` 并按错误阶段清理上下文 |
+| SQL 生成 | 参数化 SQL 草稿 | 只接收二字段 `MaterialSqlQueryPlan`；Pydantic 标准工具 Schema；API 使用 `tool_choice=auto`，程序要求唯一 `submit_sql_query` 并按错误阶段清理上下文 |
+| 结果塑形计划 | 透传或动态转列布局 | 只接收塑形指导、SQL 输出列与前五行；Pydantic 标准工具 Schema；API 使用 `tool_choice=auto`，程序要求唯一 `submit_material_shape_plan` |
 | 翻译目标识别 | 待翻译结果列及直接来源 | Pydantic 标准工具 Schema；API 使用 `tool_choice=auto`，程序要求唯一 `submit_translation_targets` |
 | 注释映射提取 | 单字段原始值与展示值映射 | Pydantic 标准工具 Schema；每字段独立使用 `tool_choice=auto`，程序要求唯一 `submit_translation_rules` |
 | 结果审计 | 相关性、表格说明和统计摘要 | Pydantic 标准工具 Schema；API 使用 `tool_choice=auto`，程序要求唯一 `submit_query_result_audit` 并有限修复 |
 
-所有工具参数先由 Pydantic 校验。Schema 违规和业务校验失败以带原 `tool_call_id` 的正常工具结果加入模型上下文，反馈会指出错误字段、错误原因和唯一修复动作。查询规划终止工具不再使用独立的固定修复次数；每次可修复失败都继续占用统一的规划生成次数和工具调用次数，直到生成合法计划或达到 `AGENT_QUERY_PLANNING_MAX_GENERATIONS`、`AGENT_QUERY_PLANNING_MAX_TOOL_CALLS`，避免部署配置允许继续生成时被隐藏的小上限提前终止。当前默认分别为 30 次模型生成和 60 次工具调用；后者包含并行表结构读取、思考和终止工具重提，不能按付费模型生成次数理解。
+所有工具参数先由 Pydantic 校验。Schema 违规和业务校验失败以带原 `tool_call_id` 的正常工具结果加入模型上下文，反馈会指出错误字段、错误原因和修复动作。查询规划工具失败后仍向模型提供完整工具集并保持 `tool_choice=auto`，不再由状态机强制下一轮必须重提原工具；模型可以先思考、补查结构或澄清事实，再提交修正调用。`think.reason` 最多 `350` 个字符，用于记录已确认事实、仍需判断的问题和倾向的下一步动作；存在新的判断点时可以连续思考，但不得重复已有结论。连续两次成功调用 `think` 后，运行时通过共享 `system_guidance` 消息向紧邻请求临时提示模型判断是否应采取实际动作；请求返回后立即删除该消息，任一协议合法的非 `think` 调用都会重置计数。查询规划终止工具不再使用独立的固定修复次数；每次可修复失败及其后续辅助步骤都继续占用统一的规划生成次数和工具调用次数，直到成功调用 `submit_final_query_result`、主动放弃或达到 `AGENT_QUERY_PLANNING_MAX_GENERATIONS`、`AGENT_QUERY_PLANNING_MAX_TOOL_CALLS`，避免部署配置允许继续生成时被隐藏的小上限提前终止。当前默认分别为 30 次模型生成和 60 次工具调用；后者包含并行表结构读取、思考、原料查询、塑形和终止工具重提，不能按付费模型生成次数理解。
 
-业务对齐、规划、单表候选、SQL、翻译和审计工具都优先按原始 Pydantic Schema 严格校验。若参数因 OpenAI 兼容工具解析器二次序列化而校验失败，兼容层会递归遍历外层参数字典和数组，只尝试还原以 `{` 或 `[` 开头且确实可解析的嵌套 JSON 字符串，然后重新执行完整 Pydantic 校验。首次校验已经成功时不会进入兼容转换，因此内容恰好是合法 JSON 的正常字符串字段仍保持原值；非法 JSON、额外字段和嵌套类型错误也不会被兼容接受。
+业务对齐、规划、单表候选、SQL、塑形、翻译和审计工具都优先按原始 Pydantic Schema 严格校验。若参数因 OpenAI 兼容工具解析器二次序列化而校验失败，兼容层会递归遍历外层参数字典和数组，只尝试还原以 `{` 或 `[` 开头且确实可解析的嵌套 JSON 字符串，然后重新执行完整 Pydantic 校验。首次校验已经成功时不会进入兼容转换，因此内容恰好是合法 JSON 的正常字符串字段仍保持原值；非法 JSON、额外字段和嵌套类型错误也不会被兼容接受。
 
 业务对齐层在 `tool_choice=auto` 下由程序校验工具顺序和唯一性：首个有效调用必须是唯一的 `think`，后续每轮也只能调用一个已注册工具。配置的工具标签会从首轮开始随任务常驻；未调用工具、首轮工具错误、同轮多工具或未知工具不会立即终止，而会作为可重试协议反馈进入紧邻的下一轮上下文，其中无 `tool_calls` 的反馈会再次强调工具标签格式。模型完成修正后，运行时会从后续模型上下文中同时移除无效 assistant 响应及其临时错误反馈，避免已解决错误持续影响工具选择；内部诊断轨迹仍保留错误和修正过程，便于排障审计。
 
@@ -179,11 +182,11 @@ SQL 修复上下文按失败阶段维护。工具协议或 Pydantic 参数错误
 
 结果审计也在 `tool_choice=auto` 下要求唯一 `submit_query_result_audit`。普通文本、多工具、错误工具、输出截断和参数 Schema 错误分别返回稳定错误码；参数错误使用原调用 ID 的 `tool` 结果，缺少工具时使用带通用 tool-tag 的协议反馈，临时 API 请求失败使用不包含内部连接信息的独立反馈。每类错误最多修复或重试一次，失败后仍保留程序生成的完整表格和统计事实。审计子图通过异步 SDK 和 `ainvoke` 运行，不重新执行 SQL，也不重新统计完整结果。
 
-部分兼容接口会把本应为对象或数组的工具参数二次编码为 JSON 字符串。规划入口只在首次 Pydantic 校验失败后递归解开可验证的嵌套 JSON，随后仍执行完全相同的 Pydantic、查询块和业务域校验；无效 JSON、错误嵌套类型和额外字段不会被容错接受。终止工具收到可修复失败后，状态机要求下一轮直接重提同一工具，无关 `think` 不会被执行，也不会消耗一次有效修复机会。
+部分兼容接口会把本应为对象或数组的工具参数二次编码为 JSON 字符串。规划入口只在首次 Pydantic 校验失败后递归解开可验证的嵌套 JSON，随后仍执行完全相同的 Pydantic、工具参数和业务域校验；无效 JSON、错误嵌套类型和额外字段不会被容错接受。工具收到可修复失败后，错误结果继续保留在模型上下文中，模型可以根据反馈补充更详细、更精确的信息后重新选择合法动作。
 
-SQL 层把查询块声明的 `aliases` 视为整个块作用域的角色集合，外层 SELECT 与块内相关子查询都必须精确复用，不能临时增加第二套成员别名。规划层因此会先拒绝把相关量词成员表同时放入资格块外层关联的方案，使 SQL 生成器无需在计划外创造别名，也避免主体资格 CTE 因成员展开产生重复行。
+SQL 层只消费 `query_material_data` 提交的 `guidance` 和 `required_tables`。Planning 必须在指导中明确主体资格、明细重关联范围和所需稳定标识；SQL 生成器可以选择 JOIN、CTE 或相关子查询实现，但不能扩大声明的基础表集合，也不能把资格条件推迟给塑形。
 
-业务域校验器同时读取 SQL 数据获取计划与结果塑形计划，以便校验跨计划的展示契约。运动域会根据根查询块粒度而不是用户是否提到图片识别逐条凭证结果，强制 `proof_record.id AS proof_record_id` 使用“凭证记录 ID”表头，并在 `passthrough` 结果中保持可见；因此模型自选的 `proof_id`、“凭证唯一标识”或隐藏技术列不能进入 SQL 阶段。
+跨查询与塑形的展示契约由 Planning 在两次工具调用之间维护。运动域的逐条凭证结果必须在查询指导中要求 `proof_record.id AS proof_record_id` 和“凭证记录 ID”表头，并在塑形结果中保持可见；Planning 观察真实表头后才能决定继续塑形或修正查询。
 
 ---
 
@@ -195,7 +198,7 @@ SQL 层把查询块声明的 `aliases` 视为整个块作用域的角色集合�
 
 - `tables.table` 表示真实表名，`row_grain` 表示一行的业务含义；
 - `columns.field_name`、`data_type`、`foreign_key` 和 `comment` 分别表示字段名、数据库类型、外键目标和数据库字段注释；
-- `query_plan` 表示只供 SQL 层读取的查询块图，包含根块标识、拓扑有序查询块、块内量化条件、带作用域的核心规则引用和稳定输出列；`result_shape_plan` 表示翻译后本地程序使用的塑形计划；SQL 模型的动态上下文只包含前者和 `allowed_table_schemas`；
+- `query_material_data` 的 `guidance` 表示 SQL 必须落实的筛选、资格和必取原料，`required_tables` 是基础表精确范围；运行时将二者投影为 `MaterialSqlQueryPlan`，该类型禁止携带额外字段。塑形要求不进入 SQL 子图，而是由 `shape_material_data` 以独立 `shaping_guidance` 提交；
 - `rows_preview` 只是受限样本，`statistics` 才是基于完整结果计算的统计事实。
 
 中文说明位于固定系统前缀，不在每次动态 YAML 中重复插入 `#` 行内注释。这样既保证字段语义明确，也避免注释与事实值混杂，并保持可复用的前缀缓存。动态内容仍必须能被 `yaml.safe_load` 解析；读取后还要由对应 Pydantic 模型或本地业务校验确认具体结构。
@@ -240,19 +243,14 @@ columns:
 最终 SQL 使用 SQLGlot 解析 MySQL AST，并在执行前验证：
 
 1. 只有单条 SELECT 或最终为 SELECT 的 CTE 查询。
-2. 基础表集合与规划层声明完全一致，且全部属于业务域白名单。
+2. 基础表集合与 `query_material_data.required_tables` 声明完全一致，且全部属于业务域白名单。
 3. 禁止注释、分号、多语句、通配字段、锁、`SELECT INTO`、数据库限定名和高风险函数。
 4. WHERE、HAVING、JOIN 和嵌套量词子查询条件中的筛选标量必须使用命名占位符；只有 `EXISTS` 投影的 `SELECT 1` 与规划允许的分页整数例外，参数集合必须精确匹配。
-5. 每个非根 `query_block` 必须对应一个同名 CTE，根块必须对应最外层 SELECT；不得增删或重命名块。
-6. 每块实际读取的真实表和前置 CTE、输出表达式与别名、`GROUP BY`、`WHERE` 和 `HAVING` 必须与该块计划一致。FROM 起点、JOIN 顺序/右侧/类型/完整 ON 及普通 `SELECT DISTINCT` 则分别与 `base_source`、`joins`、`deduplication` 精确对应，不能换保留侧、拆分 ON 或自行去重；别名还必须映射到计划声明的真实来源表。
-7. 每个规划返回字段必须声明稳定 `result_field`；SQL 必须使用同名 `AS` 别名，输出列名必须唯一，并与 `result_columns` 及规划顺序一致。
-8. `LIMIT` 和 `OFFSET` 必须精确服从规划结果；系统不会私自追加隐藏上限。
+5. 计划中显式写出的真实 `table.field` 必须存在于对应结构，并被 SQL 实际引用；不存在的字段返回规划层修正，遗漏字段在 SQL 预算内重试。
+6. 最外层输出列必须具有唯一、稳定的 `snake_case` 名称，并与 `result_columns` 的名称和顺序完全一致。
+7. `LIMIT`、`OFFSET` 只能使用非负整数；只有原料计划明确要求前 N、最近 N 或其他结果上限时才允许生成，系统不会追加隐藏上限。
 
-规划终态在 SQL 生成前还会校验查询块图是无环且拓扑有序的，根块位于最后，所有非根块均能从根块到达，块内普通字段只引用外层关系链，量词成员条件只引用其集合关系。每块的 `base_source` 必须可直接引用，JOIN 条件只能引用已进入左侧的数据源和当前 `right_source`；一对多/多对多关联若不把右侧键纳入行粒度，必须明确按左侧字段 `distinct` 去重或拆块。分组键必须与块粒度键一致；分组块不能直接选择未聚合明细字段。数量型量词的 `subject_key`、`grain_fields` 和 `group_by` 必须一致，其运算符、数量和单一 `member_key` 由量词唯一定义；`all/any/none` 通过 `collection_base_source` 与 `collection_joins` 唯一定义内部关系，`all/none` 再通过 `require_non_empty` 明确空集口径。核心规则和面向人的业务口径必须引用带查询块作用域的实际组件，`assumptions` 必须为空；完整导出的 `limit` 为 `null`；`all`、`none` 的成员谓词不能被同块普通筛选提前删除；`pivot` 使用最终行主体真实 ID 作为分组键。
-
-运动业务域在进入通用计划校验前规范化固定项目数量语义：“赛季要求锁定 N 项且全部完成”只把 `N` 作为赛季配置筛选，不生成重复的 `exactly` 量词；全部完成必须使用 `not_exists` 反例排除，并且其资格块不能再声明 `GROUP BY`、聚合或 `HAVING`。真正独立的“恰好完成 N 项”仍使用数量量词和聚合，不受该规则影响。
-
-SQL AST 先建立 `block_id -> SELECT` 映射，再在所属块内核对真实表、前置块、输出字段、分组和条件作用域。每个非根 CTE 必须直接承载一条 SELECT，不能用集合运算追加分支或用内部分页截断资格集合；所有查询块还采用 SELECT 子句白名单，拒绝 `QUALIFY` 等未进入计划的隐式筛选。`EXISTS`、`NOT EXISTS` 量词要求 `SELECT 1`、内部 FROM、有序 JOIN、成员条件或反条件、全部 `collection_filters` 和跨越子查询作用域的 `correlation_condition` 同时位于正确极性的子查询中；`require_non_empty=true` 还要求一个使用同一内部关系、关联与集合范围的正向 `EXISTS`。数量型量词的条件去重计数、比较符和数量作为一个完整 HAVING AST 核对，不只检查其中是否“出现过”某个谓词。未声明角色别名时必须使用真实表或 CTE 名；计划显式声明角色别名后会进一步核对 `alias -> source_table` 映射，避免同一真实表的多个角色被错误折叠或来源被交换。分组汇总修饰、`DISTINCT ON`、非默认 NULL 排序和表数据范围修饰都会被拒绝。十进制数值比较会归一化，比较运算符方向错误仍会被拒绝。
+SQL 模型可以根据原料计划选择 JOIN、CTE、相关子查询、分组或聚合，静态校验不再恢复旧查询块图并逐 JOIN 比对。集合资格必须在 `guidance` 中说明“如何确定合格主体”以及是否重新关联明细；资格范围与最终明细范围不同的场景还必须保留最窄作用域稳定标识，防止只按全局用户 ID 重新关联到其他赛季数据。
 
 静态校验或数据库执行发现可修复错误时，运行时会使用原 `submit_sql_query` 的 `tool_call_id` 把错误类型、准确原因和唯一修复动作作为正常工具结果追加到当前 SQL 消息上下文。后续生成因此保留本次查询的短期修复记忆，并在 SQL 生成预算内重试；校验通过后，命名参数才编译为 asyncmy 参数绑定，在 `START TRANSACTION READ ONLY` 中执行，超时为 `10` 秒，最终始终回滚并关闭连接。连接、权限和超时错误直接交由系统处理，不要求模型改写 SQL。
 
@@ -262,24 +260,23 @@ SQL AST 先建立 `block_id -> SELECT` 映射，再在所属块内核对真实�
 
 ---
 
-## 7. 结果翻译、塑形与数据暴露
+## 7. 结果塑形、翻译与数据暴露
 
-SQL 成功后先运行独立 `ResultTranslationSubgraph`：
+Planning 调用 `query_material_data` 成功后，运行时为完整 `SqlQuerySubgraphResult` 分配仅本轮有效的原料结果 ID 并保存在后台缓存；模型只看到结果 ID、完整行数、真实表头和前 `5` 行预览。Planning 随后可以用该 ID 调用 `shape_material_data`，由工具查出完整原料结果并运行 `MaterialResultShapingSubgraph`：
 
-1. 节点 1 根据保留命名占位符的已校验 SQL、直接列来源、无注释表结构和前 `5` 行识别状态、审核状态、类型、启停标记或布尔编码。ID、名称、日期、数值度量、聚合和已由 SQL 表达式转换的列不会进入翻译。
+1. 节点 1 只读取 `shaping_guidance`、准确 SQL 输出列和前 `5` 行原始样本，通过 `submit_material_shape_plan` 把布局指导编译为 `passthrough` 或 `pivot`。它不读取 SQL、表结构、查询条件或完整结果。
+2. 程序验证计划只能引用真实输出列，且不能表达筛选器、聚合函数、计算列或常量列。协议、Schema 或字段引用错误最多修复一次。
+3. 节点 2 对完整 SQL 原始结果确定性执行布局；逐行透传不会改值，动态转列按稳定主体键分组并按原料排序。发生同组值冲突、动态列键冲突或明确列数溢出时，返回失败且不产生部分表格。
+
+塑形成功后，运行时同样只向 Planning 返回本轮塑形结果 ID、来源原料结果 ID、完整行数、真实表头和前 `5` 行预览，完整 `ResultShapingSubgraphResult` 的结果行留在后台缓存。失败的查询或塑形调用只返回可修复的友好反馈，不分配结果 ID。Planning 通过 `submit_final_query_result` 提交已成功观察的塑形结果 ID 后，系统先让操作员复核最终行数与表头；确认后主 Pipeline 才取出对应完整 SQL 与塑形结果，直接运行独立 `ResultTranslationSubgraph`，修正意见则返回 Planning 继续迭代：
+
+1. 节点 1 将塑形列来源与保留命名占位符的已校验 SQL 血缘组合，再根据无注释表结构和前 `5` 行最终样本识别状态、审核状态、类型、启停标记或布尔编码。ID、名称、日期、数值度量、聚合和已由 SQL 表达式转换的列不会进入翻译。
 2. 节点 2 为每个目标字段分别构造只含一个 `comment` 的 YAML 上下文，以 `AGENT_QUERY_TRANSLATION_MAX_PARALLEL_FIELDS` 限制并发。不同字段共享固定系统前缀以利用前缀缓存，但彼此不能读取其他字段注释。
-3. 节点 3 由本地程序把经过校验的映射应用到完整结果。模型映射中的原始值和展示值都必须能在该字段原始 `comment` 中找到；未知值和非目标字段保持原样。
+3. 节点 3 由本地程序把经过校验的映射应用到完整塑形结果。模型映射中的原始值和展示值都必须能在该字段原始 `comment` 中找到；未知值和非目标字段保持原样。
 
-翻译层保留 SQL 原始行，并另外生成翻译行。模型、工具协议或结构读取失败时，子图返回失败状态和原始行副本，Pipeline 继续进行结果塑形，不因展示增强失败丢弃已经成功读取的数据。空结果不调用翻译模型。
+翻译层保留塑形前的 SQL 原始行和塑形后的原始值，并另外生成翻译行。模型、工具协议或结构读取失败时，子图返回失败状态和塑形行副本，Pipeline 继续生成表格，不因展示增强失败丢弃已经成功读取并整理的数据。空结果不调用翻译模型。
 
-翻译完成后运行不调用模型的 `ResultShapingSubgraph`。规划层已同时提交但未传给 SQL 层的 `result_shape_plan` 在此生效：
-
-- `passthrough` 按 `passthrough_fields` 顺序保留稳定结果列；
-- `pivot` 按包含主体真实 ID 的 `group_fields` 聚合同一主体，使用 `pivot_order_field` 稳定排序，并把 `pivot_value_field` 依次写入由 `column_key_prefix` 和 `column_label_pattern` 生成的动态列；
-- `hidden_fields` 只参与分组或排序，不进入最终表格；
-- 塑形所需字段必须全部来自根查询块 `select_fields[].result_field`，塑形层不能增加筛选、聚合或业务计算。
-
-同组透传字段冲突、引用列缺失或动态列超过已声明数量时，塑形子图明确失败，不返回部分表格。
+历史 `NaturalLanguageQueryPlan + ResultShapePlan` 的模型和确定性塑形器仅为旧结果解析及独立回归测试保留；生产 Pipeline 只接受新 Planning 已选中的 `final_result`，不会重新执行历史双计划。
 
 程序根据塑形后的实际结果列生成表头和完整 JSON 安全行，依据完整结果计算：
 
@@ -287,7 +284,7 @@ SQL 成功后先运行独立 `ResultTranslationSubgraph`：
 - 低基数字符串、布尔或状态字段的类别分布；
 - 排除 ID 和类别编码后的业务数值最小值与最大值。
 
-审计模型只接收原问题、对齐结果、查询计划、程序统计和前 `5` 行结果样本。它不能重新统计样本或推断未展示行。HTTP 响应可以返回完整表格，因此前端仍需评估大结果的分页、下载或虚拟滚动策略。
+审计模型只接收原问题、对齐结果、Planning 最终选择的来源信息、程序统计和前 `5` 行结果样本。它不能重新统计样本或推断未展示行。HTTP 响应可以返回完整表格，因此前端仍需评估大结果的分页、下载或虚拟滚动策略。
 
 ---
 
@@ -305,9 +302,9 @@ SQL 成功后先运行独立 `ResultTranslationSubgraph`：
 
 相关配置分为模型连接、各阶段单次输出预算、翻译字段并发、生成与工具次数、活动会话、事件历史、会话保留、SSE 心跳和诊断日志。完整变量见 [FastAPI 应用结构与基础连接](application-structure.md)。
 
-自动化测试应替换模型与数据库，不依赖真实外部服务。受控联调只允许连接开发数据库并执行只读问题；日志和测试产物不得包含密钥、密码、未校验 SQL 草稿、SQL 参数值、结果行、完整个人数据或模型原始响应。
+自动化测试应替换模型与数据库，不依赖真实外部服务。受控联调只允许连接开发数据库并执行只读问题。常规日志和测试产物不得包含密钥、密码、未校验 SQL 草稿、SQL 参数值、结果行、完整个人数据或模型原始响应；仅显式启用的 `trace` 诊断日志可以按下述受控边界记录模型消息。
 
-终态会话不会长期保存 SQL、工具参数、表结构、结果行副本或模型原文。SQL 阶段失败时只保留 `failure_stage`、稳定错误码、重试归属和已用/最大生成次数，结果接口可据此区分输出截断、工具协议、静态校验、数据库执行或基础设施错误，而不会暴露查询文本与原始异常。
+终态会话不会长期保存 SQL、工具参数、表结构、Planning 后台原料副本或模型原文；成功会话只保留结果接口需要的最终表格行、程序统计和审计说明。SQL 阶段失败时只保留 `failure_stage`、稳定错误码、重试归属和已用/最大生成次数，结果接口可据此区分输出截断、工具协议、静态校验、数据库执行或基础设施错误，而不会暴露查询文本与原始异常。
 
 ### 9.1 生产诊断日志
 
@@ -318,9 +315,14 @@ SQL 成功后先运行独立 `ResultTranslationSubgraph`：
 | 值 | 记录范围 |
 | --- | --- |
 | `basic` | 阶段变化、终态、生成与工具次数、稳定错误码、行数和耗时 |
-| `detailed` | 在 `basic` 基础上增加涉及表、结果字段、查询块数量、已校验参数化 SQL 模板和外部错误类型 |
+| `detailed` | 在 `basic` 基础上增加涉及表、结果字段、已校验参数化 SQL 模板和外部错误类型 |
+| `trace` | 在 `detailed` 基础上增加所有模型节点的真实请求消息与 `assistant` 响应 |
 
-两种等级都不记录用户问题正文、交互答案、筛选参数值、模型原始响应、工具原始参数、SQL 结果行、凭证备注、图片路径、密钥或 Token。只有通过静态校验并完成参数绑定的 SQL 模板可以进入 `detailed` 日志；模型草稿和数据库返回值始终禁止记录。
+`basic` 和 `detailed` 都不记录用户问题正文、交互答案、筛选参数值、模型原始响应、工具原始参数、SQL 结果行、凭证备注、图片路径、密钥或 Token。只有通过静态校验并完成参数绑定的 SQL 模板可以进入 `detailed` 日志；模型草稿和数据库返回值始终禁止记录。
+
+`trace` 是生产排障期间显式启用的诊断等级。查询管理器为单次查询创建一个 `ModelMessageTraceQueue`，业务对齐、Planning、单表检索、SQL、塑形、翻译和审计共享该队列。每次模型调用前，统一调用边界把实际发送的 `messages` 作为 `request` 入队；调用完成后把模型返回的 `assistant` 消息作为 `response` 入队；请求异常只追加不含异常正文的 `error`。工具成功结果、Schema 错误和协议反馈会在实际进入下一轮模型请求时自然出现在该次 `request.messages` 中，不需要业务节点另外记录执行轨迹。
+
+队列使用查询内单调递增的 `message_sequence` 保存全局顺序，并用 `stage` 标识模型节点。生产日志事件统一为 `model_message_trace`，不再使用业务对齐专属格式或由各业务分支拼接诊断文案。请求消息可能包含业务文本、工具参数和受限数据预览，只会统一遮蔽可识别的 Bearer Token 与 `sk-` 密钥。因此该等级只能在受控环境短期启用，日志访问权限和保留时间应按敏感业务日志管理；`basic` 和 `detailed` 不会创建或保留该消息队列。
 
 当前 Compose 使用 Docker `json-file` 驱动保存 `manage-backend` 标准输出，并限制单文件 `20 MiB`、最多保留 `5` 个文件。排障时按查询记录 ID 查看：
 
@@ -330,4 +332,4 @@ docker compose logs --since 30m manage-backend \
   | rg 'agent_query_diagnostic.*<query_id>'
 ```
 
-诊断开关默认关闭。生产临时启用后必须重启 `manage-backend`，问题复现并导出所需日志后应恢复为 `false`，避免持续产生额外日志量。
+诊断开关默认关闭。生产临时启用后必须重启 `manage-backend`，问题复现并导出所需日志后应恢复为 `false`，避免持续产生额外日志量。需要模型消息轨迹时同时设置 `AGENT_QUERY_DIAGNOSTIC_LOG_LEVEL=trace`；只设置 `detailed` 不会输出模型消息。

@@ -17,7 +17,7 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    app_name: str = "燃动现象管理端后端"
+    app_name: str = "燃动现象智能管理平台后端"
     app_env: Literal["development", "testing", "staging", "production"] = (
         "development"
     )
@@ -114,6 +114,7 @@ class Settings(BaseSettings):
     deepseek_query_planning_max_tokens: int = Field(default=3000, ge=256, le=8192)
     deepseek_query_inspection_max_tokens: int = Field(default=800, ge=128, le=4096)
     deepseek_query_sql_max_tokens: int = Field(default=1200, ge=128, le=4096)
+    deepseek_query_shaping_max_tokens: int = Field(default=1000, ge=128, le=4096)
     deepseek_query_translation_max_tokens: int = Field(
         default=1000,
         ge=128,
@@ -138,7 +139,7 @@ class Settings(BaseSettings):
     agent_query_sse_heartbeat_seconds: int = Field(default=15, ge=5, le=60)
     # 诊断日志默认关闭；启用后只向 Docker 标准输出写入脱敏结构化事件。
     agent_query_diagnostic_log_enabled: bool = False
-    agent_query_diagnostic_log_level: Literal["basic", "detailed"] = "basic"
+    agent_query_diagnostic_log_level: Literal["basic", "detailed", "trace"] = "basic"
 
     # 使用 SQLAlchemy URL 安全拼装异步 MySQL 地址，避免密码中的特殊字符破坏连接串。
     @property

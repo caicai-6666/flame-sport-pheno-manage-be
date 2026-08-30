@@ -1,4 +1,4 @@
-"""向 Docker 标准输出写入不包含业务数据的 Text-to-SQL 诊断事件。"""
+"""向 Docker 标准输出写入分级的 Text-to-SQL 诊断事件。"""
 
 import json
 import logging
@@ -8,6 +8,7 @@ import traceback
 from typing import Any, Literal
 
 from app.agent.text2sql.events.models import AgentProgressUpdate
+from app.agent.text2sql.model_messages import ModelMessageTraceEntry
 
 
 DIAGNOSTIC_LOGGER_NAME = "uvicorn.error.agent_query_diagnostic"
@@ -24,6 +25,12 @@ _SAFE_EXCEPTION_TYPES = frozenset(
         "SqlValidationError",
     }
 )
+
+
+# 对完整消息载荷统一遮蔽认证信息，保留模型实际收到和返回的业务内容用于排障。
+def _redact_model_message_payload(payload: Any) -> Any:
+    serialized = json.dumps(payload, ensure_ascii=False, default=str)
+    return json.loads(_SECRET_PATTERN.sub("[REDACTED]", serialized))
 
 
 # 将允许记录的内部异常摘要做长度限制和敏感片段替换，模型普通文本不会进入日志。
@@ -56,7 +63,7 @@ class AgentQueryDiagnosticLogger:
         query_id: str,
         domain_key: str,
         enabled: bool,
-        level: Literal["basic", "detailed"],
+        level: Literal["basic", "detailed", "trace"],
     ) -> None:
         self._query_id = query_id
         self._domain_key = domain_key
@@ -116,6 +123,23 @@ class AgentQueryDiagnosticLogger:
             interaction_type=interaction_type,
         )
 
+    # 判断当前查询是否需要建立模型消息队列，关闭时不在内存保留原始业务上下文。
+    def model_message_trace_enabled(self) -> bool:
+        return self._enabled and self._level == "trace"
+
+    # 将统一消息队列中的请求和响应按原序写入诊断日志，不再接受业务层拼接轨迹。
+    def model_message_trace(self, entry: ModelMessageTraceEntry) -> None:
+        if not self._enabled or self._level != "trace":
+            return
+        self._write(
+            "model_message_trace",
+            stage=entry.node,
+            status="running",
+            message_sequence=entry.sequence,
+            message_direction=entry.direction,
+            message_payload=_redact_model_message_payload(entry.payload),
+        )
+
     # 汇总各子图的安全元数据；详细模式只增加表、字段、参数化 SQL 和次数，不记录数据值。
     def pipeline_finished(self, result: Any) -> None:
         details: dict[str, object] = {
@@ -163,7 +187,7 @@ class AgentQueryDiagnosticLogger:
                 if audit_result.assessment is not None
                 else None
             )
-        if self._level == "detailed":
+        if self._level in {"detailed", "trace"}:
             self._add_detailed_result_metadata(details, planning_result, sql_result)
         self._write("pipeline_finished", **details)
 
@@ -179,6 +203,11 @@ class AgentQueryDiagnosticLogger:
             if planning_result is not None
             else None
         )
+        material_plan = (
+            getattr(planning_result, "material_plan", None)
+            if planning_result is not None
+            else None
+        )
         if query_plan is not None:
             details["planned_tables"] = [
                 table.table_name for table in query_plan.tables
@@ -187,6 +216,9 @@ class AgentQueryDiagnosticLogger:
                 field.result_field for field in query_plan.select_fields
             ]
             details["query_block_count"] = len(query_plan.query_blocks)
+        elif material_plan is not None:
+            details["planned_tables"] = list(material_plan.required_tables)
+            details["planning_protocol"] = "interactive_material_tools"
         if sql_result is not None:
             details["result_columns"] = list(sql_result.result_columns)
             if sql_result.status == "success" and sql_result.sql is not None:
@@ -208,7 +240,7 @@ class AgentQueryDiagnosticLogger:
             **_build_exception_location(error),
         }
         safe_summary = _build_safe_exception_summary(error)
-        if self._level == "detailed" and safe_summary is not None:
+        if self._level in {"detailed", "trace"} and safe_summary is not None:
             details["safe_error_summary"] = safe_summary
         self._write("query_failed_with_exception", **details)
 

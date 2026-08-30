@@ -1,4 +1,4 @@
-"""从目标业务库的 information_schema 读取 Text-to-SQL 允许表结构。"""
+"""为规划子图从目标业务库的 information_schema 读取允许表结构。"""
 
 import asyncio
 

@@ -1,4 +1,4 @@
-"""定义可暂停 Text-to-SQL 查询中的用户交互和会话状态。"""
+"""定义可暂停 Text-to-SQL 查询中的用户交互、问答记录和会话状态。"""
 
 from datetime import datetime
 from typing import Literal
@@ -19,6 +19,13 @@ AgentQueryStatus = Literal[
     "failed",
     "cancelled",
 ]
+
+
+class UserInteraction(BaseModel):
+    """一次由智能体发起、并由当前查询用户完成的内部澄清或复核问答。"""
+
+    question: str = Field(description="智能体提出的澄清或复核问题")
+    answer: str = Field(description="用户通过交互接口提交的回答")
 
 
 class AgentInteraction(BaseModel):

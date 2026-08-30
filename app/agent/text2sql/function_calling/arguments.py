@@ -1,4 +1,4 @@
-"""兼容部分 OpenAI 工具解析器对嵌套对象参数的二次 JSON 序列化。"""
+"""兼容部分 OpenAI Function Calling 解析器对嵌套参数的二次 JSON 序列化。"""
 
 import json
 from typing import Any, TypeVar

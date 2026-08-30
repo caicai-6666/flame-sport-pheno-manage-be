@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from typing import Final, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
-from app.agent.text2sql.shared.tools.pydantic_schema import (
+from app.agent.text2sql.function_calling.schema import (
     build_pydantic_tool_definition,
 )
-from app.agent.text2sql.shared.tools.argument_compatibility import (
+from app.agent.text2sql.function_calling.arguments import (
     validate_tool_arguments_with_embedded_json_fallback,
 )
 
@@ -21,15 +21,16 @@ ABANDON_ALIGNMENT_TOOL_NAME: Final[str] = "abandon_alignment"
 
 
 class ThinkingToolArguments(BaseModel):
-    """记录决定业务对齐下一步动作所必需的一条简短判断，不输出完整推理过程。"""
+    """梳理业务对齐当前所需的事实、歧义和下一步判断。"""
 
     model_config = ConfigDict(extra="forbid")
 
     reason: str = Field(
-        max_length=240,
+        max_length=350,
         description=(
-            "直接决定下一步是继续对齐、询问用户、提交结果还是放弃的一条关键判断；"
-            "不得复述用户问题、表结构或罗列多个备选方案"
+            "在业务对齐范围内梳理已确认概念、影响查询结果的关键歧义、待确认内容"
+            "以及当前倾向的下一步动作，最多350个字符；每次调用应推进判断，"
+            "避免重复已有结论或记录与当前决策无关的内容"
         ),
     )
 
@@ -47,168 +48,21 @@ class AskUserToolArguments(BaseModel):
     )
 
 
-class ResolvedBusinessConcept(BaseModel):
-    """描述用户原始表达与标准业务概念之间的一项确定映射。"""
+class SubmitAlignedQueryArguments(BaseModel):
+    """当查询需求已经完成业务对齐且没有关键歧义时，提交自然语言结果。"""
 
     model_config = ConfigDict(extra="forbid")
 
-    user_term: str = Field(description="用户问题中实际出现的原始业务表达")
-    canonical_term: str = Field(description="业务词汇表中与原始表达对应的标准业务概念")
-    alignment_reason: str = Field(
-        description="说明该映射依据的词汇表定义或稳定业务规则，不得引用数据库实现"
-    )
-
-
-class AlignedLogicalConstraint(BaseModel):
-    """描述查询主体关联集合必须满足的全部、任一、数量等业务约束。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    subject: str = Field(description="量化约束作用的业务主体，例如参与赛季的用户")
-    collection: str = Field(description="需要判断的主体关联对象集合，例如用户锁定的运动项目")
-    quantifier: Literal[
-        "all", "any", "none", "exactly", "at_least", "at_most"
-    ] = Field(
+    reason: str = Field(
         description=(
-            "集合量词：all 表示全部，any 表示至少一个，none 表示没有，exactly 表示恰好，"
-            "at_least 表示至少指定数量，at_most 表示至多指定数量"
+            "简要说明采用的词汇含义、确定业务规则和无需继续澄清的依据；"
+            "不得包含数据库实现、工具协议或与当前对齐无关的推理"
         )
     )
-    predicate: str = Field(description="集合中每个成员需要判断的标准业务条件")
-    count: int | None = Field(
-        default=None,
-        ge=0,
-        description=(
-            "exactly、at_least、at_most 对应的非负数量；"
-            "quantifier 为 all、any 或 none 时必须传 null"
-        ),
-    )
-
-    # 保证数量量词与 count 同时出现，避免规划层重新猜测数量约束。
-    @model_validator(mode="after")
-    def validate_quantifier_count(self) -> "AlignedLogicalConstraint":
-        count_quantifiers = {"exactly", "at_least", "at_most"}
-        if self.quantifier in count_quantifiers and self.count is None:
-            raise ValueError(f"量词 {self.quantifier} 必须提供 count")
-        if self.quantifier not in count_quantifiers and self.count is not None:
-            raise ValueError(f"量词 {self.quantifier} 的 count 必须为 null")
-        return self
-
-
-class AlignedPresentationRequirement(BaseModel):
-    """描述用户要求的最终结果行粒度及普通表格或横向展开布局。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    layout: Literal["table", "pivot"] = Field(
-        description="普通逐行结果使用 table；同类对象按序展开为多列时使用 pivot"
-    )
-    result_row_granularity: str = Field(
-        description="最终结果每一行代表的唯一业务主体，不得使用表名或字段名"
-    )
-    dynamic_column_subject: str | None = Field(
-        default=None,
-        description="pivot 时按序展开为多列的业务对象；table 时必须传 null",
-    )
-    dynamic_value_subject: str | None = Field(
-        default=None,
-        description="pivot 动态列中实际展示的业务内容；table 时必须传 null",
-    )
-    column_label_pattern: str | None = Field(
-        default=None,
-        description="pivot 动态列标题模板且必须包含 {index}；table 时必须传 null",
-    )
-
-    # 保证普通表格与横向展开只携带各自有效的布局参数。
-    @model_validator(mode="after")
-    def validate_layout_configuration(self) -> "AlignedPresentationRequirement":
-        dynamic_values = (
-            self.dynamic_column_subject,
-            self.dynamic_value_subject,
-            self.column_label_pattern,
-        )
-        if self.layout == "table":
-            if any(value is not None for value in dynamic_values):
-                raise ValueError("layout 为 table 时全部动态列字段必须为 null")
-            return self
-        if any(value is None for value in dynamic_values):
-            raise ValueError("layout 为 pivot 时全部动态列字段都必须提供")
-        assert self.column_label_pattern is not None
-        if "{index}" not in self.column_label_pattern:
-            raise ValueError("column_label_pattern 必须包含 {index} 占位符")
-        return self
-
-
-class SubmittedAlignedQuery(BaseModel):
-    """描述提交给查询规划层的完整业务需求，但不包含工作流自动保存的原问题和问答。"""
-
-    model_config = ConfigDict(extra="forbid")
-
     aligned_question: str = Field(
         description=(
-            "使用标准业务概念完整改写后的查询需求；必须保留查询主体、筛选条件、"
-            "返回内容和展示要求，不得包含表名、字段名、SQL 或连接方式"
-        )
-    )
-    resolved_concepts: list[ResolvedBusinessConcept] = Field(
-        description="本次实际完成的用户表达与标准业务概念映射；没有映射时传空列表"
-    )
-    business_constraints: list[str] = Field(
-        description="本次查询必须遵守的稳定业务规则；不得写入数据库实现；没有时传空列表"
-    )
-    applied_business_rules: list[str] = Field(
-        default_factory=list,
-        description="本次实际采用的核心规则稳定标识；没有采用时传空列表",
-    )
-    logical_constraints: list[AlignedLogicalConstraint] = Field(
-        default_factory=list,
-        description="从用户需求提取的集合量化或数量约束；没有时传空列表",
-    )
-    requested_outputs: list[str] = Field(
-        default_factory=list,
-        description=(
-            "用户要求在最终结果中看到的业务信息，按业务名称逐项列出；"
-            "不得退化为只返回内部唯一标识，除非用户明确只需要标识"
-        ),
-    )
-    presentation_requirements: list[AlignedPresentationRequirement] = Field(
-        default_factory=list,
-        description="用户明确提出的结果行粒度和布局要求；没有明确要求时传空列表",
-    )
-    result_scope: Literal["complete", "bounded", "unspecified"] = Field(
-        default="unspecified",
-        description=(
-            "结果范围：要求全部或导出完整名单时使用 complete，明确限定结果数量时使用 bounded，"
-            "没有说明数量范围时使用 unspecified"
-        ),
-    )
-    requested_limit: int | None = Field(
-        default=None,
-        ge=1,
-        description="result_scope 为 bounded 时填写用户指定的正整数数量，否则必须传 null",
-    )
-
-    # 保证结果范围与数量限制语义闭合，避免规划层猜测是否允许截断结果。
-    @model_validator(mode="after")
-    def validate_result_scope(self) -> "SubmittedAlignedQuery":
-        if self.result_scope == "bounded" and self.requested_limit is None:
-            raise ValueError("result_scope 为 bounded 时 requested_limit 不能为空")
-        if self.result_scope != "bounded" and self.requested_limit is not None:
-            raise ValueError(
-                "result_scope 为 complete 或 unspecified 时 requested_limit 必须为 null"
-            )
-        return self
-
-
-class SubmitAlignedQueryArguments(BaseModel):
-    """当需求已完成业务概念对齐且没有关键歧义时，提交结果并成功结束业务对齐。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    aligned_request: SubmittedAlignedQuery = Field(
-        description=(
-            "传递给查询规划层的完整业务需求；用户原问题和已完成的澄清问答由工作流自动补充，"
-            "不得在此重复提交"
+            "使用标准业务语言写成的完整自然语言查询需求；必须保留查询主体、筛选条件、"
+            "集合与数量口径、返回内容、展示要求和结果范围，不得包含表名、字段名或 SQL"
         )
     )
 
@@ -298,7 +152,7 @@ def parse_ask_user_tool_arguments(arguments_json: str) -> AskUserToolArguments:
     return AskUserToolArguments.model_validate_json(arguments_json)
 
 
-# 优先严格校验最终提交参数，失败时兼容工具解析器对 aligned_request 的二次序列化。
+# 校验只包含对齐依据和完整自然语言需求的最终提交参数。
 def parse_submit_aligned_query_arguments(
     arguments_json: str,
 ) -> SubmitAlignedQueryArguments:
@@ -324,13 +178,9 @@ __all__ = [
     "SUBMIT_ALIGNED_QUERY_TOOL_NAME",
     "THINKING_TOOL_NAME",
     "AbandonAlignmentArguments",
-    "AlignedLogicalConstraint",
-    "AlignedPresentationRequirement",
     "AlignmentAbandonment",
     "AskUserToolArguments",
-    "ResolvedBusinessConcept",
     "SubmitAlignedQueryArguments",
-    "SubmittedAlignedQuery",
     "ThinkingToolArguments",
     "build_abandon_alignment_tool_definition",
     "build_ask_user_tool_definition",

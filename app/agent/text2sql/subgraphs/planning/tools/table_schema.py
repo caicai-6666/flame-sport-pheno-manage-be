@@ -7,10 +7,10 @@ from typing import Final, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.agent.text2sql.shared.yaml_context import render_yaml_context
-from app.agent.text2sql.shared.tools.argument_compatibility import (
+from app.agent.text2sql.function_calling.arguments import (
     validate_tool_arguments_with_embedded_json_fallback,
 )
-from app.agent.text2sql.shared.tools.pydantic_schema import (
+from app.agent.text2sql.function_calling.schema import (
     build_pydantic_tool_definition,
 )
 
