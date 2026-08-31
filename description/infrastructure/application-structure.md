@@ -331,7 +331,7 @@ async def example_service(
 - 对非成功响应调用 `raise_for_status()`；
 - 在应用退出时关闭连接池。
 
-路由和后台任务复用 `app.state.client_backend` 中的共享客户端，不得为每次请求或每条凭证重复创建 `httpx.AsyncClient`。图片中转使用固定资源路径；项目、商品和活动海报使用各自固定的 multipart 写入协议；赛季结算只调用固定的 `POST /proof_record/{id}/preliminary-review` 立即初审接口。具体协议参见[图片安全中转 API](../api/image.md)、[客户端立即初审集成](client-preliminary-review.md)、[运动项目管理 API](../api/project.md)与[积分商城商品 API](../api/product.md)。
+路由和后台任务复用 `app.state.client_backend` 中的共享客户端，不得为每次请求或每条凭证重复创建 `httpx.AsyncClient`。图片中转使用固定资源路径；项目、商品和活动海报使用各自固定的 multipart 写入协议；赛季结算分别调用固定的 `POST /proof_record/{id}/preliminary-review` 遗留立即初审接口和 `POST /supplement/{id}/preliminary-review` 补交专用初审接口。具体协议参见[图片安全中转 API](../api/image.md)、[客户端初审集成](client-preliminary-review.md)、[运动项目管理 API](../api/project.md)与[积分商城商品 API](../api/product.md)。
 
 该内部客户端设置 `trust_env=False`，不会隐式读取宿主机的 `HTTP_PROXY`、`HTTPS_PROXY` 或 SOCKS 代理。这样可以避免内部服务请求因开发机代理设置而改变路由；如果部署环境确实要求代理，应在明确安全边界后通过专门配置实现。
 
@@ -339,7 +339,7 @@ async def example_service(
 
 > **注意**
 >
-> 当前图片读取与写入接口以及赛季结算立即初审接口已有明确契约。后续新增客户端后端接口前，仍必须取得对应的路径、认证、超时、重试和错误协议，不能从现有接口自行推导。
+> 当前图片读写接口以及赛季结算的两类初审接口已有明确契约。后续新增客户端后端接口前，仍必须取得对应的路径、认证、超时、重试和错误协议，不能从现有接口自行推导。
 
 ---
 

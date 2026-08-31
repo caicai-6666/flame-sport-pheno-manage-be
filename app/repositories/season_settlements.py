@@ -1,5 +1,6 @@
 """封装赛季结算初始化、资格写入和最终定分所需的数据访问。"""
 
+import json
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
@@ -67,6 +68,7 @@ class SettlementPendingFinalReviewProof:
     note: str | None
     preliminary_review_comment: str | None
     review_comment: str | None
+    preliminary_review_context_snapshot: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -405,6 +407,65 @@ async def count_pending_initial_review_proofs(
     return int(result.scalar_one())
 
 
+# 分批读取已完成补交但尚未初审的凭证，资格状态区分其与赛季遗留待审记录。
+async def fetch_pending_supplement_review_proof_ids(
+    session: AsyncSession,
+    season_id: int,
+    limit: int,
+) -> tuple[int, ...]:
+    result = await session.exec(
+        text(
+            """
+            SELECT proof_record.id
+            FROM season_supplement_eligibility
+            INNER JOIN proof_record
+                ON proof_record.id =
+                    season_supplement_eligibility.proof_record_id
+            INNER JOIN season_user
+                ON season_user.id =
+                    season_supplement_eligibility.season_user_id
+               AND season_user.id = proof_record.season_user_id
+            WHERE season_user.season_id = :season_id
+              AND season_supplement_eligibility.status = 2
+              AND proof_record.status = 1
+              AND proof_record.review_status = 'pending'
+            ORDER BY proof_record.id
+            LIMIT :limit
+            """
+        ),
+        params={"season_id": season_id, "limit": limit},
+    )
+    return tuple(int(row[0]) for row in result.all())
+
+
+# 统计指定结算赛季仍等待补交初审的凭证，供失败后决定是否阻塞本轮定分。
+async def count_pending_supplement_review_proofs(
+    session: AsyncSession,
+    season_id: int,
+) -> int:
+    result = await session.exec(
+        text(
+            """
+            SELECT COUNT(*)
+            FROM season_supplement_eligibility
+            INNER JOIN proof_record
+                ON proof_record.id =
+                    season_supplement_eligibility.proof_record_id
+            INNER JOIN season_user
+                ON season_user.id =
+                    season_supplement_eligibility.season_user_id
+               AND season_user.id = proof_record.season_user_id
+            WHERE season_user.season_id = :season_id
+              AND season_supplement_eligibility.status = 2
+              AND proof_record.status = 1
+              AND proof_record.review_status = 'pending'
+            """
+        ),
+        params={"season_id": season_id},
+    )
+    return int(result.scalar_one())
+
+
 # 分页读取尚未定分的正式赛季用户，游标避免未完成补传用户阻塞后续记录。
 async def fetch_unsettled_season_user_ids(
     session: AsyncSession,
@@ -461,7 +522,23 @@ async def fetch_settlement_season_user_ids(
     return tuple(int(row[0]) for row in result.all())
 
 
-# 一次查询当前结算赛季全部正式参赛用户的待终审凭证，并优先返回最近记录。
+# 解码补传资格中的初审上下文快照，兼容数据库驱动返回 JSON 对象或 JSON 文本。
+def decode_preliminary_review_context_snapshot(
+    raw_snapshot: object,
+) -> dict[str, Any] | None:
+    if raw_snapshot is None:
+        return None
+    decoded_snapshot = (
+        json.loads(raw_snapshot)
+        if isinstance(raw_snapshot, (str, bytes, bytearray))
+        else raw_snapshot
+    )
+    if not isinstance(decoded_snapshot, Mapping):
+        raise ValueError("补传资格初审上下文快照不是 JSON 对象")
+    return {str(key): value for key, value in decoded_snapshot.items()}
+
+
+# 一次查询当前结算赛季全部正式参赛用户的待终审凭证，并携带补传时固化的审核规则。
 async def fetch_settlement_pending_final_review_proofs(
     session: AsyncSession,
     season_id: int,
@@ -478,12 +555,19 @@ async def fetch_settlement_pending_final_review_proofs(
                 proof_record.proof_date,
                 proof_record.note,
                 proof_record.preliminary_review_comment,
-                proof_record.review_comment
+                proof_record.review_comment,
+                season_supplement_eligibility.preliminary_review_context_snapshot
+                    AS preliminary_review_context_snapshot
             FROM proof_record
             INNER JOIN season_user
                 ON season_user.id = proof_record.season_user_id
             INNER JOIN season
                 ON season.id = season_user.season_id
+            LEFT JOIN season_supplement_eligibility
+                ON season_supplement_eligibility.proof_record_id =
+                    proof_record.id
+               AND season_supplement_eligibility.season_user_id =
+                    proof_record.season_user_id
             WHERE season.id = :season_id
               AND season.status = 2
               AND season_user.level_id IS NOT NULL
@@ -516,6 +600,11 @@ async def fetch_settlement_pending_final_review_proofs(
                 str(row["review_comment"])
                 if row["review_comment"] is not None
                 else None
+            ),
+            preliminary_review_context_snapshot=(
+                decode_preliminary_review_context_snapshot(
+                    row["preliminary_review_context_snapshot"]
+                )
             ),
         )
         for row in result.mappings().all()
@@ -898,7 +987,7 @@ async def fetch_redundant_pending_final_review_proof_ids(
     return tuple(int(row[0]) for row in result.all())
 
 
-# 将待终审凭证逐行登记为补传资格，唯一键保证任务重试不会重复创建。
+# 将待终审凭证逐行登记为补传资格，并在首次创建时固化补交初审上下文。
 async def upsert_supplement_eligibilities(
     session: AsyncSession,
     season_user_id: int,
@@ -912,15 +1001,41 @@ async def upsert_supplement_eligibilities(
             INSERT INTO season_supplement_eligibility (
                 season_user_id,
                 proof_record_id,
+                preliminary_review_context_snapshot,
                 status
-            ) VALUES (
-                :season_user_id,
-                :proof_record_id,
-                1
             )
+            SELECT
+                season_user.id,
+                proof_record.id,
+                JSON_OBJECT(
+                    'projectId', proof_record.project_id,
+                    'projectName', project.name,
+                    'levelId', season_user.level_id,
+                    'recordType', project_upload_config.record_type,
+                    'ruleContent', project_rule.rule_content,
+                    'ruleNote', COALESCE(project_rule.rule_note, '')
+                ),
+                1
+            FROM proof_record
+            INNER JOIN season_user
+                ON season_user.id = proof_record.season_user_id
+            INNER JOIN project
+                ON project.id = proof_record.project_id
+            INNER JOIN project_upload_config
+                ON project_upload_config.id =
+                    proof_record.project_upload_config_id
+            INNER JOIN project_rule
+                ON project_rule.project_id = proof_record.project_id
+               AND project_rule.level_id = season_user.level_id
+               AND project_rule.status = 1
+            WHERE season_user.id = :season_user_id
+              AND proof_record.id = :proof_record_id
             ON DUPLICATE KEY UPDATE
-                season_user_id = VALUES(season_user_id),
-                status = 1
+                status = IF(
+                    season_supplement_eligibility.status = 0,
+                    1,
+                    season_supplement_eligibility.status
+                )
             """
         ),
         params=[
@@ -945,7 +1060,7 @@ async def has_active_supplement_eligibility(
                 SELECT 1
                 FROM season_supplement_eligibility
                 WHERE season_user_id = :season_user_id
-                  AND status = 1
+                  AND status <> 0
             )
             """
         ),
@@ -965,7 +1080,7 @@ async def close_supplement_eligibility(
             UPDATE season_supplement_eligibility
             SET status = 0
             WHERE proof_record_id = :proof_record_id
-              AND status = 1
+              AND status <> 0
             """
         ),
         params={"proof_record_id": proof_record_id},
@@ -987,7 +1102,7 @@ async def close_approved_supplement_eligibilities(
             SET season_supplement_eligibility.status = 0
             WHERE season_supplement_eligibility.season_user_id =
                     :season_user_id
-              AND season_supplement_eligibility.status = 1
+              AND season_supplement_eligibility.status <> 0
               AND proof_record.review_status = 'approved'
             """
         ),
@@ -995,7 +1110,7 @@ async def close_approved_supplement_eligibilities(
     )
 
 
-# 关闭用户当前全部开放资格，用于已经完整达标而无需继续补传的收口分支。
+# 关闭用户当前全部非零资格，用于已经完整达标而无需继续补传的收口分支。
 async def close_user_supplement_eligibilities(
     session: AsyncSession,
     season_user_id: int,
@@ -1006,7 +1121,7 @@ async def close_user_supplement_eligibilities(
             UPDATE season_supplement_eligibility
             SET status = 0
             WHERE season_user_id = :season_user_id
-              AND status = 1
+              AND status <> 0
             """
         ),
         params={"season_user_id": season_user_id},
@@ -1099,7 +1214,7 @@ async def set_final_points(
     return int(result.rowcount) == 1
 
 
-# 在所有正式参与用户完成定分和积分发放且无开放资格后结束赛季。
+# 在所有正式参与用户完成定分和积分发放且无非零资格后结束赛季。
 async def mark_season_ended_if_complete(
     session: AsyncSession,
     season_id: int,
@@ -1129,7 +1244,7 @@ async def mark_season_ended_if_complete(
                       ON season_user.id =
                           season_supplement_eligibility.season_user_id
                   WHERE season_user.season_id = season.id
-                    AND season_supplement_eligibility.status = 1
+                    AND season_supplement_eligibility.status <> 0
               )
             """
         ),

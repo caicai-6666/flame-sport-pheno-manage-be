@@ -142,7 +142,7 @@ description/
 | 文档 | 主要内容 |
 | --- | --- |
 | [FastAPI 应用结构与基础连接](infrastructure/application-structure.md) | 应用目录、配置、MySQL 会话、客户端后端连接、启动和测试 |
-| [客户端立即初审集成](infrastructure/client-preliminary-review.md) | 结算遗留凭证立即初审的内部 HTTP 契约、失败语义和安全边界 |
+| [客户端初审集成](infrastructure/client-preliminary-review.md) | 结算遗留立即初审与补交专用初审的内部 HTTP 契约、失败语义和安全边界 |
 | [Python 运行依赖](infrastructure/python-dependencies.md) | Python 环境基线、依赖用途、安装、验证和安全要求 |
 | [管理端 Docker Compose 部署](infrastructure/docker-compose-deployment.md) | 管理端后端镜像、Compose 服务拓扑、根环境变量、启动顺序和生产入口 |
 | [查询智能体运行时与业务域扩展](infrastructure/query-agent-runtime.md) | 通用工作流、表概述契约、业务域配置、模型与只读 SQL 安全、SSE 和扩展方法 |

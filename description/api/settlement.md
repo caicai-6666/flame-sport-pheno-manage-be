@@ -212,7 +212,20 @@ proof_record.status = 1
     "proof_date": "2026-07-30",
     "note": "晚间跑步 5 公里",
     "preliminary_review_comment": "初审符合单次要求",
-    "review_comment": null
+    "review_comment": null,
+    "preliminary_review_context_snapshot": {
+      "projectId": 2,
+      "projectName": "跑步/快走",
+      "levelId": 7,
+      "recordType": "日常记录",
+      "ruleContent": [
+        {
+          "label": "单次距离",
+          "value": "不少于 5 公里"
+        }
+      ],
+      "ruleNote": "按凭证判断"
+    }
   }
 ]
 ```
@@ -228,6 +241,9 @@ proof_record.status = 1
 | `note` | `string \| null` | 用户运动备注 |
 | `preliminary_review_comment` | `string \| null` | 大模型初审意见 |
 | `review_comment` | `string \| null` | 管理员终审意见；待终审记录通常为 `null` |
+| `preliminary_review_context_snapshot` | `object \| null` | 资格首次创建时固化的项目、等级、凭证类型和项目合格指标；历史无快照记录为 `null` |
+
+管理端审核补传记录时必须使用 `preliminary_review_context_snapshot.ruleContent` 展示项目合格指标，不得再次读取当前全局 `project_rule`。只有历史资格没有快照、字段为 `null` 时，前端才沿用全局规则查询作为兼容回退；快照存在但结构非法时应拒绝展示该异常队列，不能静默降级。
 
 没有符合条件的凭证时返回空数组 `[]` 和 `200 OK`。
 
@@ -276,11 +292,11 @@ proof_record.status = 1
 
 1. 将凭证更新为终审通过并把请求中的 `review_comment` 保存为终审意见；保留 `preliminary_review_comment`，初审已经计入的 `increase` 和项目进度保持不变。
 2. 将该凭证对应的 `season_supplement_eligibility.status` 更新为 `0`，关闭继续补传资格。
-3. 重新检查该用户是否仍有 `preliminary_approved` 凭证或 `status = 1` 的补传资格。
+3. 重新检查该用户是否仍有 `preliminary_approved` 凭证或 `status <> 0` 的补传资格。
 4. 阻塞条件全部消失后，按最终项目完成数、挑战等级和连续完成月份自动计算积分。
 5. 写入 `season_user.final_points` 和赛季结算通知，保持 `points_issued = 0`，等待积分发放接口处理。
 
-决定为 `rejected` 时，复用普通终审的进度回扣与候选凭证回补逻辑。对应补传资格保持有效，使用户后续仍可补传；若业务规则判定该凭证已经不影响项目达成或用户属于零完成禁补分支，则按结算规则自动收口。
+决定为 `rejected` 时，复用普通终审的进度回扣与候选凭证回补逻辑。对应补传资格保持非零，使用户后续仍可补传；客户端允许状态 `1`、`2`、`3` 的资格覆盖提交，并将新版本重置为状态 `2`。若业务规则判定该凭证已经不影响项目达成或用户属于零完成禁补分支，则按结算规则自动收口。
 
 终审、进度调整、资格更新、自动定分和通知写入共享一个数据库事务，任一步失败都会整体回滚。
 

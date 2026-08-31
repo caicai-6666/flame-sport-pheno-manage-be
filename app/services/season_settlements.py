@@ -41,10 +41,12 @@ from app.repositories.season_settlements import (
     close_supplement_eligibility,
     close_user_supplement_eligibilities,
     count_pending_initial_review_proofs,
+    count_pending_supplement_review_proofs,
     delete_user_supplement_eligibilities,
     did_user_fully_complete_month,
     fetch_pending_final_review_proof_ids,
     fetch_pending_initial_review_proof_ids,
+    fetch_pending_supplement_review_proof_ids,
     fetch_redundant_pending_final_review_proof_ids,
     fetch_season_point_issuance_user_id,
     fetch_season_user_finalization_targets,
@@ -525,6 +527,31 @@ async def review_pending_proof(
     return False
 
 
+# 调用补交专用初审；该入口由客户后端强制读取资格表固化的审核上下文。
+async def review_pending_supplement(
+    client_backend: ClientBackendClient,
+    proof_record_id: int,
+    semaphore: asyncio.Semaphore,
+) -> bool:
+    try:
+        async with semaphore:
+            await client_backend.review_supplement_immediately(proof_record_id)
+        return True
+    except httpx.HTTPStatusError as error:
+        logger.warning(
+            "结算补交凭证初审未完成 proof_record_id=%s status=%s",
+            proof_record_id,
+            error.response.status_code,
+        )
+    except (httpx.RequestError, ValueError):
+        logger.warning(
+            "结算补交凭证初审调用失败 proof_record_id=%s",
+            proof_record_id,
+            exc_info=True,
+        )
+    return False
+
+
 # 分批并发清理赛季截止前遗留初审；任一失败时停止本轮，避免对永久失败记录忙重试。
 async def drain_pending_initial_reviews(
     session_factory: async_sessionmaker[AsyncSession],
@@ -571,6 +598,48 @@ async def drain_pending_initial_reviews(
                 session,
                 season.id,
                 cutoff_at,
+            )
+
+
+# 分批初审已补交记录，扫描依据资格状态而不是原赛季上传截止时间。
+async def drain_pending_supplement_reviews(
+    session_factory: async_sessionmaker[AsyncSession],
+    client_backend: ClientBackendClient,
+    season: SettlementSeason,
+    batch_size: int,
+    concurrency: int,
+) -> int:
+    semaphore = asyncio.Semaphore(concurrency)
+    while True:
+        async with session_factory() as session:
+            async with session.begin():
+                proof_record_ids = (
+                    await fetch_pending_supplement_review_proof_ids(
+                        session,
+                        season.id,
+                        batch_size,
+                    )
+                )
+        if not proof_record_ids:
+            return 0
+        results = await asyncio.gather(
+            *(
+                review_pending_supplement(
+                    client_backend,
+                    proof_record_id,
+                    semaphore,
+                )
+                for proof_record_id in proof_record_ids
+            )
+        )
+        if not all(results):
+            break
+
+    async with session_factory() as session:
+        async with session.begin():
+            return await count_pending_supplement_review_proofs(
+                session,
+                season.id,
             )
 
 
@@ -1200,6 +1269,25 @@ async def run_season_settlement_cycle(
         )
 
     pending_count = await drain_pending_initial_reviews(
+        session_factory,
+        client_backend,
+        settling_season,
+        review_batch_size,
+        review_concurrency,
+    )
+    if pending_count > 0:
+        return SettlementCycleResult(
+            transitioned_season_id=(
+                transitioned_season.id if transitioned_season else None
+            ),
+            settling_season_id=settling_season.id,
+            pending_initial_review_count=pending_count,
+            finalized_user_count=0,
+            created_eligibility_count=0,
+            season_ended=False,
+        )
+
+    pending_count = await drain_pending_supplement_reviews(
         session_factory,
         client_backend,
         settling_season,

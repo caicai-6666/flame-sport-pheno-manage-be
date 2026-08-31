@@ -3,7 +3,7 @@
 from datetime import date, datetime
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, JsonValue
 
 SeasonUserId = Annotated[int, Field(gt=0)]
 
@@ -43,6 +43,42 @@ class SettlementParticipantResponse(BaseModel):
     points_issued: bool
 
 
+class PreliminaryReviewRuleMetricSnapshotResponse(BaseModel):
+    label: str = Field(min_length=1)
+    value: JsonValue
+
+
+class PreliminaryReviewContextSnapshotResponse(BaseModel):
+    project_id: int = Field(
+        validation_alias="projectId",
+        serialization_alias="projectId",
+        gt=0,
+    )
+    project_name: str = Field(
+        validation_alias="projectName",
+        serialization_alias="projectName",
+        min_length=1,
+    )
+    level_id: int = Field(
+        validation_alias="levelId",
+        serialization_alias="levelId",
+        gt=0,
+    )
+    record_type: str = Field(
+        validation_alias="recordType",
+        serialization_alias="recordType",
+        min_length=1,
+    )
+    rule_content: list[PreliminaryReviewRuleMetricSnapshotResponse] = Field(
+        validation_alias="ruleContent",
+        serialization_alias="ruleContent",
+    )
+    rule_note: str = Field(
+        validation_alias="ruleNote",
+        serialization_alias="ruleNote",
+    )
+
+
 class SettlementPendingFinalReviewProofResponse(BaseModel):
     proof_record_id: int
     season_user_id: int
@@ -53,6 +89,9 @@ class SettlementPendingFinalReviewProofResponse(BaseModel):
     note: str | None
     preliminary_review_comment: str | None
     review_comment: str | None
+    preliminary_review_context_snapshot: (
+        PreliminaryReviewContextSnapshotResponse | None
+    )
 
 
 class IssueSeasonPointsRequest(BaseModel):

@@ -43,10 +43,28 @@ class ClientBackendClient:
         self,
         proof_record_id: int,
     ) -> ImmediatePreliminaryReview:
-        response = await self.request(
-            "POST",
+        return await self._review_proof_by_path(
+            proof_record_id,
             f"/proof_record/{proof_record_id}/preliminary-review",
         )
+
+    # 补交凭证必须使用资格表中的固化上下文，禁止退回通用立即初审入口。
+    async def review_supplement_immediately(
+        self,
+        proof_record_id: int,
+    ) -> ImmediatePreliminaryReview:
+        return await self._review_proof_by_path(
+            proof_record_id,
+            f"/supplement/{proof_record_id}/preliminary-review",
+        )
+
+    async def _review_proof_by_path(
+        self,
+        proof_record_id: int,
+        path: str,
+    ) -> ImmediatePreliminaryReview:
+        """统一校验客户后端两类单条初审响应契约。"""
+        response = await self.request("POST", path)
         payload = response.json()
         if not isinstance(payload, dict):
             raise ValueError("客户端后端立即初审响应不是对象")
