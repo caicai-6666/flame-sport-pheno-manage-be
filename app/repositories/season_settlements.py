@@ -19,6 +19,52 @@ class SettlementSeason:
     required_project_count: int
 
 
+# 锁定所有未结束的赛季，为“最多一个进行中赛季”的检查提供稳定快照。
+async def lock_open_seasons(
+    session: AsyncSession,
+) -> tuple[tuple[SettlementSeason, int], ...]:
+    result = await session.exec(
+        text(
+            """
+            SELECT
+                season.id,
+                season.name,
+                season.start_date,
+                season.end_date,
+                season.required_project_count,
+                season.status
+            FROM season
+            WHERE season.status IN (0, 1, 2)
+            ORDER BY season.start_date, season.id
+            FOR UPDATE
+            """
+        )
+    )
+    return tuple(
+        (_map_settlement_season(row), int(row["status"]))
+        for row in result.mappings()
+    )
+
+
+# 仅将仍处于未开始状态的目标赛季激活，状态条件保证重复轮询保持幂等。
+async def mark_season_as_active(
+    session: AsyncSession,
+    season_id: int,
+) -> bool:
+    result = await session.exec(
+        text(
+            """
+            UPDATE season
+            SET status = 1
+            WHERE id = :season_id
+              AND status = 0
+            """
+        ),
+        params={"season_id": season_id},
+    )
+    return int(result.rowcount) == 1
+
+
 @dataclass(frozen=True, slots=True)
 class SettlementUser:
     id: int

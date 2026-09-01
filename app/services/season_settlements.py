@@ -59,6 +59,7 @@ from app.repositories.season_settlements import (
     has_active_supplement_eligibility,
     insert_season_reward_point_record,
     lock_expired_active_seasons,
+    lock_open_seasons,
     lock_season_point_issuance_target,
     lock_season_user_for_finalization,
     lock_settlement_projects_for_finalization,
@@ -66,6 +67,7 @@ from app.repositories.season_settlements import (
     lock_settlement_user,
     lock_settling_seasons,
     mark_season_as_settling,
+    mark_season_as_active,
     mark_season_ended_if_complete,
     mark_season_points_issued,
     set_final_points,
@@ -106,6 +108,10 @@ class SettlementProgressConsistencyError(RuntimeError):
 
 class SettlementTransitionConflictError(RuntimeError):
     """锁定到期赛季后状态更新失败，结算初始化必须整体回滚。"""
+
+
+class SeasonActivationConsistencyError(RuntimeError):
+    """赛季数据违反自动激活所依赖的唯一进行中或唯一到期候选约束。"""
 
 
 class SettlingSeasonNotFoundError(RuntimeError):
@@ -293,6 +299,44 @@ async def initialize_expired_season(
             raise SettlementTransitionConflictError
         await clear_supplement_eligibilities(session)
         return expired_season
+
+
+# 按上海业务日期激活唯一已到开始日的赛季，结算中赛季不阻塞新赛季开放。
+async def activate_due_season(
+    session: AsyncSession,
+    business_date: date,
+) -> SettlementSeason | None:
+    async with session.begin():
+        open_seasons = await lock_open_seasons(session)
+        active_seasons = tuple(
+            season for season, status in open_seasons if status == 1
+        )
+        if len(active_seasons) > 1:
+            raise SeasonActivationConsistencyError(
+                "同时存在多个进行中赛季"
+            )
+        if active_seasons:
+            return None
+
+        due_seasons = tuple(
+            season
+            for season, status in open_seasons
+            if status == 0
+            and season.start_date <= business_date <= season.end_date
+        )
+        if len(due_seasons) > 1:
+            raise SeasonActivationConsistencyError(
+                "同时存在多个应激活的未开始赛季"
+            )
+        if not due_seasons:
+            return None
+
+        due_season = due_seasons[0]
+        if not await mark_season_as_active(session, due_season.id):
+            raise SeasonActivationConsistencyError(
+                "目标赛季状态已发生并发变化"
+            )
+        return due_season
 
 
 # 在短只读事务中获取当前唯一结算赛季，发现脏状态时拒绝继续写业务数据。

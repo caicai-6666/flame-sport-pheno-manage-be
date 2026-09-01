@@ -14,6 +14,7 @@ from app.services.season_settlements import (
     SeasonCompletionConflictError,
     SettlementCycleResult,
     SettlingSeasonNotFoundError,
+    activate_due_season,
     complete_settling_season,
     get_single_settling_season,
     run_season_settlement_cycle,
@@ -73,6 +74,13 @@ async def check_season_settlement(
         review_concurrency,
         user_batch_size,
     )
+    async with session_factory() as session:
+        activated_season = await activate_due_season(session, effective_date)
+    if activated_season is not None:
+        logger.info(
+            "赛季已自动进入进行中 season_id=%s",
+            activated_season.id,
+        )
     if not auto_complete_enabled or result.season_ended:
         return result
     completion = await auto_complete_overdue_settling_season(
