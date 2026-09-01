@@ -3,15 +3,18 @@
 import asyncio
 import logging
 from collections.abc import AsyncIterator
+from pathlib import Path
 from uuid import uuid4
 
 from app.agent.text2sql.diagnostics import AgentQueryDiagnosticLogger
-from app.agent.text2sql.model_messages import ModelMessageTraceQueue
-from app.agent.text2sql.subgraphs.message_formatting import (
-    SettingsBackedUserMessageFormatter,
+from app.agent.text2sql.history_projection import (
+    build_result_response,
+    build_session_response,
+    build_trace_response,
 )
+from app.agent.text2sql.history_store import AgentQueryHistoryStore
+from app.agent.text2sql.model_messages import ModelMessageTraceQueue
 from app.agent.text2sql.domains.registry import get_query_domain_profile
-from app.agent.text2sql.pipeline import AgentQueryPipeline, AgentQueryPipelineResult
 from app.agent.text2sql.events.models import AgentProgressEvent, AgentProgressUpdate
 from app.agent.text2sql.interaction.session import (
     AgentQueryCancelled,
@@ -19,10 +22,19 @@ from app.agent.text2sql.interaction.session import (
     AgentQuerySession,
     TERMINAL_QUERY_STATUSES,
 )
+from app.agent.text2sql.pipeline import AgentQueryPipeline, AgentQueryPipelineResult
+from app.agent.text2sql.shared.model_options import resolve_model_provider_connection
+from app.agent.text2sql.subgraphs.message_formatting import (
+    SettingsBackedUserMessageFormatter,
+)
 from app.agent.text2sql.subgraphs.planning.tools.table_schema_cache import CachingTableSchemaReader
 from app.agent.text2sql.subgraphs.planning.tools.table_schema_reader import InformationSchemaTableSchemaReader
-from app.agent.text2sql.shared.model_options import resolve_model_provider_connection
-from app.core.config import Settings
+from app.core.config import Settings, resolve_project_path
+from app.schemas.agent_query import (
+    AgentQueryResultResponse,
+    AgentQuerySessionResponse,
+    AgentQueryTraceResponse,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -31,6 +43,9 @@ DEFAULT_MAX_ACTIVE_SESSIONS = 20
 DEFAULT_EVENT_HISTORY_SIZE = 200
 DEFAULT_SESSION_TTL_SECONDS = 3600
 DEFAULT_SSE_HEARTBEAT_SECONDS = 15
+DEFAULT_HISTORY_PATH = Path("data/query-history/query-history.sqlite3")
+DEFAULT_HISTORY_RETENTION_DAYS = 30
+DEFAULT_HISTORY_CACHE_TTL_SECONDS = 600
 
 
 class AgentQueryCapacityError(RuntimeError):
@@ -113,6 +128,25 @@ class AgentQueryManager:
             settings,
             "agent_query_sse_heartbeat_seconds",
             DEFAULT_SSE_HEARTBEAT_SECONDS,
+        )
+        self._history_store = AgentQueryHistoryStore(
+            resolve_project_path(
+                getattr(
+                    settings,
+                    "agent_query_history_path",
+                    DEFAULT_HISTORY_PATH,
+                )
+            ),
+            getattr(
+                settings,
+                "agent_query_history_retention_days",
+                DEFAULT_HISTORY_RETENTION_DAYS,
+            ),
+            getattr(
+                settings,
+                "agent_query_history_cache_ttl_seconds",
+                DEFAULT_HISTORY_CACHE_TTL_SECONDS,
+            ),
         )
         self._sessions: dict[str, AgentQuerySession] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
@@ -264,6 +298,7 @@ class AgentQueryManager:
                     _build_session_safe_result(result),
                     user_message,
                 )
+                await self._persist_successful_query(session)
             elif result.status == "abandoned":
                 user_message = result.user_message or "本次查询已停止。"
                 self._publish_progress(
@@ -356,6 +391,31 @@ class AgentQueryManager:
             user_message,
         )
 
+    # 仅保存形成可返回表格的成功查询；持久化失败只记录异常，不篡改已返回的查询结果。
+    async def _persist_successful_query(
+        self,
+        session: AgentQuerySession,
+    ) -> None:
+        result = session.get_result()
+        if (
+            session.snapshot().status != "completed"
+            or result is None
+            or result.status != "success"
+            or result.audit_result is None
+        ):
+            return
+        try:
+            await self._history_store.save_success(
+                build_session_response(session),
+                build_trace_response(session),
+                build_result_response(session),
+            )
+        except Exception:
+            logger.exception(
+                "成功查询历史写入失败 query_id=%s",
+                session.query_id,
+            )
+
     # 同时写入脱敏诊断事件和现有会话队列，保证日志与 SSE 阶段顺序一致。
     def _publish_progress(
         self,
@@ -384,7 +444,34 @@ class AgentQueryManager:
                 key=lambda session: session.snapshot().created_at,
                 reverse=True,
             )
-            return [session.query_id for session in sessions[:limit]]
+            memory_query_ids = [
+                session.query_id for session in sessions[:limit]
+            ]
+        persisted_query_ids = await self._history_store.list_query_ids(limit)
+        return list(
+            dict.fromkeys(memory_query_ids + persisted_query_ids)
+        )[:limit]
+
+    # 按标识读取已落盘的成功查询状态，供内存热缓存过期后继续访问。
+    async def load_persisted_session(
+        self,
+        query_id: str,
+    ) -> AgentQuerySessionResponse | None:
+        return await self._history_store.load_session(query_id)
+
+    # 按标识读取已落盘的友好轨迹，不加载完整结果表。
+    async def load_persisted_trace(
+        self,
+        query_id: str,
+    ) -> AgentQueryTraceResponse | None:
+        return await self._history_store.load_trace(query_id)
+
+    # 按标识读取已落盘的完整前端结果，仅由 result 接口按需调用。
+    async def load_persisted_result(
+        self,
+        query_id: str,
+    ) -> AgentQueryResultResponse | None:
+        return await self._history_store.load_result(query_id)
 
     # 将用户答案提交给当前待处理交互，具体 ID、空值和重复提交由会话原子校验。
     async def answer_interaction(

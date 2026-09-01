@@ -2,7 +2,7 @@
 
 > **文档目的**
 >
-> 本文档定义管理端获取与创建运动项目、修改项目可见状态，以及按项目和挑战等级读取规则内容的接口契约、筛选口径和数据边界。
+> 本文档定义管理端获取与创建运动项目、修改项目名称与可见状态，以及按项目和挑战等级读取规则内容的接口契约、筛选口径和数据边界。
 
 ## 1. 功能目标
 
@@ -11,9 +11,10 @@
 - `list` 接口获取全部项目及其可见状态，由管理前端过滤隐藏项目；
 - `rule` 接口使用项目 ID 与等级 ID 定位对应规则，并返回副描述、指标内容和规则备注；
 - `create` 接口一次提交项目基础信息、全部等级规则、凭证上传配置和 WebP 图标；
+- 项目名称接口在统一配置时间窗口内修改项目展示名称；
 - 项目状态接口在统一配置时间窗口内切换可见或隐藏状态。
 
-项目状态修改不会物理删除项目，也不会修改其名称、说明、图标或关联规则。
+项目名称和状态修改都不会物理删除项目，也不会修改其说明、图标或关联规则。
 
 ---
 
@@ -249,9 +250,78 @@ Content-Type: application/json
 
 ---
 
-## 5. `POST /project/create` 创建运动项目
+## 5. `PATCH /project/{project_id}/name` 修改项目名称
 
 ### 5.1 接口定义
+
+| 项目 | 内容 |
+| --- | --- |
+| FastAPI 路径 | `/flame/admin/api/project/{project_id}/name` |
+| Nginx 开发路径 | `/dev/flame/admin/api/project/{project_id}/name` |
+| Content-Type | `application/json` |
+| 认证要求 | 有效的管理员 Bearer Token |
+
+请求示例：
+
+```http
+PATCH /dev/flame/admin/api/project/2/name
+Authorization: Bearer <admin-token>
+Content-Type: application/json
+
+{
+  "name": "力量训练"
+}
+```
+
+| 参数位置 | 字段 | 类型 | 必填 | 约束 | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| Path | `project_id` | `integer` | 是 | 大于 `0` | 目标运动项目主键 |
+| Body | `name` | `string` | 是 | 去除首尾空白后长度为 `1～64` | 新的项目展示名称 |
+
+请求体不接受额外字段。项目名称受数据库唯一约束，不能与其他项目重名。
+
+### 5.2 修改规则
+
+名称修改受 `ACTIVE_SEASON_CONFIG_EDIT_WINDOW_HOURS` 保护，判断规则与项目可见状态修改一致：
+
+1. 没有 `status = 1` 的激活赛季时允许修改。
+2. 存在唯一激活赛季时，只允许在 `start_date 00:00` 起的配置窗口内修改。
+3. 当前时间达到或超过截止时刻时拒绝修改。
+4. 同时存在多个激活赛季时拒绝修改并报告赛季数据冲突。
+
+服务在同一事务中先检查配置窗口，再锁定目标项目并修改名称。重复提交当前名称保持成功；名称变化不会修改项目主键，因此现有项目规则、上传配置、参赛项目和运动凭证仍关联同一个项目。
+
+### 5.3 成功响应
+
+状态码：`200 OK`。接口返回修改后的完整项目基础信息：
+
+```json
+{
+  "project_id": 2,
+  "project_name": "力量训练",
+  "description": "记录每日训练",
+  "icon_url": "/fitness.webp",
+  "status": 1
+}
+```
+
+### 5.4 异常处理
+
+| 场景 | 状态码 | `detail` 或处理方式 |
+| --- | --- | --- |
+| `project_id` 非正整数，名称为空、超长或请求包含额外字段 | `422 Unprocessable Content` | FastAPI 请求校验错误 |
+| 运动项目不存在 | `404 Not Found` | `运动项目不存在` |
+| 新名称已经被其他项目使用 | `409 Conflict` | `运动项目名称已存在` |
+| 当前激活赛季的配置修改窗口已关闭 | `409 Conflict` | `当前激活赛季的配置修改窗口已关闭` |
+| 数据库同时存在多个激活赛季 | `409 Conflict` | `存在多个激活赛季，无法判断配置修改窗口` |
+| 管理员 Token 缺失、无效或过期 | `303 See Other` | 重定向至管理端登录接口 |
+| 数据库写入失败 | `500 Internal Server Error` | 回滚事务，不暴露 SQL 或连接信息 |
+
+---
+
+## 6. `POST /project/create` 创建运动项目
+
+### 6.1 接口定义
 
 | 项目 | 内容 |
 | --- | --- |
@@ -353,7 +423,7 @@ Content-Type: multipart/form-data
 - 文件大小不能超过 `5 MiB`；
 - 图片最长边不能超过 `1600` 像素。
 
-### 5.2 创建规则与处理流程
+### 6.2 创建规则与处理流程
 
 创建项目属于高影响配置写入，受 `ACTIVE_SEASON_CONFIG_EDIT_WINDOW_HOURS` 保护。接口按照以下顺序执行：
 
@@ -372,7 +442,7 @@ Content-Type: multipart/form-data
 
 没有激活赛季时允许创建项目；存在唯一激活赛季时，仅能在配置窗口内创建；存在多个激活赛季或窗口已关闭时拒绝写入。
 
-### 5.3 成功响应
+### 6.3 成功响应
 
 状态码：`201 Created`。
 
@@ -388,7 +458,7 @@ Content-Type: multipart/form-data
 
 响应字段与 [`GET /project/list`](#2-get-projectlist-获取全部项目) 中的单个项目保持一致。`icon_url` 是客户端后端已经确认保存的最终相对地址。
 
-### 5.4 异常处理
+### 6.4 异常处理
 
 | 场景 | 状态码 | `detail` 或处理方式 |
 | --- | --- | --- |
@@ -409,7 +479,7 @@ Content-Type: multipart/form-data
 
 ---
 
-## 6. 数据、事务与依赖
+## 7. 数据、事务与依赖
 
 数据事实来源：
 
@@ -425,11 +495,11 @@ Content-Type: multipart/form-data
 - `app/repositories/projects.py`
 - `app/router/__init__.py`
 
-列表和规则查询接口由应用服务在显式只读事务中调用仓储执行有界查询。项目创建会写入 `project`、`project_rule` 和 `project_upload_config`，并通过客户端后端保存图标；项目状态修改接口在单一写事务内按以下顺序执行：
+列表和规则查询接口由应用服务在显式只读事务中调用仓储执行有界查询。项目创建会写入 `project`、`project_rule` 和 `project_upload_config`，并通过客户端后端保存图标；项目名称和状态修改接口都在单一写事务内按以下顺序执行：
 
 1. 共享锁定激活赛季并校验配置时间窗口。
 2. 使用 `FOR UPDATE` 锁定目标项目。
-3. 参数化覆盖 `project.status`。
+3. 参数化覆盖 `project.name` 或 `project.status`。
 4. 提交事务并返回更新后的项目基础信息。
 
 统一采用“赛季锁在前、项目锁在后”的顺序，避免不同高影响配置接口形成相反锁顺序。项目列表中的 `icon_url` 只作为字符串返回；读取图标文件时应调用 [图片安全中转 API](image.md) 的 `/image/project_icon` 接口。列表服务不替前端隐藏 `status = 0` 的项目。
@@ -438,17 +508,17 @@ Content-Type: multipart/form-data
 
 ---
 
-## 7. 验证方式
+## 8. 验证方式
 
 ```bash
-python -m unittest tests.test_project_list tests.test_project_rule tests.test_project_status tests.test_project_creation -v
+python -m unittest tests.test_project_list tests.test_project_rule tests.test_project_status tests.test_project_name tests.test_project_creation -v
 ```
 
-测试覆盖全部项目、可空说明与状态映射、隐藏项目返回、稳定排序、空结果、联合规则查询、副描述与备注映射、JSON 还原、规则不存在，状态修改的请求校验、管理员认证、配置窗口、项目行锁、事务、幂等写入和异常映射，以及项目创建的 multipart 解析、WebP 校验、规则矩阵、批量持久化、内部上传协议和失败回滚。
+测试覆盖全部项目、可空说明与状态映射、隐藏项目返回、稳定排序、空结果、联合规则查询、副描述与备注映射、JSON 还原、规则不存在，名称和状态修改的请求校验、管理员认证、配置窗口、项目行锁、事务、幂等写入和异常映射，以及项目创建的 multipart 解析、WebP 校验、规则矩阵、批量持久化、内部上传协议和失败回滚。
 
 ---
 
-## 8. 已知限制
+## 9. 已知限制
 
 - 前端过滤隐藏项目时必须明确判断 `status = 1`，不能把接口返回即视为可选择。
 - 当前没有项目自定义排序字段，因此按主键升序返回。

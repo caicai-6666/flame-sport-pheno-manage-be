@@ -10,6 +10,9 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
+# 查询智能体成功历史由运行时 SQLite 管理，不纳入版本控制。
+data/query-history/
+
 # 本地测试代码不纳入版本控制。
 tests/
 

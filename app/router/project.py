@@ -1,6 +1,6 @@
 """提供管理端运动项目查询、创建与可见状态修改接口。"""
 
-from typing import Annotated, TypeVar
+from typing import Annotated
 
 from fastapi import (
     APIRouter,
@@ -12,25 +12,27 @@ from fastapi import (
     UploadFile,
     status,
 )
-from pydantic import TypeAdapter, ValidationError
-
 from app.db.session import DatabaseSession
 from app.repositories.projects import (
     ProjectRuleCreation,
     ProjectUploadConfigurationCreation,
 )
 from app.router.dependencies import ClientBackend
+from app.router.support.forms import parse_json_form_field
+from app.router.support.uploads import read_limited_upload
 from app.schemas.project import (
     PROJECT_FORM_ADAPTER,
     PROJECT_RULES_FORM_ADAPTER,
     PROJECT_UPLOAD_CONFIGS_FORM_ADAPTER,
     ProjectInformationResponse,
     ProjectRuleResponse,
+    UpdateProjectNameRequest,
     UpdateProjectVisibilityStatusRequest,
 )
 from app.services.projects import (
     InvalidProjectIconContentError,
     InvalidProjectIconMediaTypeError,
+    MAX_PROJECT_ICON_SIZE_BYTES,
     ProjectCreation,
     ProjectIconDimensionsExceededError,
     ProjectIconSizeExceededError,
@@ -42,6 +44,7 @@ from app.services.projects import (
     create_project as create_project_service,
     get_project_rule_content as get_project_rule_content_service,
     list_projects as list_projects_service,
+    update_project_name as update_project_name_service,
     update_project_visibility_status as update_project_visibility_status_service,
 )
 from app.services.configuration_guard import (
@@ -56,31 +59,6 @@ from app.services.images import (
 )
 
 router = APIRouter(prefix="/project", tags=["project"])
-
-ParsedFormValue = TypeVar("ParsedFormValue")
-
-
-# 将 multipart 中的 JSON 字符串解析为强类型对象，并返回字段级安全校验提示。
-def parse_json_form_field(
-    raw_value: str,
-    adapter: TypeAdapter[ParsedFormValue],
-    field_name: str,
-) -> ParsedFormValue:
-    try:
-        return adapter.validate_json(raw_value)
-    except (ValidationError, ValueError) as error:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=f"{field_name} 必须是符合接口定义的 JSON 字符串",
-        ) from error
-
-
-# 限量读取并关闭上传文件，避免超大请求在应用内被完整加载或遗留临时句柄。
-async def read_project_icon_file(icon_file: UploadFile) -> bytes:
-    try:
-        return await icon_file.read(5 * 1024 * 1024 + 1)
-    finally:
-        await icon_file.close()
 
 
 # 接收全部项目列表请求并返回可见状态，供管理前端自行过滤隐藏项目。
@@ -188,6 +166,58 @@ async def update_project_visibility_status(
     )
 
 
+# 按项目主键修改展示名称，并统一映射不存在、重名和配置窗口冲突。
+@router.patch(
+    "/{project_id}/name",
+    response_model=ProjectInformationResponse,
+    summary="修改项目名称",
+    responses={
+        status.HTTP_404_NOT_FOUND: {"description": "运动项目不存在"},
+        status.HTTP_409_CONFLICT: {
+            "description": "项目名称重复、配置窗口已关闭或赛季数据冲突"
+        },
+        status.HTTP_422_UNPROCESSABLE_CONTENT: {
+            "description": "项目主键或项目名称不符合字段约束"
+        },
+    },
+)
+async def update_project_name(
+    session: DatabaseSession,
+    project_id: Annotated[int, Path(gt=0, description="运动项目 ID")],
+    request: UpdateProjectNameRequest,
+) -> ProjectInformationResponse:
+    try:
+        project = await update_project_name_service(
+            session,
+            project_id,
+            request.name,
+        )
+    except ProjectNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="运动项目不存在",
+        ) from error
+    except ProjectNameConflictError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="运动项目名称已存在",
+        ) from error
+    except ActiveSeasonConfigurationWindowClosedError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="当前激活赛季的配置修改窗口已关闭",
+        ) from error
+    except MultipleActiveSeasonsForConfigurationError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="存在多个激活赛季，无法判断配置修改窗口",
+        ) from error
+    return ProjectInformationResponse.model_validate(
+        project,
+        from_attributes=True,
+    )
+
+
 # 解析 multipart 项目配置并编排数据库写入与客户端 WebP 图标上传。
 @router.post(
     "/create",
@@ -253,7 +283,10 @@ async def create_project(
         )
 
     icon_media_type = icon_file.content_type
-    icon_content = await read_project_icon_file(icon_file)
+    icon_content = await read_limited_upload(
+        icon_file,
+        MAX_PROJECT_ICON_SIZE_BYTES,
+    )
     creation = ProjectCreation(
         name=project_request.name,
         description=project_request.description,

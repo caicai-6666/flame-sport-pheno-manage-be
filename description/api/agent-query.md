@@ -26,7 +26,7 @@ GET /dev/flame/admin/api/agent/queries/cached-record-ids?limit=100
 Authorization: Bearer <admin-token>
 ```
 
-状态码：`200 OK`。接口只返回当前进程内、尚未超过 `AGENT_QUERY_SESSION_TTL_SECONDS` 保留期的查询标识，按创建时间倒序排列；运行中、等待交互和终态查询都会包含在内。
+状态码：`200 OK`。接口返回当前进程内仍保留的查询标识，以及 SQLite 保留期内已经成功形成结果的历史查询标识。运行中、等待交互、短期内存终态和持久化成功查询都会包含在内，重复标识会被去除。
 
 ```json
 {
@@ -37,7 +37,7 @@ Authorization: Bearer <admin-token>
 }
 ```
 
-`limit` 可选，默认 `100`，范围为 `1～200`。前端必须使用返回的 `query_id` 分别调用状态、轨迹或结果接口；本接口不返回问题、轨迹或表格，避免一次传输大量缓存内容。服务重启、会话过期或多进程部署后，列表不保证保留旧记录。
+`limit` 可选，默认 `100`，范围为 `1～200`。前端必须使用返回的 `query_id` 分别调用状态、轨迹或结果接口；本接口不返回问题、轨迹或表格，避免一次传输大量历史内容。失败、放弃和取消查询只在内存会话保留期内可见，不写入 SQLite。
 
 ---
 
@@ -197,7 +197,7 @@ GET /dev/flame/admin/api/agent/queries/<query_id>/trace
 Authorization: Bearer <admin-token>
 ```
 
-状态码：`200 OK`。接口返回当前内存保留期内的原始问题、已对齐问题、用户交互问答和面向操作员的关键阶段时间线；不会返回表格、SQL、模型原始响应、隐藏推理或工具参数。业务对齐尚未完成时，`aligned_question` 为 `null`，但对应阶段事件仍会出现在 `entries` 中。成功查询的最终 `result` 阶段记录包含与 SSE 一致的 `result_summary`；表格与完整审计字段仍由 `result` 接口单独返回。后台按 `query_id` 记录的模型请求与响应消息队列只写入受控服务日志，不通过本接口或其他查询智能体 HTTP 接口返回。
+状态码：`200 OK`。接口优先返回当前内存会话中的原始问题、已对齐问题、用户交互问答和面向操作员的关键阶段时间线；内存会话不存在时，按 `query_id` 从 SQLite 加载成功查询的同一安全响应。接口不会返回表格、SQL、模型原始响应、隐藏推理或工具参数。业务对齐尚未完成时，`aligned_question` 为 `null`，但对应阶段事件仍会出现在 `entries` 中。成功查询的最终 `result` 阶段记录包含与 SSE 一致的 `result_summary`；表格与完整审计字段仍由 `result` 接口单独返回。后台按 `query_id` 记录的模型请求与响应消息队列只写入受控服务日志，不通过本接口或其他查询智能体 HTTP 接口返回。
 
 ```json
 {
@@ -236,7 +236,7 @@ Authorization: Bearer <admin-token>
 
 `entry_type` 包括 `question_submitted`、`progress`、`interaction_requested` 和 `interaction_answered`。`interaction_requested` 会在 `options` 中返回当时展示给操作员的选项；用户答案作为 `interaction_answered` 单独记录，不通过 SSE 再次推送。
 
-轨迹与 SSE 补发队列是独立的内存集合，均受 `AGENT_QUERY_EVENT_HISTORY_SIZE` 限制，并跟随 `AGENT_QUERY_SESSION_TTL_SECONDS` 清理。会话不存在、服务重启或保留期已过时返回 `404`。
+活动会话的轨迹与 SSE 补发队列是独立的内存集合，均受 `AGENT_QUERY_EVENT_HISTORY_SIZE` 限制，并跟随 `AGENT_QUERY_SESSION_TTL_SECONDS` 清理。查询成功后，最终友好轨迹另行写入 SQLite，并按 `AGENT_QUERY_HISTORY_RETENTION_DAYS` 保留；失败、放弃和取消轨迹不会落盘。记录不存在或对应保留期已过时返回 `404`。
 
 ---
 
@@ -333,4 +333,4 @@ Authorization: Bearer <admin-token>
 
 ## 11. 验证方式与已知限制
 
-自动化接口测试覆盖认证、创建、需求确认、必要业务澄清、提交回答、历史轨迹、完成、SSE 历史重放和表格结果读取。当前会话仅存于单进程内存，服务重启后旧 `query_id` 不再可用；当前部署不得启用多 Worker。
+自动化接口测试覆盖认证、创建、需求确认、必要业务澄清、提交回答、历史轨迹、完成、SSE 历史重放、成功结果持久化和表格结果按需读取。活动会话、交互和 SSE 订阅仍只存在单进程内存，服务重启后不能恢复运行中的任务；已经成功生成的安全状态、友好轨迹和表格结果可以从 SQLite 继续读取。当前部署仍不得启用多 Worker。

@@ -9,6 +9,11 @@ from sqlalchemy import URL
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
+# 将运行数据的相对路径固定解析到项目根目录，避免 IDE 工作目录变化生成 app/data。
+def resolve_project_path(path: Path) -> Path:
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env",
@@ -137,6 +142,20 @@ class Settings(BaseSettings):
     agent_query_event_history_size: int = Field(default=200, ge=20, le=2000)
     agent_query_session_ttl_seconds: int = Field(default=3600, ge=60, le=86400)
     agent_query_sse_heartbeat_seconds: int = Field(default=15, ge=5, le=60)
+    # 成功查询历史写入本地 SQLite；相对路径统一以项目根目录为基准。
+    agent_query_history_path: Path = Path(
+        "data/query-history/query-history.sqlite3"
+    )
+    agent_query_history_retention_days: int = Field(
+        default=30,
+        ge=1,
+        le=3650,
+    )
+    agent_query_history_cache_ttl_seconds: int = Field(
+        default=600,
+        ge=0,
+        le=86400,
+    )
     # 诊断日志默认关闭；启用后只向 Docker 标准输出写入脱敏结构化事件。
     agent_query_diagnostic_log_enabled: bool = False
     agent_query_diagnostic_log_level: Literal["basic", "detailed", "trace"] = "basic"

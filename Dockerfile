@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     TZ=Asia/Shanghai
 
-WORKDIR /app
+WORKDIR /workspace
 
 RUN groupadd --system app \
     && useradd --system --gid app --create-home app
@@ -18,6 +18,9 @@ RUN python -m pip install --upgrade pip \
 
 COPY --chown=app:app app ./app
 COPY --chown=app:app data ./data
+RUN mkdir -p /workspace/data/query-history \
+    && chown app:app /workspace/data/query-history \
+    && chmod 700 /workspace/data/query-history
 
 USER app
 

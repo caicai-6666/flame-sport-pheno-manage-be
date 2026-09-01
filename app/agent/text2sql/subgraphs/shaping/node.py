@@ -88,6 +88,14 @@ class ResultShapingSubgraphResult(BaseModel):
         description="塑形后的最终结果行数",
     )
     error: str | None = Field(default=None, description="失败时的可定位原因")
+    error_code: str | None = Field(
+        default=None,
+        description="失败原因的稳定机器可读代码",
+    )
+    repair_action: str | None = Field(
+        default=None,
+        description="调用方针对当前失败应执行的唯一修复动作",
+    )
     material_shape_plan: MaterialResultShapePlan | None = Field(
         default=None,
         description="新原料协议编译出的确定性塑形计划",
@@ -667,12 +675,9 @@ class MaterialResultShapingSubgraph:
         self,
         state: _MaterialResultShapingState,
     ) -> dict[str, Any]:
-        try:
-            dynamic_column_contract = parse_dynamic_column_contract(
-                state["shaping_guidance"]
-            )
-        except DynamicColumnContractError as error:
-            raise RuntimeError(f"原料塑形指导不符合动态列数量契约：{error}") from error
+        dynamic_column_contract = parse_dynamic_column_contract(
+            state["shaping_guidance"]
+        )
         messages: list[Any] = build_material_shaping_messages(
             state["shaping_guidance"],
             state["result_columns"],
@@ -823,6 +828,18 @@ class MaterialResultShapingSubgraph:
                         "result_columns": result_columns,
                         "rows": rows,
                     }
+                )
+            except DynamicColumnContractError as error:
+                self._write_trace(
+                    "[塑形层] 动态列契约校验失败："
+                    f"code={error.code} message={error}"
+                )
+                return ResultShapingSubgraphResult(
+                    status="failure",
+                    source_row_count=len(rows),
+                    error=str(error),
+                    error_code=error.code,
+                    repair_action=error.repair_action,
                 )
             except Exception as error:
                 self._write_trace(f"[塑形层] 执行失败：{error}")

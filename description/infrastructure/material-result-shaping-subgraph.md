@@ -38,7 +38,9 @@ flowchart LR
     D --> E[带列来源的最终布局]
 ```
 
-`compile_shape_plan` 使用 `tool_choice=auto`、非 strict Pydantic Schema、关闭隐藏思考和全局 tool-tag 模板。缺少工具、多工具、错误工具、参数错误和不存在的结果列分别返回准确错误；最多修复一次。程序还会解析塑形指导中的唯一动态列数量声明：固定 N 列时，模型必须把 `expected_pivot_columns` 精确编译为 N；由完整结果决定时必须为 `null`；不适用时必须使用 `passthrough`。不一致作为原工具失败结果反馈模型修正。
+`compile_shape_plan` 使用 `tool_choice=auto`、非 strict Pydantic Schema、关闭隐藏思考和全局 tool-tag 模板。缺少工具、多工具、错误工具、参数错误和不存在的结果列分别返回准确错误；最多修复一次。程序还会解析塑形指导中的唯一动态列数量声明：固定 N 列时，模型必须把 `expected_pivot_columns` 精确编译为 N；由完整结果决定时必须为 `null`；不适用时必须使用 `passthrough`。
+
+动态列声明缺失、重复、格式非法或固定数量超过 `100` 时，子图在调用塑形模型前返回独立稳定错误代码、准确失败事实和针对当前错误的修复动作。Planning 必须按该动作只修正错误声明并复用原料结果，不能把文本契约校验误判为模型服务或数据库故障。
 
 `shape_rows` 不调用模型。它始终处理完整 SQL 结果，而不是前五行样本。透传逐格复制原值；动态转列按稳定键分组并拒绝同组普通字段冲突。指导明确动态列数量时，即使完整结果为零行也先生成固定表头；实际成员超过该数量则失败，不能静默截断。
 
@@ -56,7 +58,7 @@ flowchart LR
 - 实际成员数量超过操作员确认的动态列数量；
 - 工具协议或参数在有限修复后仍不合法。
 
-失败结果会以友好原因和修正方向返回 Planning。原料完整时，Planning 可以继续引用同一个 `material_result_id` 并提交更精确的塑形指导；反馈指出原料缺失时，Planning 必须重新调用 `query_material_data`，不能用布局规则补造数据。
+失败结果会以错误代码、准确原因和修正方向返回 Planning。动态列文本契约使用 `shaping_dynamic_column_declaration_missing`、`shaping_dynamic_column_declaration_duplicate`、`shaping_dynamic_column_declaration_invalid` 和 `shaping_dynamic_column_count_out_of_range` 区分四类错误。原料完整时，Planning 可以继续引用同一个 `material_result_id` 并提交更精确的塑形指导；反馈指出原料缺失时，Planning 必须重新调用 `query_material_data`，不能用布局规则补造数据。
 
 只有 Planning 通过 `submit_final_query_result` 选中成功的 `shaped_result_id` 后，主 Pipeline 才直接进入字段翻译。普通列和动态列都保留来源 SQL 别名，使翻译层能够读取对应数据库字段注释；翻译失败只降级为原始值，不回滚已完成的布局。
 
@@ -66,4 +68,4 @@ flowchart LR
 
 `DEEPSEEK_QUERY_SHAPING_MAX_TOKENS` 限制单次布局计划输出，模型供应商、地址和工具标签沿用整条查询流水线的全局配置。
 
-自动测试覆盖工具 Schema、受限 YAML 上下文、原料表头、`tool_choice=auto`、vLLM 关闭思考参数、动态转列、零行固定表头、固定列数修复、列来源保留、列数溢出、失败不产生结果 ID，以及 Planning 选中塑形结果后 Pipeline 直接进入翻译的执行顺序。
+自动测试覆盖工具 Schema、受限 YAML 上下文、原料表头、`tool_choice=auto`、vLLM 关闭思考参数、动态列文本契约分类错误、动态转列、零行固定表头、固定列数修复、列来源保留、列数溢出、失败不产生结果 ID，以及 Planning 选中塑形结果后 Pipeline 直接进入翻译的执行顺序。

@@ -33,6 +33,15 @@ class UpdateProjectVisibilityStatusRequest(BaseModel):
     status: int = Field(strict=True, ge=0, le=1)
 
 
+class UpdateProjectNameRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=1, max_length=64),
+    ]
+
+
 class CreateProjectRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

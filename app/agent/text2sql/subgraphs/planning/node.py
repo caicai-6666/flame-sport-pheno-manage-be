@@ -997,12 +997,17 @@ def _render_material_shaping_failure(
     material_result_id: str,
     shaping_result: ResultShapingSubgraphResult,
 ) -> str:
+    error_code = shaping_result.error_code or "material_shaping_failed"
+    repair_action = shaping_result.repair_action or (
+        "若原料列完整，请更精确地说明最终行粒度、字段、分组、排序和动态列后重新塑形；"
+        "若反馈指出缺少原料，请重新查询。"
+    )
     return (
         "【塑形状态】失败\n\n"
         f"- 来源原料结果 ID：`{material_result_id}`\n"
+        f"- 错误代码：{error_code}\n"
         f"- 失败原因：{shaping_result.error or '塑形工具未产生可用结果。'}\n"
-        "- 修正提示：若原料列完整，请更精确地说明最终行粒度、字段、分组、"
-        "排序和动态列后重新塑形；若反馈指出缺少原料，请重新查询。\n\n"
+        f"- 修正提示：{repair_action}\n\n"
         "本次失败未生成塑形结果 ID，不能提交为最终结果。"
     )
 

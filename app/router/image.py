@@ -1,6 +1,5 @@
 """提供经客户端后端安全中转的图片 HTTP 接口。"""
 
-from collections.abc import Awaitable
 from typing import Annotated
 
 from fastapi import (
@@ -16,22 +15,17 @@ from fastapi import (
 
 from app.core.config import get_settings
 from app.router.dependencies import ClientBackend
+from app.router.support.image_response import build_image_response
+from app.router.support.uploads import read_limited_upload
 from app.schemas.image import PosterReplacementResponse
 from app.services.images import (
-    EmptyImageAddressError,
     EmptyPosterImageError,
-    ImageBackendResponseError,
-    ImageBackendUnavailableError,
-    ImageNotFoundError,
-    InvalidImageContentError,
-    InvalidImagePathError,
     InvalidPosterMediaTypeError,
     InvalidPosterUploadError,
     MAX_POSTER_UPLOAD_SIZE_BYTES,
     PosterBackendResponseError,
     PosterBackendUnavailableError,
     PosterUploadTooLargeError,
-    ProxiedImage,
     get_avatar_image,
     get_poster_image,
     get_product_image,
@@ -42,51 +36,6 @@ from app.services.images import (
 
 router = APIRouter(prefix="/image", tags=["image"])
 settings = get_settings()
-
-
-# 限量读取并关闭海报上传文件，避免超大内容继续占用应用内存和临时句柄。
-async def read_poster_file(image: UploadFile) -> bytes:
-    try:
-        return await image.read(MAX_POSTER_UPLOAD_SIZE_BYTES + 1)
-    finally:
-        await image.close()
-
-
-# 将图片服务结果与异常统一映射为安全 HTTP 响应，避免不同图片接口产生协议偏差。
-async def build_image_response(
-    image_operation: Awaitable[ProxiedImage],
-) -> Response:
-    try:
-        image = await image_operation
-    except (EmptyImageAddressError, InvalidImagePathError) as error:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(error),
-        ) from error
-    except ImageNotFoundError as error:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(error),
-        ) from error
-    except (
-        ImageBackendUnavailableError,
-        ImageBackendResponseError,
-        InvalidImageContentError,
-    ) as error:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=str(error),
-        ) from error
-
-    return Response(
-        content=image.content,
-        status_code=status.HTTP_200_OK,
-        headers={
-            "Content-Type": image.media_type,
-            "Cache-Control": f"private, max-age={image.cache_seconds}",
-            "X-Content-Type-Options": "nosniff",
-        },
-    )
 
 
 # 接收头像地址并调用固定头像中转用例，参数不能改变上游接口路径。
@@ -303,7 +252,10 @@ async def update_poster(
     ],
 ) -> PosterReplacementResponse:
     image_media_type = image.content_type
-    image_content = await read_poster_file(image)
+    image_content = await read_limited_upload(
+        image,
+        MAX_POSTER_UPLOAD_SIZE_BYTES,
+    )
     try:
         replaced_poster = await replace_poster_image(
             client_backend,

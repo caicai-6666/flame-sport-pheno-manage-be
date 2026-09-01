@@ -12,18 +12,19 @@ from fastapi import (
     UploadFile,
     status,
 )
-from pydantic import ValidationError
-
 from app.db.session import DatabaseSession
 from app.router.dependencies import ClientBackend
+from app.router.support.forms import (
+    parse_product_update_form,
+    validate_product_creation_form,
+)
+from app.router.support.uploads import read_limited_upload
 from app.schemas.product import (
-    CreateProductRequest,
     GiftDistributionRequest,
     GiftDistributionResponse,
     PendingGiftDistributionResponse,
     ProductDetailsResponse,
     ProductInformationResponse,
-    UpdateProductBasicInformationRequest,
     UpdateProductVisibilityStatusRequest,
 )
 from app.services.configuration_guard import (
@@ -35,6 +36,7 @@ from app.services.products import (
     GiftDistributionNotFoundError,
     GiftDistributionStatusConflictError,
     InvalidGiftDistributionRecordError,
+    MAX_PRODUCT_IMAGE_SIZE_BYTES,
     PointBalanceConsistencyError,
     ProductBasicInformationPatch,
     ProductCreation,
@@ -53,53 +55,6 @@ from app.services.products import (
 )
 
 router = APIRouter(prefix="/product", tags=["product"])
-MAX_PRODUCT_IMAGE_SIZE_BYTES = 5 * 1024 * 1024
-
-
-# 解析 multipart 中的商品 JSON 补丁，并把格式错误转换为稳定的字段级响应。
-def parse_product_update_form(
-    raw_product: str | None,
-) -> UpdateProductBasicInformationRequest:
-    if raw_product is None:
-        return UpdateProductBasicInformationRequest()
-    try:
-        return UpdateProductBasicInformationRequest.model_validate_json(
-            raw_product
-        )
-    except (ValidationError, ValueError) as error:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="product 必须是符合接口定义的 JSON 字符串",
-        ) from error
-
-
-# 校验奖品新增表单的标量字段，并把纯空白描述统一转换为空值。
-def validate_product_creation_form(
-    name: str,
-    points_required: int,
-    description: str | None,
-) -> CreateProductRequest:
-    try:
-        return CreateProductRequest.model_validate(
-            {
-                "name": name,
-                "points_required": points_required,
-                "description": description,
-            }
-        )
-    except ValidationError as error:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="奖品名称、兑换积分或描述不符合字段约束",
-        ) from error
-
-
-# 限量读取并关闭奖品图片，供必填新增与可选修改场景安全复用。
-async def read_product_image_file(image: UploadFile) -> bytes:
-    try:
-        return await image.read(MAX_PRODUCT_IMAGE_SIZE_BYTES + 1)
-    finally:
-        await image.close()
 
 
 # 接收待发放礼品列表请求，并返回管理端履约所需字段与兑换时间。
@@ -190,7 +145,10 @@ async def create_product(
         points_required=request.points_required,
         description=request.description,
         image=ProductImageUpload(
-            content=await read_product_image_file(image),
+            content=await read_limited_upload(
+                image,
+                MAX_PRODUCT_IMAGE_SIZE_BYTES,
+            ),
             media_type=image_media_type,
         ),
     )
@@ -315,7 +273,10 @@ async def update_product_basic_information(
     if image is not None:
         image_media_type = image.content_type
         image_upload = ProductImageUpload(
-            content=await read_product_image_file(image),
+            content=await read_limited_upload(
+                image,
+                MAX_PRODUCT_IMAGE_SIZE_BYTES,
+            ),
             media_type=image_media_type,
         )
     patch = ProductBasicInformationPatch(

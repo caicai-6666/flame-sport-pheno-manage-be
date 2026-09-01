@@ -1,49 +1,28 @@
 """为管理 API 编排查询智能体会话操作和安全响应转换。"""
 
+from app.agent.text2sql.history_projection import (
+    build_result_response,
+    build_session_response,
+    build_trace_response,
+)
 from app.agent.text2sql.interaction.session import AgentQuerySession
-from app.agent.text2sql.query_manager import AgentQueryManager
+from app.agent.text2sql.query_manager import (
+    AgentQueryManager,
+    AgentQueryNotFoundError,
+)
 from app.schemas.agent_query import (
-    AgentInteractionResponse,
     AgentQueryCachedRecordIdsResponse,
-    AgentQueryResultHeaderResponse,
     AgentQueryResultResponse,
     AgentQuerySessionResponse,
-    AgentQueryTraceEntryResponse,
     AgentQueryTraceResponse,
 )
-
-
-# 将内部交互模型转换为前端所需字段，隐藏回答时间和线程等待状态。
-def _build_interaction_response(session: AgentQuerySession) -> AgentInteractionResponse | None:
-    interaction = session.snapshot().pending_interaction
-    if interaction is None or interaction.status != "pending":
-        return None
-    return AgentInteractionResponse(
-        interaction_id=interaction.interaction_id,
-        interaction_type=interaction.interaction_type,
-        question=interaction.question,
-        options=list(interaction.options),
-        allow_free_text=interaction.allow_free_text,
-    )
 
 
 # 构造查询会话安全快照，任何模型原始响应、工具参数和 SQL 都不会进入普通状态接口。
 def build_agent_query_session_response(
     session: AgentQuerySession,
 ) -> AgentQuerySessionResponse:
-    snapshot = session.snapshot()
-    return AgentQuerySessionResponse(
-        query_id=snapshot.query_id,
-        domain_key=snapshot.domain_key,
-        question=snapshot.question,
-        status=snapshot.status,
-        latest_sequence=snapshot.latest_sequence,
-        pending_interaction=_build_interaction_response(session),
-        result_available=snapshot.result_available,
-        user_message=snapshot.user_message,
-        created_at=snapshot.created_at,
-        updated_at=snapshot.updated_at,
-    )
+    return build_session_response(session)
 
 
 # 创建后台查询任务并立即返回会话状态，模型处理和交互等待不占用创建请求。
@@ -56,16 +35,22 @@ async def create_agent_query(
     return build_agent_query_session_response(session)
 
 
-# 读取查询状态并清理可能已经过期的终态会话。
+# 优先读取内存会话；内存已释放时按标识回退加载持久化成功状态。
 async def get_agent_query(
     manager: AgentQueryManager,
     query_id: str,
 ) -> AgentQuerySessionResponse:
-    session = await manager.get_session(query_id)
+    try:
+        session = await manager.get_session(query_id)
+    except AgentQueryNotFoundError as error:
+        persisted = await manager.load_persisted_session(query_id)
+        if persisted is not None:
+            return persisted
+        raise error
     return build_agent_query_session_response(session)
 
 
-# 列出保留期内的查询标识；调用方必须再使用单条接口读取对应轨迹或表格，避免一次返回全部历史内容。
+# 合并内存会话与持久化成功记录标识，调用方再按标识加载所需内容。
 async def list_cached_agent_query_ids(
     manager: AgentQueryManager,
     limit: int,
@@ -95,70 +80,31 @@ async def cancel_agent_query(
     return build_agent_query_session_response(session)
 
 
-# 将内部结果转换为表格、摘要或安全失败元数据，明确排除 SQL、数据结构与模型原始轨迹。
+# 优先转换内存结果；会话过期后只按需加载持久化成功表格。
 async def get_agent_query_result(
     manager: AgentQueryManager,
     query_id: str,
 ) -> AgentQueryResultResponse:
-    session = await manager.get_session(query_id)
-    snapshot = session.snapshot()
-    result = session.get_result()
-    response = AgentQueryResultResponse(
-        query_id=query_id,
-        status=snapshot.status,
-        user_message=snapshot.user_message,
-    )
-    if result is None:
-        return response
-    if result.status == "failure" and result.sql_result is not None:
-        response.failure_stage = "sql"
-        response.failure_code = result.sql_result.error_code
-        response.failure_retry_target = result.sql_result.retry_target
-        response.failure_attempt_count = result.sql_result.generation_count
-        response.failure_attempt_limit = result.sql_result.max_generation_count
-    audit_result = result.audit_result
-    if audit_result is None:
-        return response
-    response.headers = [
-        AgentQueryResultHeaderResponse(key=header.key, label=header.label)
-        for header in audit_result.display_result.headers
-    ]
-    response.rows = audit_result.display_result.rows
-    response.statistics = audit_result.statistics.model_dump(mode="json")
-    assessment = audit_result.assessment
-    if assessment is not None:
-        response.matches_user_request = assessment.matches_user_request
-        response.relevance_explanation = assessment.relevance_explanation
-        response.table_description = assessment.table_description
-        response.result_summary = assessment.result_summary
-        response.issues = assessment.issues
-    return response
+    try:
+        session = await manager.get_session(query_id)
+    except AgentQueryNotFoundError as error:
+        persisted = await manager.load_persisted_result(query_id)
+        if persisted is not None:
+            return persisted
+        raise error
+    return build_result_response(session, query_id)
 
 
-# 返回查询会话的安全友好轨迹；对齐问题只从已裁剪的终态结果读取，避免暴露模型原始轨迹。
+# 优先构造内存友好轨迹；会话过期后按需加载持久化成功轨迹。
 async def get_agent_query_trace(
     manager: AgentQueryManager,
     query_id: str,
 ) -> AgentQueryTraceResponse:
-    session = await manager.get_session(query_id)
-    snapshot = session.snapshot()
-    result = session.get_result()
-    aligned_question: str | None = None
-    if result is not None and result.alignment_result is not None:
-        aligned_request = result.alignment_result.aligned_request
-        if aligned_request is not None:
-            aligned_question = aligned_request.aligned_question
-    return AgentQueryTraceResponse(
-        query_id=snapshot.query_id,
-        domain_key=snapshot.domain_key,
-        question=snapshot.question,
-        aligned_question=aligned_question,
-        status=snapshot.status,
-        user_message=snapshot.user_message,
-        created_at=snapshot.created_at,
-        updated_at=snapshot.updated_at,
-        entries=[
-            AgentQueryTraceEntryResponse(**entry.model_dump())
-            for entry in session.get_trace_entries()
-        ],
-    )
+    try:
+        session = await manager.get_session(query_id)
+    except AgentQueryNotFoundError as error:
+        persisted = await manager.load_persisted_trace(query_id)
+        if persisted is not None:
+            return persisted
+        raise error
+    return build_trace_response(session)

@@ -41,6 +41,7 @@ app/
 ├── router/
 │   ├── __init__.py               # 公开与受保护路由聚合
 │   ├── dependencies.py           # 管理路由统一认证依赖
+│   ├── support/                  # 表单、上传、图片响应和 SSE 等 HTTP 辅助能力
 │   ├── admin_auth.py             # 管理员密钥换取 token
 │   ├── agent_query.py             # 查询创建、SSE、交互、结果与取消路由
 │   ├── health.py                 # 服务存活检查
@@ -105,7 +106,7 @@ tests/                            # 本地未跟踪的 unittest 测试集，存�
 | --- | --- |
 | `app/agent/` | 维护可注入业务域的查询工作流、子图专属工具、Function Calling 基础设施、只读运行时、交互会话和进度事件 |
 | `app/schemas/` | 定义 Pydantic HTTP 请求、响应、字段级约束及纯传输格式适配，不依赖路由、服务或仓储 |
-| `app/router/` | 声明 HTTP 路径和参数位置，注入公共依赖，调用服务并映射响应与异常；不定义 Pydantic 模型或复杂业务规则 |
+| `app/router/` | 声明 HTTP 路径和参数位置，注入公共依赖，调用服务并映射响应与异常；共享传输辅助逻辑集中在 `support/`，不定义 Pydantic 模型或复杂业务规则 |
 | `app/clients/` | 隔离客户端后端及后续其他外部服务的 HTTP 协议 |
 | `app/core/` | 维护应用级配置及不属于具体业务域的核心能力 |
 | `app/db/` | 维护数据库引擎、连接池和请求级会话 |
@@ -116,7 +117,9 @@ tests/                            # 本地未跟踪的 unittest 测试集，存�
 
 业务领域和数据库模型目录应在产生真实功能时按职责创建，不提前建立空目录。
 
-HTTP 路由从 `app/schemas/` 引用对应业务的请求与响应结构，再调用 `app/services/` 中的应用用例。服务管理事务和跨依赖编排，并调用仓储或客户端适配器。赛季统计的数据查询集中在 `app/repositories/season_statistics.py`，不能把 Pydantic 模型、聚合 SQL、用例规则或事务直接堆入路由函数。完整边界参见 [应用服务层设计](../application/service-layer.md)。
+HTTP 路由从 `app/schemas/` 引用对应业务的请求与响应结构，再调用 `app/services/` 中的应用用例。路由文件只保留参数声明、服务调用、响应转换和端点级异常映射；multipart JSON 解析、上传流限量读取、通用图片响应及 SSE 传输等可复用 HTTP 细节集中在 `app/router/support/`。这些辅助能力可以依赖 FastAPI，但不得承载事务、数据库查询或业务状态变化。
+
+服务管理事务和跨依赖编排，并调用仓储或客户端适配器。赛季统计的数据查询集中在 `app/repositories/season_statistics.py`，不能把 Pydantic 模型、聚合 SQL、用例规则或事务直接堆入路由函数。完整边界参见 [应用服务层设计](../application/service-layer.md)。
 
 `schemas` 按业务主题与路由保持同名模块，不建立横跨全部业务的 `requests.py` 或 `responses.py`。其校验范围仅包括类型、长度、枚举、字段组合和传输格式；需要数据库、当前时间、配置窗口或外部服务才能判断的规则必须留在服务层。`app/schemas/__init__.py` 不集中重导出模型，避免形成隐式公共 API 和循环依赖。
 
@@ -244,6 +247,9 @@ AGENT_QUERY_MAX_ACTIVE_SESSIONS=20
 AGENT_QUERY_EVENT_HISTORY_SIZE=200
 AGENT_QUERY_SESSION_TTL_SECONDS=3600
 AGENT_QUERY_SSE_HEARTBEAT_SECONDS=15
+AGENT_QUERY_HISTORY_PATH=data/query-history/query-history.sqlite3
+AGENT_QUERY_HISTORY_RETENTION_DAYS=30
+AGENT_QUERY_HISTORY_CACHE_TTL_SECONDS=600
 AGENT_QUERY_DIAGNOSTIC_LOG_ENABLED=false
 AGENT_QUERY_DIAGNOSTIC_LOG_LEVEL=basic
 ```
@@ -252,7 +258,7 @@ AGENT_QUERY_DIAGNOSTIC_LOG_LEVEL=basic
 
 查询诊断日志默认关闭。`basic` 只记录阶段、状态、次数、稳定错误码和耗时；`detailed` 额外记录涉及表、结果字段、已通过静态安全校验的参数化 SQL 模板及返回行数；`trace` 为单次查询创建统一模型消息队列，记录所有模型节点实际发送的消息上下文与返回的 `assistant` 消息。工具结果和错误反馈只通过下一轮真实请求上下文体现，不在业务逻辑中重复埋点。修改开关或等级后必须重启应用，`trace` 只用于受控短期排障，结束后应恢复为关闭。
 
-查询会话与事件只保存在单进程内存，`AGENT_QUERY_MAX_ACTIVE_SESSIONS` 包含正在运行和等待用户回答的任务。当前部署必须保持单 Worker；配置与完整安全边界见 [查询智能体运行时与业务域扩展](query-agent-runtime.md)。修改配置后需要重启应用。
+查询活动会话与 SSE 事件保存在单进程内存，`AGENT_QUERY_MAX_ACTIVE_SESSIONS` 包含正在运行和等待用户回答的任务。只有成功形成前端结果的终态查询会把安全状态、友好轨迹和结果写入 `AGENT_QUERY_HISTORY_PATH` 指定的 SQLite 文件，并按 `AGENT_QUERY_HISTORY_RETENTION_DAYS` 清理；默认路径为 `data/query-history/query-history.sqlite3`。相对路径固定以项目根目录解析，不受 IDE 或进程工作目录影响，因此本地数据位于根目录 `data/`，与源码目录 `app/` 同级。从 SQLite 加载的状态、轨迹和结果字段分别进入有界 LRU 热缓存，默认由 `AGENT_QUERY_HISTORY_CACHE_TTL_SECONDS=600` 保留十分钟，设置为 `0` 可关闭。生产镜像参照客户后端以 `/workspace` 为项目根目录，Python 包位于 `/workspace/app`；Compose 使用 `flame_manage_data` 卷挂载与其同级的 `/workspace/data`。当前部署必须保持单 Worker；配置与完整安全边界见 [查询智能体运行时与业务域扩展](query-agent-runtime.md)。修改配置后需要重启应用。
 
 ### 3.3 激活赛季配置变更窗口
 

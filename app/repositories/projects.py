@@ -316,6 +316,61 @@ async def update_project_visibility_status(
     )
 
 
+# 锁定目标项目后更新展示名称，并返回其他基础信息保持不变的完整结果。
+async def update_project_name(
+    session: AsyncSession,
+    project_id: int,
+    project_name: str,
+) -> ProjectInformation | None:
+    result = await session.exec(
+        text(
+            """
+            SELECT
+                project.id AS project_id,
+                project.description,
+                project.icon_url,
+                project.status
+            FROM project
+            WHERE project.id = :project_id
+            FOR UPDATE
+            """
+        ),
+        params={"project_id": project_id},
+    )
+    row = result.mappings().first()
+    if row is None:
+        return None
+
+    await session.exec(
+        text(
+            """
+            UPDATE project
+            SET name = :project_name
+            WHERE id = :project_id
+            """
+        ),
+        params={
+            "project_id": project_id,
+            "project_name": project_name,
+        },
+    )
+    return ProjectInformation(
+        project_id=int(row["project_id"]),
+        project_name=project_name,
+        description=(
+            str(row["description"])
+            if row["description"] is not None
+            else None
+        ),
+        icon_url=(
+            str(row["icon_url"])
+            if row["icon_url"] is not None
+            else None
+        ),
+        status=int(row["status"]),
+    )
+
+
 # 共享锁定当前启用项目集合并返回数量，防止创建赛季校验期间项目被停用。
 async def lock_visible_project_count(session: AsyncSession) -> int:
     result = await session.exec(

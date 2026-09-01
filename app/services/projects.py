@@ -22,6 +22,7 @@ from app.repositories.projects import (
     insert_project_rules,
     insert_project_upload_configurations,
     lock_all_project_level_ids,
+    update_project_name as update_project_name_repository,
     update_project_visibility_status as update_project_visibility_status_repository,
 )
 from app.services.configuration_guard import (
@@ -204,6 +205,35 @@ async def update_project_visibility_status(
             project_id,
             visibility_status,
         )
+        if project is None:
+            raise ProjectNotFoundError
+        return project
+
+
+# 在统一配置窗口和项目行锁保护下修改名称，并将唯一键冲突转换为业务错误。
+async def update_project_name(
+    session: AsyncSession,
+    project_id: int,
+    project_name: str,
+    edit_window_hours: int = (
+        settings.active_season_config_edit_window_hours
+    ),
+) -> ProjectInformation:
+    async with session.begin():
+        await ensure_active_season_configuration_editable(
+            session,
+            edit_window_hours,
+        )
+        try:
+            project = await update_project_name_repository(
+                session,
+                project_id,
+                project_name,
+            )
+        except IntegrityError as error:
+            if is_duplicate_key_error(error):
+                raise ProjectNameConflictError from error
+            raise
         if project is None:
             raise ProjectNotFoundError
         return project

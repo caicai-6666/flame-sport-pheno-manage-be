@@ -1,16 +1,16 @@
 """提供查询创建、进度流、交互恢复、结果读取和取消接口。"""
 
-from collections.abc import AsyncIterator
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
+from fastapi import APIRouter, Header, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
 
-from app.agent.text2sql.events.sse import encode_sse_event, encode_sse_heartbeat
-from app.agent.text2sql.query_manager import (
-    AgentQueryCapacityError,
-    AgentQueryManager,
-    AgentQueryNotFoundError,
+from app.router.support.agent_query import (
+    AgentQueryManagerDependency,
+    get_agent_query_manager,
+    parse_last_event_id,
+    raise_agent_query_http_error,
+    stream_agent_query_events,
 )
 from app.schemas.agent_query import (
     AgentInteractionAnswerRequest,
@@ -34,32 +34,6 @@ from app.services.agent_queries import (
 router = APIRouter(prefix="/agent/queries", tags=["agent-query"])
 
 
-# 从应用生命周期读取共享查询管理器，保证状态接口、SSE 和回答接口访问同一批会话。
-def get_agent_query_manager(request: Request) -> AgentQueryManager:
-    return request.app.state.agent_query_manager
-
-
-AgentQueryManagerDependency = Annotated[
-    AgentQueryManager,
-    Depends(get_agent_query_manager),
-]
-
-
-# 将查询会话常见业务异常映射为稳定 HTTP 状态，避免路由泄漏内部技术错误。
-def _raise_agent_query_http_error(error: Exception) -> None:
-    if isinstance(error, AgentQueryNotFoundError):
-        raise HTTPException(status_code=404, detail=str(error)) from error
-    if isinstance(error, AgentQueryCapacityError):
-        raise HTTPException(status_code=429, detail=str(error)) from error
-    if isinstance(error, KeyError):
-        raise HTTPException(status_code=422, detail=str(error).strip("'")) from error
-    if isinstance(error, ValueError):
-        raise HTTPException(status_code=409, detail=str(error)) from error
-    if isinstance(error, RuntimeError):
-        raise HTTPException(status_code=503, detail=str(error)) from error
-    raise error
-
-
 # 创建后台查询并返回 202，会话后续进展通过独立 SSE 连接实时发送。
 @router.post(
     "",
@@ -77,11 +51,11 @@ async def create_query(
             payload.domain_key,
         )
     except Exception as error:
-        _raise_agent_query_http_error(error)
+        raise_agent_query_http_error(error)
         raise
 
 
-# 列出当前进程保留期内的查询标识；前端按标识调用轨迹或结果接口，不在列表中批量传输历史内容。
+# 列出内存会话与持久化成功查询标识；前端再按标识读取轨迹或结果。
 @router.get("/cached-record-ids", response_model=AgentQueryCachedRecordIdsResponse)
 async def get_cached_record_ids(
     manager: AgentQueryManagerDependency,
@@ -90,7 +64,7 @@ async def get_cached_record_ids(
     try:
         return await list_cached_agent_query_ids(manager, limit)
     except Exception as error:
-        _raise_agent_query_http_error(error)
+        raise_agent_query_http_error(error)
         raise
 
 
@@ -103,11 +77,11 @@ async def get_query(
     try:
         return await get_agent_query(manager, query_id)
     except Exception as error:
-        _raise_agent_query_http_error(error)
+        raise_agent_query_http_error(error)
         raise
 
 
-# 返回当前内存保留期内的友好交互与关键阶段轨迹，表格结果仍由独立 result 接口读取。
+# 返回内存或 SQLite 中的友好轨迹，表格结果仍由独立 result 接口按需读取。
 @router.get("/{query_id}/trace", response_model=AgentQueryTraceResponse)
 async def get_query_trace(
     query_id: str,
@@ -116,34 +90,8 @@ async def get_query_trace(
     try:
         return await get_agent_query_trace_service(manager, query_id)
     except Exception as error:
-        _raise_agent_query_http_error(error)
+        raise_agent_query_http_error(error)
         raise
-
-
-# 将 Last-Event-ID 安全转换为非负序号，格式错误明确返回 400 而不是静默漏发事件。
-def _parse_last_event_id(last_event_id: str | None) -> int:
-    if last_event_id is None or not last_event_id.strip():
-        return 0
-    try:
-        sequence = int(last_event_id)
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail="Last-Event-ID 必须是非负整数") from error
-    if sequence < 0:
-        raise HTTPException(status_code=400, detail="Last-Event-ID 必须是非负整数")
-    return sequence
-
-
-# 订阅历史补发和实时事件；客户端断开时及时结束生成器并释放订阅队列。
-async def _stream_query_events(
-    request: Request,
-    manager: AgentQueryManager,
-    query_id: str,
-    after_sequence: int,
-) -> AsyncIterator[str]:
-    async for event in manager.subscribe(query_id, after_sequence):
-        if await request.is_disconnected():
-            return
-        yield encode_sse_heartbeat() if event is None else encode_sse_event(event)
 
 
 # 建立只由服务器发送事件的长连接，关闭代理缓冲以保证关键进度及时到达页面。
@@ -154,14 +102,14 @@ async def stream_query_events(
     manager: AgentQueryManagerDependency,
     last_event_id: Annotated[str | None, Header(alias="Last-Event-ID")] = None,
 ) -> StreamingResponse:
-    after_sequence = _parse_last_event_id(last_event_id)
+    after_sequence = parse_last_event_id(last_event_id)
     try:
         await manager.get_session(query_id)
     except Exception as error:
-        _raise_agent_query_http_error(error)
+        raise_agent_query_http_error(error)
         raise
     return StreamingResponse(
-        _stream_query_events(request, manager, query_id, after_sequence),
+        stream_agent_query_events(request, manager, query_id, after_sequence),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache, no-transform",
@@ -190,7 +138,7 @@ async def answer_query_interaction(
             payload.answer,
         )
     except Exception as error:
-        _raise_agent_query_http_error(error)
+        raise_agent_query_http_error(error)
         raise
 
 
@@ -204,7 +152,7 @@ async def get_query_result(
     try:
         result = await get_agent_query_result(manager, query_id)
     except Exception as error:
-        _raise_agent_query_http_error(error)
+        raise_agent_query_http_error(error)
         raise
     if result.status in {
         "running",
@@ -224,5 +172,5 @@ async def delete_query(
     try:
         return await cancel_agent_query(manager, query_id)
     except Exception as error:
-        _raise_agent_query_http_error(error)
+        raise_agent_query_http_error(error)
         raise

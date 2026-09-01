@@ -78,7 +78,7 @@ router → services → repositories / clients
 | 目录 | 职责 |
 | --- | --- |
 | `app/agent/` | 智能体业务命名空间；当前 `text2sql/` 独立承载查询会话、交互、事件、业务域和完整查询工作流 |
-| `app/router/` | HTTP 路径、认证依赖、参数位置、服务调用和异常映射 |
+| `app/router/` | HTTP 路径、认证依赖、服务调用和异常映射；共享传输细节集中在 `support/` |
 | `app/schemas/` | Pydantic 请求响应模型及传输层字段校验 |
 | `app/services/` | 业务用例、事务边界、跨仓储和外部服务编排 |
 | `app/repositories/` | 参数化 SQL、行锁、聚合查询和持久化结果映射 |
@@ -215,7 +215,7 @@ Authorization: Bearer <access-token>
 
 > **警告**
 >
-> 管理员 Token、查询任务、待回答交互和 SSE 历史都只保存在当前进程内。现阶段必须使用单 Worker、单实例部署；服务重启会使已有 Token 和查询任务失效。启用多 Worker 或横向扩容前，必须先引入共享认证与查询会话存储。
+> 管理员 Token、活动查询任务、待回答交互和 SSE 历史只保存在当前进程内。成功查询的安全状态、友好轨迹和表格结果会保存到 `data/query-history/query-history.sqlite3`，生产 Compose 将整个 `/workspace/data` 挂载至 `flame_manage_data` 卷，服务重启后仍可按查询 ID 读取；失败、放弃和取消查询不会落盘。现阶段仍必须使用单 Worker、单实例部署。
 
 ---
 
