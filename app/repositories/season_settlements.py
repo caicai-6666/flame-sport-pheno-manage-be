@@ -10,6 +10,29 @@ from sqlalchemy import bindparam, text
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 
+# 月末必须等待同赛季用户、同项目的全部有效月初记录离开 pending；
+# 在 LIMIT 前过滤，避免跨批次或月末主键较小时越过月初依赖。
+INITIAL_REVIEW_DEPENDENCY_READY_SQL = """
+    NOT EXISTS (
+        SELECT 1
+        FROM project_upload_config AS end_config
+        WHERE end_config.id = proof_record.project_upload_config_id
+          AND end_config.record_type = '月末记录'
+          AND EXISTS (
+              SELECT 1
+              FROM proof_record AS start_proof
+              INNER JOIN project_upload_config AS start_config
+                  ON start_config.id = start_proof.project_upload_config_id
+              WHERE start_proof.season_user_id = proof_record.season_user_id
+                AND start_proof.project_id = proof_record.project_id
+                AND start_proof.status = 1
+                AND start_proof.review_status = 'pending'
+                AND start_config.record_type = '月初记录'
+          )
+    )
+"""
+
+
 @dataclass(frozen=True, slots=True)
 class SettlementSeason:
     id: int
@@ -390,7 +413,7 @@ async def lock_settlement_proofs_for_finalization(
     )
 
 
-# 分批读取截止时间前仍待初审的正式参赛凭证，避免一次加载无界记录。
+# 分批读取截止前正式参赛凭证，仅放行没有待审月初依赖的月末记录。
 async def fetch_pending_initial_review_proof_ids(
     session: AsyncSession,
     season_id: int,
@@ -399,7 +422,7 @@ async def fetch_pending_initial_review_proof_ids(
 ) -> tuple[int, ...]:
     result = await session.exec(
         text(
-            """
+            f"""
             SELECT proof_record.id
             FROM proof_record
             INNER JOIN season_user
@@ -412,6 +435,7 @@ async def fetch_pending_initial_review_proof_ids(
               AND proof_record.status = 1
               AND proof_record.review_status = 'pending'
               AND proof_record.created_at < :cutoff_at
+              AND {INITIAL_REVIEW_DEPENDENCY_READY_SQL}
             ORDER BY proof_record.id
             LIMIT :limit
             """
@@ -453,7 +477,7 @@ async def count_pending_initial_review_proofs(
     return int(result.scalar_one())
 
 
-# 分批读取已完成补交但尚未初审的凭证，资格状态区分其与赛季遗留待审记录。
+# 补交沿用月初先于月末的约束，依赖检查覆盖跨批次及遗留队列中的月初记录。
 async def fetch_pending_supplement_review_proof_ids(
     session: AsyncSession,
     season_id: int,
@@ -461,7 +485,7 @@ async def fetch_pending_supplement_review_proof_ids(
 ) -> tuple[int, ...]:
     result = await session.exec(
         text(
-            """
+            f"""
             SELECT proof_record.id
             FROM season_supplement_eligibility
             INNER JOIN proof_record
@@ -475,6 +499,7 @@ async def fetch_pending_supplement_review_proof_ids(
               AND season_supplement_eligibility.status = 2
               AND proof_record.status = 1
               AND proof_record.review_status = 'pending'
+              AND {INITIAL_REVIEW_DEPENDENCY_READY_SQL}
             ORDER BY proof_record.id
             LIMIT :limit
             """

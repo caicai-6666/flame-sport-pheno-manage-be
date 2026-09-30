@@ -596,7 +596,7 @@ async def review_pending_supplement(
     return False
 
 
-# 分批并发清理赛季截止前遗留初审；任一失败时停止本轮，避免对永久失败记录忙重试。
+# 分批并发处理依赖就绪的遗留初审；失败或仅剩被月初阻塞的月末时退出并统计全部待审。
 async def drain_pending_initial_reviews(
     session_factory: async_sessionmaker[AsyncSession],
     client_backend: ClientBackendClient,
@@ -621,7 +621,7 @@ async def drain_pending_initial_reviews(
                     )
                 )
         if not proof_record_ids:
-            return 0
+            break
 
         results = await asyncio.gather(
             *(
@@ -645,7 +645,7 @@ async def drain_pending_initial_reviews(
             )
 
 
-# 分批初审已补交记录，扫描依据资格状态而不是原赛季上传截止时间。
+# 分批初审依赖就绪的补交记录；没有可调用记录时仍统计被月初阻塞的月末，禁止提前定分。
 async def drain_pending_supplement_reviews(
     session_factory: async_sessionmaker[AsyncSession],
     client_backend: ClientBackendClient,
@@ -665,7 +665,7 @@ async def drain_pending_supplement_reviews(
                     )
                 )
         if not proof_record_ids:
-            return 0
+            break
         results = await asyncio.gather(
             *(
                 review_pending_supplement(
@@ -1284,7 +1284,7 @@ async def finish_season_if_complete(
         return await mark_season_ended_if_complete(session, season_id)
 
 
-# 执行一轮可恢复结算：初始化、清理遗留初审、用户定分和最终状态收敛按顺序隔离。
+# 两类初审队列均尝试推进，避免遗留月末阻塞补交月初；任一队列仍待审时禁止用户定分。
 async def run_season_settlement_cycle(
     session_factory: async_sessionmaker[AsyncSession],
     client_backend: ClientBackendClient,
@@ -1312,32 +1312,21 @@ async def run_season_settlement_cycle(
             season_ended=False,
         )
 
-    pending_count = await drain_pending_initial_reviews(
+    pending_initial_count = await drain_pending_initial_reviews(
         session_factory,
         client_backend,
         settling_season,
         review_batch_size,
         review_concurrency,
     )
-    if pending_count > 0:
-        return SettlementCycleResult(
-            transitioned_season_id=(
-                transitioned_season.id if transitioned_season else None
-            ),
-            settling_season_id=settling_season.id,
-            pending_initial_review_count=pending_count,
-            finalized_user_count=0,
-            created_eligibility_count=0,
-            season_ended=False,
-        )
-
-    pending_count = await drain_pending_supplement_reviews(
+    pending_supplement_count = await drain_pending_supplement_reviews(
         session_factory,
         client_backend,
         settling_season,
         review_batch_size,
         review_concurrency,
     )
+    pending_count = pending_initial_count + pending_supplement_count
     if pending_count > 0:
         return SettlementCycleResult(
             transitioned_season_id=(
