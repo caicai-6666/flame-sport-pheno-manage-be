@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-from calendar import monthrange
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
@@ -43,7 +42,7 @@ from app.repositories.season_settlements import (
     count_pending_initial_review_proofs,
     count_pending_supplement_review_proofs,
     delete_user_supplement_eligibilities,
-    did_user_fully_complete_month,
+    fetch_completed_predecessor_start_date,
     fetch_pending_final_review_proof_ids,
     fetch_pending_initial_review_proof_ids,
     fetch_pending_supplement_review_proof_ids,
@@ -217,24 +216,6 @@ class SeasonUserCompletionResult:
     rejected_proof_count: int
     finalized: bool
     issued_now: bool
-
-
-# 把给定日期归一到自然月首日，连续完成奖励只按自然月判断。
-def month_start(value: date) -> date:
-    return value.replace(day=1)
-
-
-# 返回目标月份前若干个月的首日，不依赖非标准日期库。
-def subtract_months(value: date, months: int) -> date:
-    absolute_month = value.year * 12 + value.month - 1 - months
-    year, zero_based_month = divmod(absolute_month, 12)
-    return date(year, zero_based_month + 1, 1)
-
-
-# 返回下一自然月首日，用于构造无时区歧义的左闭右开月份范围。
-def next_month_start(value: date) -> date:
-    days_in_month = monthrange(value.year, value.month)[1]
-    return value.replace(day=days_in_month) + timedelta(days=1)
 
 
 # 根据完成项目数计算基础积分，并阻止可配置奖励使最终积分越过数据库范围。
@@ -687,31 +668,31 @@ async def drain_pending_supplement_reviews(
             )
 
 
-# 按当前环境配置计算两个月或三个月连续奖励，三个月档替代两个月档。
+# 按日期首尾相接追溯最多两个完整赛季；使用 date 减一天，正确处理跨年和闰日。
 async def calculate_streak_bonus(
     session: AsyncSession,
     user_id: str,
     current_season_start: date,
 ) -> int:
     settings = get_settings()
-    current_month = month_start(current_season_start)
-    previous_month = subtract_months(current_month, 1)
-    if not await did_user_fully_complete_month(
+    if current_season_start == date.min:
+        return 0
+    previous_start = await fetch_completed_predecessor_start_date(
         session,
         user_id,
-        previous_month,
-        next_month_start(previous_month),
-    ):
+        current_season_start - timedelta(days=1),
+    )
+    if previous_start is None:
         return 0
 
-    two_months_ago = subtract_months(current_month, 2)
-    if await did_user_fully_complete_month(
-        session,
-        user_id,
-        two_months_ago,
-        next_month_start(two_months_ago),
-    ):
-        return settings.season_settlement_three_month_streak_bonus_points
+    if previous_start != date.min:
+        earlier_start = await fetch_completed_predecessor_start_date(
+            session,
+            user_id,
+            previous_start - timedelta(days=1),
+        )
+        if earlier_start is not None:
+            return settings.season_settlement_three_month_streak_bonus_points
     return settings.season_settlement_two_month_streak_bonus_points
 
 

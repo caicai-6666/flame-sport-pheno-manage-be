@@ -193,7 +193,7 @@ cp .env.example .env
 
 配置由 `pydantic-settings` 从根目录 `.env` 和进程环境变量加载并校验。数据库密码使用 `SecretStr` 保存，构造连接地址时通过 SQLAlchemy `URL` 处理特殊字符。
 
-连续完整完成赛季的奖励可按部署环境配置：
+连续完整完成赛季的奖励可按部署环境配置。为兼容既有部署，变量名中的 `TWO_MONTH` 和 `THREE_MONTH` 保留，实际分别表示两个、三个及以上日期首尾衔接的赛季，详见[赛季结算规则](../domain/season-settlement.md)：
 
 ```dotenv
 SEASON_SETTLEMENT_TWO_MONTH_STREAK_BONUS_POINTS=50

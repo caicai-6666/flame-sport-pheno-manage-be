@@ -69,7 +69,7 @@ class Settings(BaseSettings):
         ge=0,
         le=365,
     )
-    # 连续完整达成赛季的奖励允许按部署环境调整，默认值保持现行业务规则。
+    # 连续两个及三个以上赛季的奖励；保留 month 配置名以兼容既有部署。
     season_settlement_two_month_streak_bonus_points: int = Field(
         default=50,
         ge=0,

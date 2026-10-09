@@ -1215,51 +1215,49 @@ async def delete_user_supplement_eligibilities(
     )
 
 
-# 判断用户是否完整完成指定自然月的已结束赛季，部分完成获得保底分不计入连续完成。
-async def did_user_fully_complete_month(
+# 只匹配结束于指定日期且用户完整完成的已结束赛季，返回开始日供继续追溯；多条匹配拒绝任意选取。
+async def fetch_completed_predecessor_start_date(
     session: AsyncSession,
     user_id: str,
-    month_start: date,
-    next_month_start: date,
-) -> bool:
+    predecessor_end_date: date,
+) -> date | None:
     result = await session.exec(
         text(
             """
-            SELECT EXISTS (
-                SELECT 1
-                FROM season
-                INNER JOIN season_user
-                    ON season_user.season_id = season.id
-                WHERE season.status = 3
-                  AND season.start_date >= :month_start
-                  AND season.start_date < :next_month_start
-                  AND season_user.user_id = :user_id
-                  AND season_user.final_points IS NOT NULL
-                  AND season_user.level_id IS NOT NULL
-                  AND season_user.status >= season.required_project_count
-                  AND (
-                      SELECT COUNT(*)
-                      FROM season_user_project
-                      WHERE season_user_project.season_user_id = season_user.id
-                        AND season_user_project.status = 1
-                  ) = season.required_project_count
-                  AND (
-                      SELECT COUNT(*)
-                      FROM season_user_project
-                      WHERE season_user_project.season_user_id = season_user.id
-                        AND season_user_project.status = 1
-                        AND season_user_project.completion_progress = 1.0000
-                  ) = season.required_project_count
-            )
+            SELECT season.start_date
+            FROM season
+            INNER JOIN season_user
+                ON season_user.season_id = season.id
+            WHERE season.status = 3
+              AND season.end_date = :predecessor_end_date
+              AND season.start_date <= season.end_date
+              AND season.required_project_count > 0
+              AND season_user.user_id = :user_id
+              AND season_user.final_points IS NOT NULL
+              AND season_user.level_id IS NOT NULL
+              AND season_user.status >= season.required_project_count
+              AND (
+                  SELECT COUNT(*)
+                  FROM season_user_project
+                  WHERE season_user_project.season_user_id = season_user.id
+                    AND season_user_project.status = 1
+              ) = season.required_project_count
+              AND (
+                  SELECT COUNT(*)
+                  FROM season_user_project
+                  WHERE season_user_project.season_user_id = season_user.id
+                    AND season_user_project.status = 1
+                    AND season_user_project.completion_progress = 1.0000
+              ) = season.required_project_count
+            LIMIT 2
             """
         ),
         params={
             "user_id": user_id,
-            "month_start": month_start,
-            "next_month_start": next_month_start,
+            "predecessor_end_date": predecessor_end_date,
         },
     )
-    return bool(result.scalar_one())
+    return result.scalar_one_or_none()
 
 
 # 仅在尚未定分时写入最终积分，行锁与空值条件共同保证通知和定分只发生一次。
