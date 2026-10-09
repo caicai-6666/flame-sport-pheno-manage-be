@@ -57,6 +57,8 @@ def load_tool_tag_template(template_filename: str | None) -> str | None:
     return template_content
 
 
-# 读取整条查询流水线唯一的工具标签模板，禁止阶段级配置形成协议分叉。
+# 关闭时跳过模板读取及各阶段重试注入；缺少开关的旧调用方保持原有行为。
 def resolve_query_tool_tag_template_filename(settings: object) -> str | None:
+    if not getattr(settings, "agent_query_tool_tag_enabled", True):
+        return None
     return getattr(settings, "agent_query_tool_tag_template", None)

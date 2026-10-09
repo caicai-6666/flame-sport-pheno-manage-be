@@ -153,9 +153,20 @@ Profile 加载时会检查允许表非空且不重复、表标签完整、每张
 
 供应商选择同时决定连接信息和关闭思考的请求参数，但不自动决定模型的工具标签格式。vLLM 可以承载 DeepSeek、Qwen、Kimi 等不同模型，其工具解析器和 Chat Template 必须在服务端正确配置，并与 `VLLM_MODEL` 公开的模型标识一致。新增供应商时，在 `shared/model_options.py` 增加连接解析和独立 `ModelRequestProfile`，不得在各子图内重复判断供应商。
 
+`AGENT_QUERY_TOOL_TAG_ENABLED` 是整条查询流水线的模板注入开关，默认 `true`，保持既有行为。设为 `false` 后，业务对齐、查询规划及单表候选检索、SQL 生成、结果塑形、结果翻译、结果审计和用户消息格式化均跳过模板文件读取，首次请求和纠错重试都不注入 tool-tag。标准 `tools`、`tool_choice`、参数校验和 SQL 安全校验保持原样；关闭模板不等于关闭工具调用。开关独立于模型供应商，关闭时可以保留模板文件名，之后重新开启即可恢复。
+
+在应用 `.env` 中手动选择：
+
+```dotenv
+AGENT_QUERY_TOOL_TAG_ENABLED=false
+AGENT_QUERY_TOOL_TAG_TEMPLATE=deepseek-v4.txt
+```
+
+改为 `true` 即开启。设置在进程启动时读取，修改后必须重启应用；容器部署还须透传该变量并重建容器，见[部署配置](docker-compose-deployment.md)。非法布尔值会在配置加载时失败。开关关闭时不检查模板文件是否存在；开启后仍执行下述路径与内容校验。
+
 `AGENT_QUERY_TOOL_TAG_TEMPLATE` 可以填写 `data/tool-tag/` 下的单个 `.txt` 文件名，是整条查询流水线的唯一模板配置源；业务对齐、查询规划、单表候选检索、SQL 生成、结果塑形、结果翻译和结果审计均复用该变量，不提供阶段专用覆盖配置。默认使用为 `deepseek-v4-flash` 提供的 `deepseek-v4.txt`，通过 vLLM 承载 Qwen3.6 时应改为 `qwen3.6.txt`，留空时不注入模板。模板只描述供应商标签语法，使用 `TOOL_NAME`、`PARAMETER_NAME` 和 `PARAMETER_VALUE` 等显式占位符，不得写入 `think`、`submit_sql_query` 等具体工具或任何业务内容；真实工具名和参数只以当轮 Function Calling Schema 为准。Qwen3.6 模板依据其[官方 `tokenizer_config.json`](https://huggingface.co/Qwen/Qwen3.6-27B/blob/main/tokenizer_config.json)使用 `<tool_call>`、`<function=...>` 和 `<parameter=...>` 标签，不得替换成 DeepSeek DSML 或早期 Qwen3 Hermes JSON 格式。运行时拒绝目录分隔符、非 `.txt` 文件、缺失文件、空文件及超过 `16000` 字符的内容，避免环境变量形成任意文件读取或无界 Prompt 注入。Docker 镜像会复制该受控目录。
 
-工具标签模板会作为稳定格式提醒追加在原始用户任务末尾。模型返回普通文本、没有形成 OpenAI `tool_calls` 时，同一模板还会随精确协议错误再次加入紧邻重试上下文，明确要求使用标签结构而非正文模拟工具调用。模型修正后，运行时移除无效响应和临时错误反馈，但保留原始任务中的常驻提醒；参数 Schema 错误仍使用精确字段反馈，不重复增加模板。模板必须与实际模型版本以及 vLLM 的 `--tool-call-parser`、`--chat-template` 配置一致，不能仅根据 `deepseek` 或 `vllm` 请求体系自动猜测。
+启用且配置非空模板时，工具标签模板作为稳定格式提醒注入任务上下文；使用公共前缀构建器的阶段将模板放在动态业务上下文之前。模型返回普通文本、没有形成 OpenAI `tool_calls` 时，同一模板还会随精确协议错误再次加入紧邻重试上下文，明确要求使用标签结构而非正文模拟工具调用。模型修正后，运行时移除无效响应和临时错误反馈，但保留原始任务中的常驻提醒；参数 Schema 错误仍使用精确字段反馈，不重复增加模板。模板必须与实际模型版本以及 vLLM 的 `--tool-call-parser`、`--chat-template` 配置一致，不能仅根据 `deepseek` 或 `vllm` 请求体系自动猜测。
 
 | 阶段 | 主要输出 | 工具策略 |
 | --- | --- | --- |
@@ -337,3 +348,13 @@ docker compose logs --since 30m manage-backend \
 ```
 
 诊断开关默认关闭。生产临时启用后必须重启 `manage-backend`，问题复现并导出所需日志后应恢复为 `false`，避免持续产生额外日志量。需要模型消息轨迹时同时设置 `AGENT_QUERY_DIAGNOSTIC_LOG_LEVEL=trace`；只设置 `detailed` 不会输出模型消息。
+
+### 9.2 tool-tag 开关验证
+
+在仓库根目录执行本地测试：
+
+```bash
+python -m unittest discover -s tests -p 'test_tool_tag_switch.py' -v
+```
+
+测试覆盖默认开启、环境变量布尔值解析、关闭后忽略模板路径、开启时保留文件校验、旧的空模板配置，以及 SQL 首次提示和无工具调用重试的注入行为。测试不连接真实模型或数据库；`tests/` 按仓库约定只保存在本地，不纳入版本控制。

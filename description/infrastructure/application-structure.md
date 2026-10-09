@@ -231,6 +231,7 @@ VLLM_BASE_URL=http://127.0.0.1:8000/v1
 VLLM_MODEL=deepseek-v4-flash
 VLLM_HTTP_TIMEOUT_SECONDS=60
 AGENT_QUERY_MODEL_PROVIDER=deepseek
+AGENT_QUERY_TOOL_TAG_ENABLED=true
 AGENT_QUERY_TOOL_TAG_TEMPLATE=deepseek-v4.txt
 DEEPSEEK_QUERY_ALIGNMENT_MAX_TOKENS=1200
 DEEPSEEK_QUERY_PLANNING_MAX_TOKENS=3000
@@ -254,7 +255,7 @@ AGENT_QUERY_DIAGNOSTIC_LOG_ENABLED=false
 AGENT_QUERY_DIAGNOSTIC_LOG_LEVEL=basic
 ```
 
-管理端不会因存在密钥而自动发起模型请求。只有创建查询任务后才会调用模型。`AGENT_QUERY_MODEL_PROVIDER` 为整条查询流水线统一选择 `deepseek` 或 `vllm`；所有子图共享该供应商的地址、密钥、模型和超时，不允许单独覆盖。业务对齐、查询规划、单表候选检索、SQL 生成、结果翻译和结果审计均采用标准 Pydantic Function Calling，因此 vLLM 服务端必须配置与所承载模型匹配的工具解析器和 Chat Template。`AGENT_QUERY_TOOL_TAG_TEMPLATE` 是全局唯一模板配置，由全部模型工具阶段共享；vLLM 承载 Qwen3.6 时应选择 `qwen3.6.txt`。模板只描述标签语法并使用显式占位符，不包含任何具体工具名、参数名或业务示例；真实调用只依赖当轮工具 Schema。任务提示词会在动态业务上下文之前提供该通用模板，模型未形成 `tool_calls` 时还会在错误反馈中再次收到同一格式提示。留空表示关闭格式模板提示，配置时只能填写镜像内 `data/tool-tag/` 下的单个 `.txt` 文件名。翻译层按待翻译字段独立异步调用模型，并受 `AGENT_QUERY_TRANSLATION_MAX_PARALLEL_FIELDS` 限制；`MAX_TOKENS`、并发数、生成轮次和工具次数分别构成独立预算，不能互相替代。
+管理端不会因存在密钥而自动发起模型请求。只有创建查询任务后才会调用模型。`AGENT_QUERY_MODEL_PROVIDER` 为整条查询流水线统一选择 `deepseek` 或 `vllm`；所有子图共享该供应商的地址、密钥、模型和超时，不允许单独覆盖。业务对齐、查询规划、单表候选检索、SQL 生成、结果翻译和结果审计均采用标准 Pydantic Function Calling，因此 vLLM 服务端必须配置与所承载模型匹配的工具解析器和 Chat Template。`AGENT_QUERY_TOOL_TAG_ENABLED` 默认 `true`，设为 `false` 后全部阶段的首次请求和纠错重试均不读取或注入模板，标准工具调用保持启用。修改后需重启应用。`AGENT_QUERY_TOOL_TAG_TEMPLATE` 是全局唯一模板配置，由全部模型工具阶段共享；vLLM 承载 Qwen3.6 时应选择 `qwen3.6.txt`。模板只描述标签语法并使用显式占位符，不包含任何具体工具名、参数名或业务示例；真实调用只依赖当轮工具 Schema。任务提示词会在动态业务上下文之前提供该通用模板，模型未形成 `tool_calls` 时还会在错误反馈中再次收到同一格式提示。留空表示关闭格式模板提示，配置时只能填写镜像内 `data/tool-tag/` 下的单个 `.txt` 文件名。翻译层按待翻译字段独立异步调用模型，并受 `AGENT_QUERY_TRANSLATION_MAX_PARALLEL_FIELDS` 限制；`MAX_TOKENS`、并发数、生成轮次和工具次数分别构成独立预算，不能互相替代。
 
 查询诊断日志默认关闭。`basic` 只记录阶段、状态、次数、稳定错误码和耗时；`detailed` 额外记录涉及表、结果字段、已通过静态安全校验的参数化 SQL 模板及返回行数；`trace` 为单次查询创建统一模型消息队列，记录所有模型节点实际发送的消息上下文与返回的 `assistant` 消息。工具结果和错误反馈只通过下一轮真实请求上下文体现，不在业务逻辑中重复埋点。修改开关或等级后必须重启应用，`trace` 只用于受控短期排障，结束后应恢复为关闭。
 

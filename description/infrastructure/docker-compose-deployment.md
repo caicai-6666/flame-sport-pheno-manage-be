@@ -69,11 +69,20 @@ flowchart LR
 | `VLLM_MODEL` | `deepseek-v4-flash` | vLLM 服务公开的模型标识，必须与服务端注册名称一致 |
 | `VLLM_HTTP_TIMEOUT_SECONDS` | `60` | vLLM 单次 HTTP 请求超时 |
 | `AGENT_QUERY_MODEL_PROVIDER` | `deepseek` | 查询智能体全局模型供应商，可选 `deepseek` 或 `vllm` |
+| `AGENT_QUERY_TOOL_TAG_ENABLED` | `true` | 全局 tool-tag 注入开关；`false` 同时关闭首次请求与纠错重试的模板提示 |
 | `AGENT_QUERY_TOOL_TAG_TEMPLATE` | `deepseek-v4.txt` | 已适配工具阶段共享、用于工具调用提醒和无工具调用纠错的受控模板文件名 |
 | `DEEPSEEK_QUERY_*_MAX_TOKENS` | 见查询智能体运行文档 | 各查询阶段（含结果翻译）的单次生成上限 |
 | `AGENT_QUERY_*` | 见查询智能体运行文档 | 查询生成轮次、翻译字段并发、工具次数和进程内会话资源上限 |
 
 Compose 会把共享的 `MYSQL_USER`、`MYSQL_PASSWORD`、`MYSQL_DATABASE`，以及管理端查询智能体专属的 `AGENT_QUERY_DEEPSEEK_*`、`VLLM_*`、`DEEPSEEK_QUERY_*`、`AGENT_QUERY_*` 配置注入管理端后端，并将数据库主机固定为 `mysql:3306`。在管理端容器边界，`AGENT_QUERY_DEEPSEEK_*` 会映射为进程现有设置读取的 `DEEPSEEK_*`，但不会读取客户端后端使用的根级 `DEEPSEEK_*`。`AGENT_QUERY_MODEL_PROVIDER` 对整条查询流水线生效，禁止为不同子图分别选择供应商。客户端后端默认使用 `http://backend:8000/flame/api/admin`；只有 Compose 服务名或管理接口路径变化时才调整该环境变量，生产容器不得误走公网。
+
+手动关闭 tool-tag 时，在部署根目录 `.env` 设置 `AGENT_QUERY_TOOL_TAG_ENABLED=false`；重新开启设为 `true`，无需删除模板文件名。`manage-backend.environment` 必须包含以下映射：
+
+```yaml
+AGENT_QUERY_TOOL_TAG_ENABLED: ${AGENT_QUERY_TOOL_TAG_ENABLED:-true}
+```
+
+更新后执行 `docker compose up -d --build --force-recreate manage-backend`，让新代码及环境变量生效。仅执行 `docker compose restart` 不会更新容器环境变量。不要依靠清空 `AGENT_QUERY_TOOL_TAG_TEMPLATE` 关闭 Compose 注入，因为现有 `${AGENT_QUERY_TOOL_TAG_TEMPLATE:-deepseek-v4.txt}` 会把空值回退到默认模板。
 
 管理端后端容器固定注入 `TZ=Asia/Shanghai`，镜像也使用相同默认值。涉及赛季日期边界的业务代码仍应显式使用 `Asia/Shanghai`，不得只依赖容器系统时区。
 

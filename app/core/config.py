@@ -109,6 +109,8 @@ class Settings(BaseSettings):
     vllm_http_timeout_seconds: float = Field(default=60.0, gt=0)
     # 查询智能体整条流水线统一使用同一模型供应商，禁止不同子图分别选择服务。
     agent_query_model_provider: Literal["deepseek", "vllm"] = "deepseek"
+    # 统一控制首次请求及纠错重试的工具标签注入，默认开启以兼容既有部署。
+    agent_query_tool_tag_enabled: bool = True
     # 整条查询流水线共享同一工具标签模板，文件只能从 data/tool-tag 受控目录选择。
     agent_query_tool_tag_template: str | None = Field(
         default="deepseek-v4.txt",
